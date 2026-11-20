@@ -609,6 +609,17 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         padding: 8px 14px;
         font-weight: 500;
     }}
+
+    QLabel#LiveBadge {{
+        background-color: rgba(239, 68, 68, 28);
+        color: #F87171;
+        border: 1px solid rgba(239, 68, 68, 72);
+        border-radius: 10px;
+        padding: 2px 9px;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.4px;
+    }}
     """
 
 

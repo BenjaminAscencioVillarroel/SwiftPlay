@@ -139,6 +139,7 @@ class VideoPlayerPanel(QWidget):
     video_double_clicked = Signal()
     theater_toggled = Signal()
     wheel_scrolled = Signal(int)
+    reload_live_requested = Signal()
 
     def __init__(
         self,
@@ -159,6 +160,8 @@ class VideoPlayerPanel(QWidget):
         self._is_fullscreen = False
         self._is_theater = False
         self._in_watch_later = False
+        self._is_live_mode = False
+        self._is_twitch = False
         self._current_thumb_url = ""
         self._current_avatar_url = ""
         self._has_avatar_pix = False
@@ -337,6 +340,16 @@ class VideoPlayerPanel(QWidget):
 
         btn_row.addStretch()
 
+        self.live_badge = QLabel("● EN VIVO")
+        self.live_badge.setObjectName("LiveBadge")
+        self.live_badge.setVisible(False)
+        btn_row.addWidget(self.live_badge)
+
+        self.viewers_lbl = QLabel("")
+        self.viewers_lbl.setObjectName("MutedLabel")
+        self.viewers_lbl.setVisible(False)
+        btn_row.addWidget(self.viewers_lbl)
+
         # Velocidades estrictamente: 1x, 1.5x, 2x, 2.5x
         self.speed_combo = QComboBox()
         self.speed_combo.setToolTip("Velocidad de reproducción")
@@ -371,6 +384,15 @@ class VideoPlayerPanel(QWidget):
         self.wl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.wl_btn.clicked.connect(self.watch_later_toggled.emit)
         btn_row.addWidget(self.wl_btn)
+
+        self.reload_live_btn = QPushButton()
+        self.reload_live_btn.setObjectName("IconBtn")
+        self.reload_live_btn.setFixedSize(32, 32)
+        self.reload_live_btn.setToolTip("Sincronizar con el directo")
+        self.reload_live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reload_live_btn.setVisible(False)
+        self.reload_live_btn.clicked.connect(self.reload_live_requested.emit)
+        btn_row.addWidget(self.reload_live_btn)
 
         self.dl_btn = QPushButton()
         self.dl_btn.setObjectName("IconBtn")
@@ -605,12 +627,34 @@ class VideoPlayerPanel(QWidget):
 
     def set_watch_later(self, active: bool) -> None:
         self._in_watch_later = active
-        if active:
-            self.wl_btn.setIcon(render_icon("bookmark_filled", self._palette.accent, 17))
-            self.wl_btn.setToolTip("Quitar de Ver más tarde")
+        if self._is_twitch:
+            icon_name = "heart_filled" if active else "heart"
+            tip = "Quitar de Favoritos" if active else "Guardar en Favoritos"
         else:
-            self.wl_btn.setIcon(render_icon("bookmark", self._palette.text2, 17))
-            self.wl_btn.setToolTip("Guardar en Ver más tarde")
+            icon_name = "bookmark_filled" if active else "bookmark"
+            tip = "Quitar de Ver más tarde" if active else "Guardar en Ver más tarde"
+        color = self._palette.accent if active else self._palette.text2
+        self.wl_btn.setIcon(render_icon(icon_name, color, 17))
+        self.wl_btn.setToolTip(tip)
+
+    def set_live_mode(
+        self, is_live: bool, viewers_text: str = "", is_twitch: bool = False
+    ) -> None:
+        self._is_live_mode = bool(is_live)
+        self._is_twitch = bool(is_twitch)
+        self.pos_lbl.setVisible(not self._is_live_mode)
+        self.seek_slider.setVisible(not self._is_live_mode)
+        self.dur_lbl.setVisible(not self._is_live_mode)
+        self.speed_combo.setVisible(not self._is_live_mode)
+        self.dl_btn.setVisible(not self._is_live_mode)
+
+        self.live_badge.setVisible(self._is_live_mode)
+        self.viewers_lbl.setText(viewers_text)
+        self.viewers_lbl.setVisible(self._is_live_mode and bool(viewers_text))
+        self.reload_live_btn.setVisible(self._is_live_mode)
+        if not self._is_live_mode:
+            self._duration = 0.0
+        self.set_watch_later(self._in_watch_later)
 
     def set_fullscreen_state(self, is_fs: bool) -> None:
         self._is_fullscreen = is_fs
@@ -670,6 +714,7 @@ class VideoPlayerPanel(QWidget):
         ao_color = palette.accent_text if self.audio_only_btn.isChecked() else palette.text
         self.audio_only_btn.setIcon(render_icon("audio_only", ao_color, 15))
         self.dl_btn.setIcon(render_icon("download", palette.text2, 17))
+        self.reload_live_btn.setIcon(render_icon("refresh", palette.text, 16))
         self.audio_thumb.setStyleSheet(
             f"background-color: {palette.base}; border-radius: 8px; border: 1px solid {palette.border};"
         )

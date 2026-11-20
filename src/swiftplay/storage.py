@@ -65,6 +65,12 @@ class LocalLibrary:
                     last_played_at REAL NOT NULL,
                     last_position REAL NOT NULL DEFAULT 0.0
                 );
+                CREATE TABLE IF NOT EXISTS twitch_favorites (
+                    login TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    avatar_url TEXT NOT NULL DEFAULT '',
+                    added_at REAL NOT NULL
+                );
                 """
             )
             # Migraciones seguras para bases de datos previas
@@ -388,6 +394,75 @@ class LocalLibrary:
                 for r in rows
             ]
 
+    # --- Favoritos locales de Twitch ---
+
+    def add_twitch_favorite(self, item: MediaItem) -> None:
+        login = (item.video_id or "").strip().lower()
+        if not login:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO twitch_favorites (login, display_name, avatar_url, added_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(login) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    avatar_url=CASE
+                        WHEN excluded.avatar_url != '' THEN excluded.avatar_url
+                        ELSE twitch_favorites.avatar_url
+                    END
+                """,
+                (
+                    login,
+                    item.author or login,
+                    item.channel_avatar_url or "",
+                    time.time(),
+                ),
+            )
+
+    def remove_twitch_favorite(self, login: str) -> None:
+        clean = (login or "").strip().lower()
+        if not clean:
+            return
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM twitch_favorites WHERE login = ?", (clean,))
+
+    def is_twitch_favorite(self, login: str) -> bool:
+        clean = (login or "").strip().lower()
+        if not clean:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM twitch_favorites WHERE login = ?", (clean,)
+            ).fetchone()
+            return row is not None
+
+    def list_twitch_favorites(self) -> list[MediaItem]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT login, display_name, avatar_url FROM twitch_favorites ORDER BY added_at DESC"
+            ).fetchall()
+            return [
+                MediaItem(
+                    video_id=r["login"],
+                    title=f"{r['display_name']} (Favorito)",
+                    author=r["display_name"],
+                    duration="",
+                    duration_sec=0,
+                    thumb_url=r["avatar_url"] or "",
+                    kind="twitch",
+                    channel_avatar_url=r["avatar_url"] or "",
+                    published_text="Cargando estado...",
+                    is_live=False,
+                )
+                for r in rows
+            ]
+
+    def count_twitch_favorites(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM twitch_favorites").fetchone()
+            return int(row[0]) if row else 0
+
     def count_video_history(self) -> int:
         with self._lock:
             row = self._conn.execute(
@@ -433,6 +508,75 @@ class LocalLibrary:
                 for r in rows
             ]
 
+    # --- Favoritos locales de Twitch ---
+
+    def add_twitch_favorite(self, item: MediaItem) -> None:
+        login = (item.video_id or "").strip().lower()
+        if not login:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO twitch_favorites (login, display_name, avatar_url, added_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(login) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    avatar_url=CASE
+                        WHEN excluded.avatar_url != '' THEN excluded.avatar_url
+                        ELSE twitch_favorites.avatar_url
+                    END
+                """,
+                (
+                    login,
+                    item.author or login,
+                    item.channel_avatar_url or "",
+                    time.time(),
+                ),
+            )
+
+    def remove_twitch_favorite(self, login: str) -> None:
+        clean = (login or "").strip().lower()
+        if not clean:
+            return
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM twitch_favorites WHERE login = ?", (clean,))
+
+    def is_twitch_favorite(self, login: str) -> bool:
+        clean = (login or "").strip().lower()
+        if not clean:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM twitch_favorites WHERE login = ?", (clean,)
+            ).fetchone()
+            return row is not None
+
+    def list_twitch_favorites(self) -> list[MediaItem]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT login, display_name, avatar_url FROM twitch_favorites ORDER BY added_at DESC"
+            ).fetchall()
+            return [
+                MediaItem(
+                    video_id=r["login"],
+                    title=f"{r['display_name']} (Favorito)",
+                    author=r["display_name"],
+                    duration="",
+                    duration_sec=0,
+                    thumb_url=r["avatar_url"] or "",
+                    kind="twitch",
+                    channel_avatar_url=r["avatar_url"] or "",
+                    published_text="Cargando estado...",
+                    is_live=False,
+                )
+                for r in rows
+            ]
+
+    def count_twitch_favorites(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM twitch_favorites").fetchone()
+            return int(row[0]) if row else 0
+
     def count_music_history(self) -> int:
         with self._lock:
             row = self._conn.execute(
@@ -471,3 +615,72 @@ class LocalLibrary:
                 )
                 for r in rows
             ]
+
+    # --- Favoritos locales de Twitch ---
+
+    def add_twitch_favorite(self, item: MediaItem) -> None:
+        login = (item.video_id or "").strip().lower()
+        if not login:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO twitch_favorites (login, display_name, avatar_url, added_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(login) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    avatar_url=CASE
+                        WHEN excluded.avatar_url != '' THEN excluded.avatar_url
+                        ELSE twitch_favorites.avatar_url
+                    END
+                """,
+                (
+                    login,
+                    item.author or login,
+                    item.channel_avatar_url or "",
+                    time.time(),
+                ),
+            )
+
+    def remove_twitch_favorite(self, login: str) -> None:
+        clean = (login or "").strip().lower()
+        if not clean:
+            return
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM twitch_favorites WHERE login = ?", (clean,))
+
+    def is_twitch_favorite(self, login: str) -> bool:
+        clean = (login or "").strip().lower()
+        if not clean:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM twitch_favorites WHERE login = ?", (clean,)
+            ).fetchone()
+            return row is not None
+
+    def list_twitch_favorites(self) -> list[MediaItem]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT login, display_name, avatar_url FROM twitch_favorites ORDER BY added_at DESC"
+            ).fetchall()
+            return [
+                MediaItem(
+                    video_id=r["login"],
+                    title=f"{r['display_name']} (Favorito)",
+                    author=r["display_name"],
+                    duration="",
+                    duration_sec=0,
+                    thumb_url=r["avatar_url"] or "",
+                    kind="twitch",
+                    channel_avatar_url=r["avatar_url"] or "",
+                    published_text="Cargando estado...",
+                    is_live=False,
+                )
+                for r in rows
+            ]
+
+    def count_twitch_favorites(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM twitch_favorites").fetchone()
+            return int(row[0]) if row else 0

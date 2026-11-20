@@ -31,6 +31,11 @@ from swiftplay.session_state import SessionState, load_session_state, save_sessi
 from swiftplay.storage import LocalLibrary  # noqa: E402
 from swiftplay.themes import THEMES, build_stylesheet  # noqa: E402
 from swiftplay.thumb_cache import ThumbnailCache  # noqa: E402
+from swiftplay.twitch_service import (  # noqa: E402
+    TwitchService,
+    extract_channel_login,
+    format_viewers,
+)
 from swiftplay.ui.icons import render_icon  # noqa: E402
 from swiftplay.ui.main_window import MainWindow  # noqa: E402
 from swiftplay.ui.settings_dialog import SettingsDialog  # noqa: E402
@@ -149,6 +154,30 @@ def test_storage_config_themes() -> None:
         assert len(mhist) == 1 and mhist[0].video_id == "mus1"
         db.clear_music_history()
         assert db.count_music_history() == 0
+
+        # Twitch Favoritos locales y utilidades (sin sesión ni chat)
+        assert extract_channel_login("https://www.twitch.tv/ibai") == "ibai"
+        assert extract_channel_login("@Rubius") == "rubius"
+        assert format_viewers(12500) == "12.5 K"
+        tw_fav = MediaItem(
+            "ibai",
+            "Stream de prueba",
+            "Ibai",
+            "EN VIVO",
+            0,
+            "",
+            "twitch",
+            is_live=True,
+            game_name="Just Chatting",
+            viewer_count=15200,
+        )
+        assert tw_fav.normalized_thumb().startswith("https://static-cdn.jtvnw.net/")
+        db.add_twitch_favorite(tw_fav)
+        assert db.is_twitch_favorite("ibai")
+        assert db.count_twitch_favorites() == 1
+        assert [x.video_id for x in db.list_twitch_favorites()] == ["ibai"]
+        db.remove_twitch_favorite("ibai")
+        assert db.count_twitch_favorites() == 0
         db.close()
 
         # Persistencia de última sesión (video + música + cola <= 15)
@@ -247,6 +276,15 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
     radio = yt.get_music_radio_queue(songs[0].video_id, limit=10)
     assert len(radio) >= 1, "La cola/radio de YT Music no devolvió pistas"
     print(f"   Radio/Autoplay cola OK ({len(radio)} pistas relacionadas).")
+
+    tw = TwitchService()
+    tw_streams = tw.get_top_streams(limit=5, language="ALL")
+    assert len(tw_streams) >= 1, "Twitch no devolvió streams en vivo"
+    assert all(s.kind == "twitch" and s.is_live for s in tw_streams)
+    tw_hls = tw.resolve_live_stream(tw_streams[0].video_id, quality="360p")
+    assert tw_hls.primary_url.startswith("http"), "URL HLS de Twitch inválida"
+    assert ".m3u8" in tw_hls.primary_url.lower(), f"Se esperaba playlist .m3u8, recibido: {tw_hls.primary_url}"
+    print(f"   Twitch en vivo sin sesión OK ({len(tw_streams)} canales, ej: {tw_streams[0].author} -> HLS listo).")
     return video_stream, audio_stream
 
 
@@ -361,6 +399,9 @@ def test_gui_and_libmpv_smoke(
             win._switch_page(MainWindow.PAGE_MUSIC_PLAYER)
             app.processEvents()
             assert win.stack.currentIndex() == MainWindow.PAGE_MUSIC_PLAYER
+            win._switch_page(MainWindow.PAGE_TWITCH)
+            app.processEvents()
+            assert win.stack.currentIndex() == MainWindow.PAGE_TWITCH
             win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
             app.processEvents()
         finally:
@@ -444,6 +485,54 @@ def test_gui_and_libmpv_smoke(
         # Verificar unload de libmpv en reposo
         win.video_player.unload()
         assert win.video_player._mpv is None and not win.video_player.has_active_stream
+
+        # Verificar adaptación modo EN VIVO (Twitch sin chat) en reproductor, fullscreen overlay y barra inferior
+        live_demo = MediaItem(
+            "tw_demo",
+            "Directo Demo",
+            "StreamerDemo",
+            "EN VIVO",
+            0,
+            "",
+            "twitch",
+            is_live=True,
+            game_name="Just Chatting",
+            viewer_count=5432,
+        )
+        win._video_item = live_demo
+        win.video_panel.set_item(live_demo, False)
+        win.video_panel.set_live_mode(True, viewers_text="5.4 mil", is_twitch=True)
+        win.fs_overlay.set_item(live_demo, False)
+        win.fs_overlay.set_live_mode(True, viewers_text="5.4 mil", is_twitch=True)
+        win._sync_bottom_bar()
+        assert not win.video_panel.live_badge.isHidden()
+        assert not win.video_panel.reload_live_btn.isHidden()
+        assert win.video_panel.seek_slider.isHidden()
+        assert win.video_panel.speed_combo.isHidden()
+        assert win.video_panel.dl_btn.isHidden()
+        assert not win.fs_overlay.live_badge.isHidden()
+        assert not win.fs_overlay.reload_live_btn.isHidden()
+        assert win.fs_overlay.seek_slider.isHidden()
+        assert win.fs_overlay.speed_combo.isHidden()
+        assert win.fs_overlay.dl_btn.isHidden()
+        assert win.bb_deck_tag.text() == "EN VIVO"
+        assert win.bb_seek.isHidden() and win.bb_dl.isHidden()
+
+        vod_demo = MediaItem("vod_demo", "VOD Demo", "Canal", "3:00", 180, "", "video")
+        win._video_item = vod_demo
+        win.video_panel.set_live_mode(False, is_twitch=False)
+        win.video_panel.set_item(vod_demo, False)
+        win.fs_overlay.set_live_mode(False, is_twitch=False)
+        win.fs_overlay.set_item(vod_demo, False)
+        win._sync_bottom_bar()
+        assert win.video_panel.live_badge.isHidden()
+        assert not win.video_panel.seek_slider.isHidden()
+        assert not win.video_panel.speed_combo.isHidden()
+        assert not win.video_panel.dl_btn.isHidden()
+        assert win.fs_overlay.live_badge.isHidden()
+        assert not win.fs_overlay.seek_slider.isHidden()
+        assert win.bb_deck_tag.text() == "VIDEO"
+        assert not win.bb_seek.isHidden()
 
         win._video_item = None
         win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)

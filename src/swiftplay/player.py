@@ -245,6 +245,7 @@ class MediaPlayer(QObject):
         video_enabled: bool = True,
         http_headers: dict[str, str] | None = None,
         start_pos: float = 0.0,
+        is_live: bool = False,
     ) -> None:
         with self._lock:
             player = self._ensure_mpv()
@@ -258,9 +259,25 @@ class MediaPlayer(QObject):
                 player.vid = "no"
             else:
                 player.vid = "auto" if video_enabled else "no"
-            player.start = f"+{start_pos:.1f}" if start_pos > 0.5 else "none"
+
+            if is_live:
+                player["cache-secs"] = 2
+                player["demuxer-max-bytes"] = "4MiB"
+                player["demuxer-max-back-bytes"] = "512KiB"
+                player.start = "none"
+                player.speed = 1.0
+            else:
+                player["cache-secs"] = 6
+                player["demuxer-max-bytes"] = (
+                    "3MiB" if self._is_audio_only_instance else "8MiB"
+                )
+                player["demuxer-max-back-bytes"] = (
+                    "1MiB" if self._is_audio_only_instance else "2MiB"
+                )
+                player.start = f"+{start_pos:.1f}" if start_pos > 0.5 else "none"
+                player.speed = self._speed
+
             player.volume = self._volume
-            player.speed = self._speed
             target_af = NORMALIZATION_FILTER if self._normalization else ""
             if target_af != self._applied_af:
                 player.af = target_af

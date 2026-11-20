@@ -249,6 +249,7 @@ class FullscreenOverlayBar(QWidget):
     exit_fullscreen_requested = Signal()
     theater_requested = Signal()
     wheel_scrolled = Signal(int)
+    reload_live_requested = Signal()
 
     def __init__(
         self,
@@ -265,6 +266,8 @@ class FullscreenOverlayBar(QWidget):
         self._seeking = False
         self._is_paused = True
         self._in_watch_later = False
+        self._is_live_mode = False
+        self._is_twitch = False
         self._prev_volume = max(10, initial_volume)
 
         self.setWindowFlags(
@@ -288,9 +291,14 @@ class FullscreenOverlayBar(QWidget):
         root.setContentsMargins(16, 10, 16, 10)
         root.setSpacing(6)
 
-        # Fila 1: Título + tiempo
+        # Fila 1: Badge en vivo + Título + tiempo/viewers
         top_row = QHBoxLayout()
         top_row.setSpacing(10)
+        self.live_badge = QLabel("● EN VIVO")
+        self.live_badge.setObjectName("LiveBadge")
+        self.live_badge.setVisible(False)
+        top_row.addWidget(self.live_badge)
+
         self.title_lbl = QLabel("Sin video")
         self.title_lbl.setStyleSheet("font-size: 13px; font-weight: 600;")
         top_row.addWidget(self.title_lbl, 1)
@@ -368,6 +376,15 @@ class FullscreenOverlayBar(QWidget):
         self.wl_btn.clicked.connect(self.watch_later_toggled.emit)
         btn_row.addWidget(self.wl_btn)
 
+        self.reload_live_btn = QPushButton()
+        self.reload_live_btn.setObjectName("IconBtn")
+        self.reload_live_btn.setFixedSize(30, 30)
+        self.reload_live_btn.setToolTip("Sincronizar con el directo")
+        self.reload_live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reload_live_btn.setVisible(False)
+        self.reload_live_btn.clicked.connect(self.reload_live_requested.emit)
+        btn_row.addWidget(self.reload_live_btn)
+
         self.dl_btn = QPushButton()
         self.dl_btn.setObjectName("IconBtn")
         self.dl_btn.setFixedSize(30, 30)
@@ -403,7 +420,8 @@ class FullscreenOverlayBar(QWidget):
 
     def reveal(self, screen_rect: QRect) -> None:
         w = min(max(660, screen_rect.width() - 80), 980)
-        self.setFixedSize(w, 98)
+        h = 78 if self._is_live_mode else 98
+        self.setFixedSize(w, h)
         x = screen_rect.center().x() - w // 2
         y = screen_rect.bottom() - self.height() - 22
         self._target_pos = QPoint(x, y)
@@ -632,11 +650,33 @@ class FullscreenOverlayBar(QWidget):
     def set_watch_later(self, active: bool) -> None:
         self._in_watch_later = active
         color = self._palette.accent if active else self._palette.text2
-        icon_name = "bookmark_filled" if active else "bookmark"
+        if self._is_twitch:
+            icon_name = "heart_filled" if active else "heart"
+            tip = "Quitar de Favoritos" if active else "Guardar en Favoritos"
+        else:
+            icon_name = "bookmark_filled" if active else "bookmark"
+            tip = "Quitar de Ver más tarde" if active else "Guardar en Ver más tarde"
         self.wl_btn.setIcon(render_icon(icon_name, color, 16))
-        self.wl_btn.setToolTip(
-            "Quitar de Ver más tarde" if active else "Guardar en Ver más tarde"
-        )
+        self.wl_btn.setToolTip(tip)
+
+    def set_live_mode(
+        self, is_live: bool, viewers_text: str = "", is_twitch: bool = False
+    ) -> None:
+        self._is_live_mode = bool(is_live)
+        self._is_twitch = bool(is_twitch)
+        self.live_badge.setVisible(self._is_live_mode)
+        self.seek_slider.setVisible(not self._is_live_mode)
+        self.speed_combo.setVisible(not self._is_live_mode)
+        self.dl_btn.setVisible(not self._is_live_mode)
+        self.reload_live_btn.setVisible(self._is_live_mode)
+        if self._is_live_mode:
+            self.time_lbl.setText(viewers_text)
+            self.time_lbl.setVisible(bool(viewers_text))
+        else:
+            self._duration = 0.0
+            self.time_lbl.setText("0:00 / 0:00")
+            self.time_lbl.setVisible(True)
+        self.set_watch_later(self._in_watch_later)
 
     def _refresh_vol_icon(self) -> None:
         name = "mute" if self.vol_slider.value() == 0 else "volume"
@@ -645,6 +685,7 @@ class FullscreenOverlayBar(QWidget):
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self.dl_btn.setIcon(render_icon("download", palette.text2, 16))
+        self.reload_live_btn.setIcon(render_icon("refresh", palette.text, 16))
         self.exit_fs_btn.setIcon(render_icon("exit_fullscreen", palette.text, 16))
         self.set_paused(self._is_paused)
         self.set_watch_later(self._in_watch_later)

@@ -54,14 +54,19 @@ class MediaItem:
     duration: str = ""
     duration_sec: int = 0
     thumb_url: str = ""
-    kind: Literal["video", "music"] = "video"
+    kind: Literal["video", "music", "twitch"] = "video"
     channel_avatar_url: str = ""
     resume_pos: float = 0.0
     published_text: str = ""
+    is_live: bool = False
+    game_name: str = ""
+    viewer_count: int = 0
 
     def normalized_thumb(self) -> str:
         if self.thumb_url:
             return self.thumb_url
+        if self.kind == "twitch" and self.video_id:
+            return f"https://static-cdn.jtvnw.net/previews-ttv/live_user_{self.video_id.lower()}-440x248.jpg"
         if self.video_id:
             return f"https://i.ytimg.com/vi/{self.video_id}/hqdefault.jpg"
         return ""
@@ -78,6 +83,9 @@ class MediaItem:
             "channel_avatar_url": self.channel_avatar_url,
             "resume_pos": float(self.resume_pos or 0.0),
             "published_text": self.published_text,
+            "is_live": bool(self.is_live),
+            "game_name": self.game_name,
+            "viewer_count": int(self.viewer_count or 0),
         }
 
     @classmethod
@@ -85,7 +93,12 @@ class MediaItem:
         if not isinstance(data, dict):
             return cls(video_id="", title="")
         raw_kind = str(data.get("kind") or "video")
-        kind: Literal["video", "music"] = "music" if raw_kind == "music" else "video"
+        if raw_kind == "music":
+            kind: Literal["video", "music", "twitch"] = "music"
+        elif raw_kind == "twitch":
+            kind = "twitch"
+        else:
+            kind = "video"
         try:
             dur_sec = int(data.get("duration_sec") or 0)
         except (TypeError, ValueError):
@@ -94,6 +107,10 @@ class MediaItem:
             res_pos = max(0.0, float(data.get("resume_pos") or 0.0))
         except (TypeError, ValueError):
             res_pos = 0.0
+        try:
+            viewers = max(0, int(data.get("viewer_count") or 0))
+        except (TypeError, ValueError):
+            viewers = 0
         return cls(
             video_id=str(data.get("video_id") or "").strip(),
             title=str(data.get("title") or "").strip(),
@@ -105,6 +122,9 @@ class MediaItem:
             channel_avatar_url=str(data.get("channel_avatar_url") or "").strip(),
             resume_pos=res_pos,
             published_text=str(data.get("published_text") or "").strip(),
+            is_live=bool(data.get("is_live", False)),
+            game_name=str(data.get("game_name") or "").strip(),
+            viewer_count=viewers,
         )
 
 

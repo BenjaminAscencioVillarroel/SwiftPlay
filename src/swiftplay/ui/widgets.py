@@ -555,6 +555,8 @@ class RoundedThumbWidget(QWidget):
                 painter.drawPath(play_path)
 
         if self._duration_text:
+            is_live_badge = self._duration_text.upper() == "EN VIVO"
+            is_off_badge = self._duration_text.upper() == "OFFLINE"
             font = QFont(self.font())
             font.setPixelSize(11)
             font.setWeight(QFont.Weight.Bold)
@@ -564,7 +566,8 @@ class RoundedThumbWidget(QWidget):
             th = fm.height()
             pad_x = 6
             pad_y = 2
-            bw = tw + pad_x * 2
+            dot_extra = 10 if is_live_badge else 0
+            bw = tw + pad_x * 2 + dot_extra
             bh = th + pad_y * 2
             margin = 7
             y_extra = 4 if self._progress_ratio > 0.0 else 0
@@ -574,8 +577,17 @@ class RoundedThumbWidget(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(11, 12, 14, 218))
             painter.drawRoundedRect(badge_rect, 4.0, 4.0)
-            painter.setPen(QColor("#F1F3F6"))
-            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self._duration_text)
+            if is_live_badge:
+                dot_r = 3.0
+                cx = bx + pad_x + dot_r
+                cy = by + bh / 2.0
+                painter.setBrush(QColor("#EF4444"))
+                painter.drawEllipse(QRectF(cx - dot_r, cy - dot_r, dot_r * 2.0, dot_r * 2.0))
+                txt_rect = QRectF(bx + dot_extra, by, float(bw - dot_extra), float(bh))
+            else:
+                txt_rect = badge_rect
+            painter.setPen(QColor("#9299A8" if is_off_badge else "#F1F3F6"))
+            painter.drawText(txt_rect, Qt.AlignmentFlag.AlignCenter, self._duration_text)
 
         if self._progress_ratio > 0.0:
             bar_h = 3.0
@@ -813,16 +825,25 @@ class VideoGridCard(QFrame):
 
     def _open_context_menu(self) -> None:
         menu = QMenu(self)
-        wl_label = (
-            "Quitar de Ver más tarde"
-            if self._in_watch_later
-            else "Guardar en Ver más tarde"
-        )
-        act_wl = menu.addAction(wl_label)
-        act_wl.triggered.connect(lambda: self.watch_later_toggled.emit(self.item))
+        if self.item.kind == "twitch":
+            fav_label = (
+                "Quitar de Favoritos"
+                if self._in_watch_later
+                else "Guardar en Favoritos"
+            )
+            act_fav = menu.addAction(fav_label)
+            act_fav.triggered.connect(lambda: self.watch_later_toggled.emit(self.item))
+        else:
+            wl_label = (
+                "Quitar de Ver más tarde"
+                if self._in_watch_later
+                else "Guardar en Ver más tarde"
+            )
+            act_wl = menu.addAction(wl_label)
+            act_wl.triggered.connect(lambda: self.watch_later_toggled.emit(self.item))
 
-        act_dl = menu.addAction("Descargar video")
-        act_dl.triggered.connect(lambda: self.download_requested.emit(self.item))
+            act_dl = menu.addAction("Descargar video")
+            act_dl.triggered.connect(lambda: self.download_requested.emit(self.item))
 
         if self._show_remove:
             menu.addSeparator()
@@ -873,13 +894,15 @@ class VideoGridCard(QFrame):
     def enterEvent(self, event) -> None:
         self._card_hovered = True
         self.more_btn.setIcon(render_icon("more", self._palette.text, 16))
-        self.hover_entered.emit(self.item)
+        if self.item.kind != "twitch":
+            self.hover_entered.emit(self.item)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         self._card_hovered = False
         self.more_btn.setIcon(render_icon("more", "#687080", 16))
-        self.hover_left.emit(self.item)
+        if self.item.kind != "twitch":
+            self.hover_left.emit(self.item)
         super().leaveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:

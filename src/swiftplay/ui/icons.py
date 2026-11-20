@@ -291,5 +291,14 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
         p.drawLine(QPointF(s * 0.22, s * 0.38), QPointF(s * 0.50, s * 0.66))
         p.drawLine(QPointF(s * 0.50, s * 0.66), QPointF(s * 0.78, s * 0.38))
 
+    elif name == "live":
+        p.drawArc(QRectF(s * 0.14, s * 0.18, s * 0.72, s * 0.64), 135 * 16, 90 * 16)
+        p.drawArc(QRectF(s * 0.14, s * 0.18, s * 0.72, s * 0.64), -45 * 16, 90 * 16)
+        p.drawArc(QRectF(s * 0.28, s * 0.30, s * 0.44, s * 0.40), 135 * 16, 90 * 16)
+        p.drawArc(QRectF(s * 0.28, s * 0.30, s * 0.44, s * 0.40), -45 * 16, 90 * 16)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawEllipse(QRectF(s * 0.41, s * 0.41, s * 0.18, s * 0.18))
+
     p.end()
     return QIcon(pm)
