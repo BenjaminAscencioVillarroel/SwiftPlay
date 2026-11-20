@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
+from PySide6.QtGui import QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QWheelEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -68,7 +80,29 @@ class VolumeHudOverlay(QWidget):
 
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self.hide)
+        self._hide_timer.timeout.connect(self._start_fade_out)
+
+        self._fading_out = False
+        self._opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self._opacity_anim.finished.connect(self._on_anim_finished)
+        self.setWindowOpacity(0.0)
+
+    def _start_fade_out(self) -> None:
+        if not self.isVisible() or self._fading_out:
+            return
+        cur = float(self.windowOpacity())
+        self._opacity_anim.stop()
+        self._fading_out = True
+        self._opacity_anim.setDuration(max(70, int(180 * cur)))
+        self._opacity_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._opacity_anim.setStartValue(cur)
+        self._opacity_anim.setEndValue(0.0)
+        self._opacity_anim.start()
+
+    def _on_anim_finished(self) -> None:
+        if self._fading_out:
+            self._fading_out = False
+            self.hide()
 
     def show_volume(self, percent: int, anchor_rect: QRect) -> None:
         pct = max(0, min(100, int(percent)))
@@ -83,9 +117,119 @@ class VolumeHudOverlay(QWidget):
         y = anchor_rect.top() + 26
         self.move(x, y)
         if not self.isVisible():
+            self._opacity_anim.stop()
+            self._fading_out = False
+            self.setWindowOpacity(0.0)
+            self.show()
+            self.raise_()
+            self._opacity_anim.setDuration(120)
+            self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._opacity_anim.setStartValue(0.0)
+            self._opacity_anim.setEndValue(1.0)
+            self._opacity_anim.start()
+        elif self._fading_out or self.windowOpacity() < 0.99:
+            cur = float(self.windowOpacity())
+            self._opacity_anim.stop()
+            self._fading_out = False
+            self.raise_()
+            self._opacity_anim.setDuration(max(50, int(120 * (1.0 - cur))))
+            self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._opacity_anim.setStartValue(cur)
+            self._opacity_anim.setEndValue(1.0)
+            self._opacity_anim.start()
+        else:
+            self.raise_()
+        self._hide_timer.start(900)
+
+    def update_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+
+
+class PlaybackFeedbackHud(QWidget):
+    """HUD central flotante estilo YouTube para feedback de Play/Pause/Fullscreen/Seek."""
+
+    def __init__(self, palette: ThemePalette, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._palette = palette
+        self._icon_name = "play"
+        self._text = ""
+        self._t = 0.0
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFixedSize(82, 82)
+
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(340)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.valueChanged.connect(self._on_val)
+        self._anim.finished.connect(self.hide)
+
+    def _on_val(self, val: object) -> None:
+        self._t = float(val)
+        # Opacidad rápida de entrada (0..0.28) y fade-out suave (0.28..1.0)
+        if self._t < 0.28:
+            op = self._t / 0.28
+        else:
+            op = max(0.0, 1.0 - (self._t - 0.28) / 0.72)
+        self.setWindowOpacity(op)
+        self.update()
+
+    def show_action(self, icon_name: str, anchor_rect: QRect, text: str = "") -> None:
+        self._icon_name = icon_name
+        self._text = text
+        self._t = 0.0
+        x = anchor_rect.center().x() - self.width() // 2
+        y = anchor_rect.center().y() - self.height() // 2
+        self.move(x, y)
+        self.setWindowOpacity(0.15)
+        if not self.isVisible():
             self.show()
         self.raise_()
-        self._hide_timer.start(900)
+        self._anim.stop()
+        self._anim.start()
+
+    def paintEvent(self, _event) -> None:
+        w = self.width()
+        h = self.height()
+        if w <= 0 or h <= 0:
+            return
+        scale = 0.84 + 0.21 * self._t
+        d = min(w, h) * 0.78 * scale
+        cx = w / 2.0
+        cy = h / 2.0
+        circle = QRectF(cx - d / 2.0, cy - d / 2.0, d, d)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        painter.setPen(QColor(207, 213, 223, 72))
+        painter.setBrush(QColor(14, 16, 20, 215))
+        painter.drawEllipse(circle)
+
+        if self._text:
+            font = QFont(self.font())
+            font.setPixelSize(15)
+            font.setWeight(QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.setPen(QColor(self._palette.text))
+            painter.drawText(circle, Qt.AlignmentFlag.AlignCenter, self._text)
+        else:
+            ico_px = max(20, int(28 * scale))
+            pm = render_icon(self._icon_name, self._palette.text, ico_px).pixmap(
+                QSize(ico_px, ico_px)
+            )
+            painter.drawPixmap(int(cx - ico_px / 2.0), int(cy - ico_px / 2.0), pm)
+
+        painter.end()
 
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
@@ -248,8 +392,10 @@ class FullscreenOverlayBar(QWidget):
         self._hide_timer.timeout.connect(self._on_hide_timeout)
 
         self._is_fading_out = False
+        self._target_pos = QPoint(0, 0)
         self._opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
         self._opacity_anim.finished.connect(self._on_anim_finished)
+        self._pos_anim = QPropertyAnimation(self, b"pos", self)
         self.setWindowOpacity(0.0)
 
         self.set_audio_only_silent(initial_audio_only)
@@ -260,11 +406,13 @@ class FullscreenOverlayBar(QWidget):
         self.setFixedSize(w, 98)
         x = screen_rect.center().x() - w // 2
         y = screen_rect.bottom() - self.height() - 22
-        self.move(x, y)
+        self._target_pos = QPoint(x, y)
         if not self.isVisible():
             self._opacity_anim.stop()
+            self._pos_anim.stop()
             self._is_fading_out = False
             self.setWindowOpacity(0.0)
+            self.move(x, y + 14)
             self.show()
             self.raise_()
             self._start_fade_in()
@@ -272,32 +420,47 @@ class FullscreenOverlayBar(QWidget):
             self.raise_()
             self._start_fade_in()
         else:
+            self.move(self._target_pos)
             self.raise_()
         self._hide_timer.start(500)
 
     def _start_fade_in(self) -> None:
         cur = float(self.windowOpacity())
         self._opacity_anim.stop()
+        self._pos_anim.stop()
         self._is_fading_out = False
-        dur = max(60, int(160 * (1.0 - cur)))
+        dur = max(70, int(180 * (1.0 - cur)))
         self._opacity_anim.setDuration(dur)
         self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._opacity_anim.setStartValue(cur)
         self._opacity_anim.setEndValue(1.0)
         self._opacity_anim.start()
 
+        self._pos_anim.setDuration(dur)
+        self._pos_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._pos_anim.setStartValue(self.pos())
+        self._pos_anim.setEndValue(self._target_pos)
+        self._pos_anim.start()
+
     def fade_out(self) -> None:
         if not self.isVisible() or self._is_fading_out:
             return
         cur = float(self.windowOpacity())
         self._opacity_anim.stop()
+        self._pos_anim.stop()
         self._is_fading_out = True
-        dur = max(80, int(220 * cur))
+        dur = max(80, int(200 * cur))
         self._opacity_anim.setDuration(dur)
         self._opacity_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self._opacity_anim.setStartValue(cur)
         self._opacity_anim.setEndValue(0.0)
         self._opacity_anim.start()
+
+        self._pos_anim.setDuration(dur)
+        self._pos_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._pos_anim.setStartValue(self.pos())
+        self._pos_anim.setEndValue(QPoint(self._target_pos.x(), self._target_pos.y() + 10))
+        self._pos_anim.start()
 
     def _on_anim_finished(self) -> None:
         if self._is_fading_out:
@@ -307,6 +470,7 @@ class FullscreenOverlayBar(QWidget):
     def hide_immediately(self) -> None:
         self._hide_timer.stop()
         self._opacity_anim.stop()
+        self._pos_anim.stop()
         self._is_fading_out = False
         self.setWindowOpacity(0.0)
         self.hide()

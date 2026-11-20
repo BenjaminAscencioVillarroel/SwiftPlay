@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPalette, QPixmap, QWheelEvent
+from PySide6.QtCore import QEasingCurve, QEvent, QRectF, QSize, Qt, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPalette, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -21,7 +21,62 @@ from swiftplay.models import MediaItem, format_duration
 from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
-from swiftplay.ui.widgets import ClickableSlider
+from swiftplay.ui.widgets import ClickableSlider, RoundedThumbWidget
+
+
+class _LoadingShimmerBar(QWidget):
+    """Barra de carga animada ligera que solo consume CPU mientras está visible."""
+
+    def __init__(self, accent_color: str = "#CFD5DF", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._accent = QColor(accent_color)
+        self._pos = 0.0
+        self.setFixedHeight(4)
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(950)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setLoopCount(-1)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self._anim.valueChanged.connect(self._on_val)
+
+    def _on_val(self, val: object) -> None:
+        self._pos = float(val)
+        self.update()
+
+    def set_accent(self, color: str) -> None:
+        self._accent = QColor(color)
+        self.update()
+
+    def start(self) -> None:
+        if self._anim.state() != QVariantAnimation.State.Running:
+            self._anim.start()
+
+    def stop(self) -> None:
+        if self._anim.state() == QVariantAnimation.State.Running:
+            self._anim.stop()
+
+    def hideEvent(self, event) -> None:
+        self.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        w = self.width()
+        h = self.height()
+        if w <= 0 or h <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 28))
+        painter.drawRoundedRect(QRectF(0.0, 0.0, float(w), float(h)), 2.0, 2.0)
+
+        seg_w = max(48.0, w * 0.34)
+        x = -seg_w + (w + seg_w) * self._pos
+        painter.setClipRect(QRectF(0.0, 0.0, float(w), float(h)))
+        painter.setBrush(self._accent)
+        painter.drawRoundedRect(QRectF(x, 0.0, seg_w, float(h)), 2.0, 2.0)
+        painter.end()
 
 
 class VideoSurface(QWidget):
@@ -180,6 +235,41 @@ class VideoPlayerPanel(QWidget):
 
         audio_page_lay.addWidget(self.audio_banner)
         self.media_stack.addWidget(audio_page)
+
+        # Página 2: Vista previa instantánea al cambiar de video
+        loading_page = QWidget()
+        loading_page_lay = QVBoxLayout(loading_page)
+        loading_page_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.loading_card = QFrame()
+        self.loading_card.setObjectName("AudioOnlyBanner")
+        self.loading_card.setFixedWidth(400)
+        load_lay = QVBoxLayout(self.loading_card)
+        load_lay.setContentsMargins(20, 20, 20, 20)
+        load_lay.setSpacing(10)
+        load_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.loading_thumb = RoundedThumbWidget(radius=10, bg_color=palette.surface1)
+        self.loading_thumb.setFixedSize(320, 180)
+        load_lay.addWidget(self.loading_thumb, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self.loading_title = QLabel("")
+        self.loading_title.setWordWrap(True)
+        self.loading_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_title.setStyleSheet("font-size: 14px; font-weight: 600;")
+        load_lay.addWidget(self.loading_title)
+
+        self.loading_sub = QLabel("Cargando video...")
+        self.loading_sub.setObjectName("MutedLabel")
+        self.loading_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        load_lay.addWidget(self.loading_sub)
+
+        self.loading_bar = _LoadingShimmerBar(palette.accent)
+        self.loading_bar.setFixedWidth(280)
+        load_lay.addWidget(self.loading_bar, 0, Qt.AlignmentFlag.AlignCenter)
+
+        loading_page_lay.addWidget(self.loading_card)
+        self.media_stack.addWidget(loading_page)
         root.addWidget(self.media_stack, 1)
 
         # Barra inferior de controles del reproductor de video
@@ -370,11 +460,23 @@ class VideoPlayerPanel(QWidget):
             self.audio_only_btn.setIcon(render_icon("audio_only", self._palette.text, 15))
         self.audio_only_btn.style().unpolish(self.audio_only_btn)
         self.audio_only_btn.style().polish(self.audio_only_btn)
-        self.media_stack.setCurrentIndex(1 if audio_only else 0)
+        if self.media_stack.currentIndex() != 2 or audio_only:
+            if audio_only:
+                self.loading_bar.stop()
+            self.media_stack.setCurrentIndex(1 if audio_only else 0)
+
+    def set_loading_state(self, loading: bool) -> None:
+        if loading and not self.audio_only_btn.isChecked():
+            self.media_stack.setCurrentIndex(2)
+            self.loading_bar.start()
+        else:
+            self.loading_bar.stop()
+            self.media_stack.setCurrentIndex(1 if self.audio_only_btn.isChecked() else 0)
 
     def set_item(self, item: MediaItem, in_watch_later: bool) -> None:
         self.video_title_lbl.setText(f"{item.title}  —  {item.author}" if item.author else item.title)
         self.audio_title.setText(f"{item.title}\n{item.author}" if item.author else item.title)
+        self.loading_title.setText(f"{item.title}\n{item.author}" if item.author else item.title)
         self._current_thumb_url = item.normalized_thumb()
         self._current_avatar_url = item.channel_avatar_url or ""
         self._has_avatar_pix = False
@@ -384,6 +486,12 @@ class VideoPlayerPanel(QWidget):
             self.audio_thumb.setPixmap(pix)
         else:
             self.audio_thumb.clear()
+
+        lpix = self._thumb_cache.get_or_fetch(self._current_thumb_url, QSize(320, 180))
+        if lpix is not None:
+            self.loading_thumb.set_pixmap(lpix)
+        else:
+            self.loading_thumb.clear()
 
         if self._current_avatar_url:
             av_pix = self._thumb_cache.get_or_fetch(
@@ -415,8 +523,15 @@ class VideoPlayerPanel(QWidget):
 
     def _on_thumb_ready(self, url: str, pix: QPixmap) -> None:
         if url == self._current_thumb_url:
-            self.audio_thumb.setPixmap(pix)
-        elif self._current_avatar_url and url == self._current_avatar_url:
+            if pix.size() == QSize(256, 144):
+                self.audio_thumb.setPixmap(pix)
+            elif pix.size() == QSize(320, 180):
+                self.loading_thumb.set_pixmap(pix)
+        elif (
+            self._current_avatar_url
+            and url == self._current_avatar_url
+            and pix.size() == QSize(24, 24)
+        ):
             self._set_channel_avatar(pix)
 
     def set_status(self, text: str) -> None:
@@ -527,6 +642,8 @@ class VideoPlayerPanel(QWidget):
         self.audio_thumb.setStyleSheet(
             f"background-color: {palette.base}; border-radius: 8px; border: 1px solid {palette.border};"
         )
+        self.loading_thumb.set_bg_color(palette.surface1)
+        self.loading_bar.set_accent(palette.accent)
         self.set_paused(self._is_paused)
         self.set_watch_later(self._in_watch_later)
         self._refresh_vol_icon()

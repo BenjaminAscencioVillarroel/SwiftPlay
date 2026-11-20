@@ -10,8 +10,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+from collections import OrderedDict
 from hashlib import sha1
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
@@ -390,11 +392,19 @@ class YouTubeService:
         self._ytmusic: YTMusic
         self._ytmusic_search: YTMusic | None = None
         self._ytmusic_authenticated = False
+        self._stream_lock = threading.Lock()
+        self._stream_cache: OrderedDict[tuple[str, bool, str], tuple[float, ResolvedStream]] = OrderedDict()
+        self._inflight_streams: dict[
+            tuple[str, bool, str],
+            tuple[threading.Event, list[ResolvedStream | None], list[Exception | None]],
+        ] = {}
         self.reload_auth()
 
     def reload_auth(self) -> None:
         """Recarga YTMusic con cookies DPAPI si existen, protegiendo LC_NUMERIC='C'."""
         self._ytmusic_search = None
+        with self._stream_lock:
+            self._stream_cache.clear()
         raw = load_cookies_decrypted()
         try:
             if raw:
@@ -814,12 +824,80 @@ class YouTubeService:
     # Streams y Descargas
     # ------------------------------------------------------------------
 
+    _STREAM_CACHE_TTL = 1500.0
+    _STREAM_CACHE_MAX = 20
+
+    def _stream_key(
+        self, video_id: str, audio_only: bool, quality: str
+    ) -> tuple[str, bool, str]:
+        return (video_id, bool(audio_only), "audio" if audio_only else quality)
+
+    def has_cached_stream(
+        self, video_id: str, audio_only: bool, quality: str = "720p"
+    ) -> bool:
+        if not video_id:
+            return False
+        key = self._stream_key(video_id, audio_only, quality)
+        with self._stream_lock:
+            entry = self._stream_cache.get(key)
+            if entry is None:
+                return False
+            if (time.monotonic() - entry[0]) < self._STREAM_CACHE_TTL:
+                return True
+            self._stream_cache.pop(key, None)
+            return False
+
+    def prefetch_stream(
+        self, video_id: str, audio_only: bool, quality: str = "720p"
+    ) -> None:
+        if not video_id:
+            return
+        try:
+            self.resolve_stream(video_id, audio_only=audio_only, quality=quality, use_cache=True)
+        except Exception:
+            pass
+
     def resolve_stream(
         self,
         video_id: str,
         audio_only: bool,
         quality: str = "720p",
+        use_cache: bool = True,
     ) -> ResolvedStream:
+        key = self._stream_key(video_id, audio_only, quality)
+        inflight_entry: tuple[
+            threading.Event, list[ResolvedStream | None], list[Exception | None]
+        ] | None = None
+        is_owner = False
+
+        with self._stream_lock:
+            if use_cache:
+                cached = self._stream_cache.get(key)
+                if cached is not None:
+                    ts, stream = cached
+                    if (time.monotonic() - ts) < self._STREAM_CACHE_TTL:
+                        self._stream_cache.move_to_end(key)
+                        return stream
+                    self._stream_cache.pop(key, None)
+
+            existing_inflight = self._inflight_streams.get(key)
+            if existing_inflight is not None:
+                inflight_entry = existing_inflight
+            else:
+                inflight_entry = (threading.Event(), [None], [None])
+                self._inflight_streams[key] = inflight_entry
+                is_owner = True
+
+        if not is_owner:
+            ev, res_box, err_box = inflight_entry
+            ev.wait(timeout=20.0)
+            if res_box[0] is not None:
+                return res_box[0]
+            if err_box[0] is not None:
+                raise err_box[0]
+            raise RuntimeError("Tiempo de espera agotado al resolver el stream.")
+
+        ev, res_box, err_box = inflight_entry
         url = f"https://www.youtube.com/watch?v={video_id}"
         max_h = QUALITY_HEIGHT_MAP.get(quality, 720)
         if audio_only:
@@ -836,6 +914,10 @@ class YouTubeService:
                 opts = _base_ydl_opts(ck)
                 opts["format"] = fmt
                 opts["noplaylist"] = True
+                opts["skip_download"] = True
+                opts["noprogress"] = True
+                opts["no_color"] = True
+                opts["extractor_args"] = {"youtube": {"player_skip": ["configs"]}}
                 with _make_youtube_ydl(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
 
@@ -864,7 +946,7 @@ class YouTubeService:
             if not primary_url:
                 raise RuntimeError("yt-dlp no devolvió una URL reproducible.")
 
-            return ResolvedStream(
+            resolved = ResolvedStream(
                 video_id=video_id,
                 primary_url=primary_url,
                 audio_url=audio_url,
@@ -875,8 +957,21 @@ class YouTubeService:
                 thumb_url=_pick_best_thumb(info.get("thumbnails"), video_id),
                 video_enabled=not audio_only,
             )
+            res_box[0] = resolved
+            with self._stream_lock:
+                self._stream_cache[key] = (time.monotonic(), resolved)
+                self._stream_cache.move_to_end(key)
+                while len(self._stream_cache) > self._STREAM_CACHE_MAX:
+                    self._stream_cache.popitem(last=False)
+            return resolved
+        except Exception as exc:
+            err_box[0] = exc
+            raise
         finally:
-            gc.collect()
+            with self._stream_lock:
+                if self._inflight_streams.get(key) is inflight_entry:
+                    self._inflight_streams.pop(key, None)
+            ev.set()
 
     def download_media(
         self,

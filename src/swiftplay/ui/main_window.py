@@ -70,7 +70,11 @@ from swiftplay.ui.mini_bar import MiniBarWindow
 from swiftplay.ui.music_player_panel import MusicNowPlayingPanel
 from swiftplay.ui.settings_dialog import SettingsDialog
 from swiftplay.ui.shortcuts_dialog import ShortcutsDialog
-from swiftplay.ui.video_overlays import FullscreenOverlayBar, VolumeHudOverlay
+from swiftplay.ui.video_overlays import (
+    FullscreenOverlayBar,
+    PlaybackFeedbackHud,
+    VolumeHudOverlay,
+)
 from swiftplay.ui.video_surface import VideoPlayerPanel
 from swiftplay.ui.widgets import (
     ClickableSlider,
@@ -177,6 +181,16 @@ class MainWindow(QMainWindow):
         self._video_click_timer.timeout.connect(self._on_video_single_click_commit)
         self._last_video_dbl_ts: float = 0.0
 
+        # Pre-resolución inteligente (hover sobre video + siguiente pista de música)
+        self._hover_prefetch_item: MediaItem | None = None
+        self._prefetch_inflight: int = 0
+        self._video_prefetch_timer = QTimer(self)
+        self._video_prefetch_timer.setSingleShot(True)
+        self._video_prefetch_timer.setInterval(380)
+        self._video_prefetch_timer.timeout.connect(self._run_hover_video_prefetch)
+        self._sidebar_anim: QPropertyAnimation | None = None
+        self._bottom_bar_anim: QPropertyAnimation | None = None
+
         # Estado independiente del Reproductor Dual
         self._search_mode: Literal["video", "music"] = "video"
         self._active_deck: Literal["video", "music"] = "video"
@@ -241,6 +255,7 @@ class MainWindow(QMainWindow):
             initial_audio_only=self.cfg.video_audio_only,
         )
         self.vol_hud = VolumeHudOverlay(palette=self.palette)
+        self.action_hud = PlaybackFeedbackHud(palette=self.palette)
 
         self._connect_player_signals()
         self._connect_video_panel_signals()
@@ -882,7 +897,7 @@ class MainWindow(QMainWindow):
     def _connect_video_panel_signals(self) -> None:
         p = self.video_panel
         p.back_requested.connect(lambda: self._switch_page(self.PAGE_VIDEO_SEARCH))
-        p.play_pause_requested.connect(lambda: self.toggle_deck_play_pause("video"))
+        p.play_pause_requested.connect(self._on_video_play_btn_clicked)
         p.seek_requested.connect(self.video_player.seek)
         p.volume_changed.connect(self._on_video_volume_changed)
         p.speed_changed.connect(self._on_video_speed_changed)
@@ -1007,6 +1022,12 @@ class MainWindow(QMainWindow):
 
     def _shortcut_space(self) -> None:
         if not self._typing_in_input():
+            if (
+                self._get_effective_deck() == "video"
+                and self._video_item is not None
+                and self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER
+            ):
+                self._show_action_hud("play" if self._video_paused else "pause")
             self.toggle_play_pause()
 
     def _shortcut_fullscreen(self) -> None:
@@ -1036,6 +1057,8 @@ class MainWindow(QMainWindow):
             deck = self._get_effective_deck()
             if deck == "video" and self._video_item is not None:
                 self.video_player.seek_relative(delta)
+                if self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER:
+                    self._show_action_hud("play", text=f"{int(delta):+d}s")
             elif deck == "music" and self._music_item is not None:
                 self.music_player.seek_relative(delta)
 
@@ -1101,6 +1124,7 @@ class MainWindow(QMainWindow):
         self.music_panel.update_theme(p)
         self.fs_overlay.update_theme(p)
         self.vol_hud.update_theme(p)
+        self.action_hud.update_theme(p)
         self.mini_bar.update_theme(p)
         self._refresh_sidebar_toggle_ui()
         if self.video_refresh_btn is not None:
@@ -1150,7 +1174,10 @@ class MainWindow(QMainWindow):
         if self._is_fullscreen and page_idx != self.PAGE_VIDEO_PLAYER:
             self.toggle_fullscreen()
 
+        prev_idx = self.stack.currentIndex()
         self.stack.setCurrentIndex(page_idx)
+        if page_idx == self.PAGE_MUSIC_PLAYER and prev_idx != self.PAGE_MUSIC_PLAYER:
+            self.music_panel.play_entrance_animation()
 
         music_return_nav = {
             self.PAGE_MUSIC_SEARCH: self.nav_ytm,
@@ -1541,9 +1568,42 @@ class MainWindow(QMainWindow):
         card.play_requested.connect(self.play_video)
         card.watch_later_toggled.connect(self._toggle_watch_later_item)
         card.download_requested.connect(lambda it: self._download_item(it, "video"))
+        card.hover_entered.connect(self._on_video_card_hover_enter)
+        card.hover_left.connect(self._on_video_card_hover_leave)
         if show_remove:
             card.remove_requested.connect(self._remove_history_item)
         return card
+
+    def _on_video_card_hover_enter(self, item: MediaItem) -> None:
+        if not item.video_id:
+            return
+        self._hover_prefetch_item = item
+        self._video_prefetch_timer.start()
+
+    def _on_video_card_hover_leave(self, item: MediaItem) -> None:
+        if self._hover_prefetch_item is item:
+            self._hover_prefetch_item = None
+            self._video_prefetch_timer.stop()
+
+    def _run_hover_video_prefetch(self) -> None:
+        item = self._hover_prefetch_item
+        if item is None or not item.video_id or self._prefetch_inflight >= 1:
+            return
+        audio_only = self.cfg.video_audio_only
+        quality = self.cfg.video_quality
+        if self.yt.has_cached_stream(item.video_id, audio_only=audio_only, quality=quality):
+            return
+        self._prefetch_inflight += 1
+        self._run_async(
+            lambda: self.yt.prefetch_stream(
+                item.video_id, audio_only=audio_only, quality=quality
+            ),
+            on_done=lambda _res: self._finish_prefetch(),
+            on_error=lambda _err: self._finish_prefetch(),
+        )
+
+    def _finish_prefetch(self) -> None:
+        self._prefetch_inflight = max(0, self._prefetch_inflight - 1)
 
     def _create_music_tile(self, item: MediaItem) -> MusicTileWidget:
         tile = MusicTileWidget(
@@ -1762,8 +1822,14 @@ class MainWindow(QMainWindow):
         self._last_saved_video_ts = time.monotonic()
 
     def play_video(self, item: MediaItem, start_pos: float | None = None) -> None:
+        self._video_click_timer.stop()
+        self._video_prefetch_timer.stop()
         self._save_current_video_progress(force=True)
         self._pause_other_if_auto("video")
+
+        # Cierre instantáneo del video anterior al cambiar a uno nuevo
+        if self._video_item is not None:
+            self.video_player.stop()
 
         if start_pos is None:
             saved_pos = float(getattr(item, "resume_pos", 0.0) or 0.0)
@@ -1796,10 +1862,17 @@ class MainWindow(QMainWindow):
             self.fs_overlay.set_duration(self._video_dur)
             self.video_panel.set_position(effective_start)
             self.fs_overlay.set_position(effective_start)
-        self.video_panel.set_status("Cargando stream...")
-        self.video_panel.set_audio_only_visual(self.cfg.video_audio_only)
+
+        audio_only = self.cfg.video_audio_only
+        quality = self.cfg.video_quality
+        is_cached = self.yt.has_cached_stream(
+            item.video_id, audio_only=audio_only, quality=quality
+        )
+        self.video_panel.set_audio_only_visual(audio_only)
+        self.video_panel.set_loading_state(not is_cached)
+        self.video_panel.set_status("" if is_cached else "Cargando video...")
         self.fs_overlay.set_item(item, wl_saved)
-        self.fs_overlay.set_audio_only_silent(self.cfg.video_audio_only)
+        self.fs_overlay.set_audio_only_silent(audio_only)
         self._sync_mini_bar()
 
         if start_pos is None and effective_start >= 3.0:
@@ -1809,8 +1882,6 @@ class MainWindow(QMainWindow):
 
         self._video_play_gen += 1
         gen = self._video_play_gen
-        audio_only = self.cfg.video_audio_only
-        quality = self.cfg.video_quality
         self._run_async(
             lambda: self.yt.resolve_stream(item.video_id, audio_only=audio_only, quality=quality),
             on_done=lambda stream: self._on_video_stream_resolved(gen, stream, effective_start),
@@ -1822,6 +1893,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         if gen != self._video_play_gen:
             return
+        self.video_panel.set_loading_state(False)
         self.video_panel.set_status("")
         if stream.duration > 0:
             self._on_video_dur_changed(stream.duration)
@@ -1838,6 +1910,7 @@ class MainWindow(QMainWindow):
     def _on_video_play_error(self, gen: int, err: str) -> None:
         if gen != self._video_play_gen:
             return
+        self.video_panel.set_loading_state(False)
         self.video_panel.set_status("Error")
         self.show_toast(f"No se pudo reproducir el video: {err}")
 
@@ -2066,6 +2139,18 @@ class MainWindow(QMainWindow):
         self._sync_bottom_bar()
         self._update_bottom_bar_visibility()
 
+        # Pre-resolver la siguiente canción en segundo plano para transición instantánea
+        nxt_idx = self._queue_index + 1
+        if 0 <= nxt_idx < len(self._music_queue) and self._prefetch_inflight < 2:
+            nxt = self._music_queue[nxt_idx]
+            if nxt.video_id and not self.yt.has_cached_stream(nxt.video_id, audio_only=True):
+                self._prefetch_inflight += 1
+                self._run_async(
+                    lambda vid=nxt.video_id: self.yt.prefetch_stream(vid, audio_only=True),
+                    on_done=lambda _res: self._finish_prefetch(),
+                    on_error=lambda _err: self._finish_prefetch(),
+                )
+
     def _on_music_play_error(self, gen: int, err: str) -> None:
         if gen != self._music_play_gen:
             return
@@ -2220,6 +2305,7 @@ class MainWindow(QMainWindow):
 
     def _on_music_paused_changed(self, paused: bool) -> None:
         self._music_paused = paused
+        self.music_panel.set_playing_state(not paused)
         if not paused:
             self._active_deck = "music"
         self._sync_bottom_bar()
@@ -2279,6 +2365,21 @@ class MainWindow(QMainWindow):
             anchor = QRect(top_left, ms.size())
         self.vol_hud.show_volume(percent, anchor)
 
+    def _show_action_hud(self, icon_name: str, text: str = "") -> None:
+        if self._is_fullscreen:
+            scr = self.screen() or QApplication.primaryScreen()
+            anchor = scr.geometry() if scr else self.geometry()
+        else:
+            ms = self.video_panel.media_stack
+            top_left = ms.mapToGlobal(QPoint(0, 0))
+            anchor = QRect(top_left, ms.size())
+        self.action_hud.show_action(icon_name, anchor, text=text)
+
+    def _on_video_play_btn_clicked(self) -> None:
+        if self._video_item is not None:
+            self._show_action_hud("play" if self._video_paused else "pause")
+        self.toggle_deck_play_pause("video")
+
     def _on_video_surface_clicked(self) -> None:
         if self._video_item is None or self.stack.currentIndex() != self.PAGE_VIDEO_PLAYER:
             return
@@ -2291,6 +2392,7 @@ class MainWindow(QMainWindow):
             return
         if (time.monotonic() - self._last_video_dbl_ts) < 0.30:
             return
+        self._show_action_hud("play" if self._video_paused else "pause")
         self.toggle_deck_play_pause("video")
 
     def _on_video_surface_double_clicked(self) -> None:
@@ -2544,11 +2646,38 @@ class MainWindow(QMainWindow):
     def _update_bottom_bar_visibility(self) -> None:
         # Fija siempre mientras haya reproducción/contenido, excepto en video fullscreen o dentro del reproductor de video
         if self._is_fullscreen:
+            if self._bottom_bar_anim is not None:
+                self._bottom_bar_anim.stop()
+            self.bottom_bar.setFixedHeight(74)
             self.bottom_bar.setVisible(False)
             return
         on_video_player = self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER
         has_any = self._video_item is not None or self._music_item is not None
-        self.bottom_bar.setVisible(has_any and not on_video_player)
+        should_show = has_any and not on_video_player
+        was_visible = self.bottom_bar.isVisible()
+        if should_show and not was_visible:
+            if self._bottom_bar_anim is not None:
+                self._bottom_bar_anim.stop()
+            self.bottom_bar.setMinimumHeight(0)
+            self.bottom_bar.setMaximumHeight(0)
+            self.bottom_bar.setVisible(True)
+            anim = QPropertyAnimation(self.bottom_bar, b"maximumHeight", self)
+            anim.setDuration(180)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(0)
+            anim.setEndValue(74)
+            anim.finished.connect(self._on_bottom_bar_shown)
+            self._bottom_bar_anim = anim
+            anim.start()
+        elif not should_show:
+            if self._bottom_bar_anim is not None:
+                self._bottom_bar_anim.stop()
+            self.bottom_bar.setFixedHeight(74)
+            self.bottom_bar.setVisible(False)
+
+    def _on_bottom_bar_shown(self) -> None:
+        if self.bottom_bar.isVisible():
+            self.bottom_bar.setFixedHeight(74)
 
     # ------------------------------------------------------------------
     # Modo Teatro (Sidebar), Fullscreen 100%, Mini-barra y Ajustes
@@ -2562,8 +2691,28 @@ class MainWindow(QMainWindow):
             self._refresh_sidebar_toggle_ui()
             return
         self._sidebar_hidden = not self._sidebar_hidden
-        self.sidebar.setVisible(not self._sidebar_hidden)
+        if self._sidebar_anim is not None:
+            self._sidebar_anim.stop()
+        if self._sidebar_hidden:
+            self.sidebar.setFixedWidth(220)
+            self.sidebar.setVisible(False)
+        else:
+            self.sidebar.setMinimumWidth(0)
+            self.sidebar.setMaximumWidth(0)
+            self.sidebar.setVisible(True)
+            anim = QPropertyAnimation(self.sidebar, b"maximumWidth", self)
+            anim.setDuration(170)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(0)
+            anim.setEndValue(220)
+            anim.finished.connect(self._on_sidebar_shown)
+            self._sidebar_anim = anim
+            anim.start()
         self._refresh_sidebar_toggle_ui()
+
+    def _on_sidebar_shown(self) -> None:
+        if not self._sidebar_hidden:
+            self.sidebar.setFixedWidth(220)
 
     def _refresh_sidebar_toggle_ui(self) -> None:
         p = self.palette
@@ -2594,12 +2743,15 @@ class MainWindow(QMainWindow):
                 self.normalGeometry() if self._pre_fs_was_maximized else self.geometry()
             )
             self._is_fullscreen = True
+            if self._sidebar_anim is not None:
+                self._sidebar_anim.stop()
             self.sidebar.setVisible(False)
             self.top_bar.setVisible(False)
             self.video_panel.set_fullscreen_state(True)
             self._update_bottom_bar_visibility()
             self.showFullScreen()
             self.video_player.set_cursor_autohide(500)
+            self._show_action_hud("fullscreen")
             QTimer.singleShot(50, self._on_video_mouse_moved)
         else:
             self._is_fullscreen = False
@@ -2611,11 +2763,16 @@ class MainWindow(QMainWindow):
                 self.showNormal()
                 if self._pre_fs_geometry is not None and self._pre_fs_geometry.isValid():
                     self.setGeometry(self._pre_fs_geometry)
+            if self._sidebar_anim is not None:
+                self._sidebar_anim.stop()
+            self.sidebar.setFixedWidth(220)
             self.sidebar.setVisible(not self._sidebar_hidden)
             self.top_bar.setVisible(True)
             self.video_panel.set_fullscreen_state(False)
             self._update_bottom_bar_visibility()
             self._refresh_sidebar_toggle_ui()
+            if self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER and self._video_item is not None:
+                self._show_action_hud("exit_fullscreen")
 
     def toggle_mini_bar(self) -> None:
         if self.mini_bar.isVisible():
@@ -2803,6 +2960,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.vol_hud.close()
+        except Exception:
+            pass
+        try:
+            self.action_hud.close()
         except Exception:
             pass
         try:

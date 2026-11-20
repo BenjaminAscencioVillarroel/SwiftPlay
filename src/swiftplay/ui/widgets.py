@@ -9,6 +9,7 @@ from PySide6.QtCore import (
     QRectF,
     QSize,
     Qt,
+    QTimer,
     QVariantAnimation,
     Signal,
 )
@@ -215,7 +216,81 @@ class RoundedThumbWidget(QWidget):
         self._prev_pixmap: QPixmap | None = None
         self._fade_t = 1.0
         self._fade_anim: QVariantAnimation | None = None
+        self._enter_t = 1.0
+        self._enter_anim: QVariantAnimation | None = None
+        self._press_t = 0.0
+        self._press_anim: QVariantAnimation | None = None
+        self._playing_bars = False
+        self._bars_phase = 0
+        self._bars_timer: QTimer | None = None
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+    def _on_enter_val(self, val: object) -> None:
+        self._enter_t = float(val)
+        self.update()
+
+    def play_entrance(self) -> None:
+        if self._enter_anim is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(220)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.valueChanged.connect(self._on_enter_val)
+            self._enter_anim = anim
+        self._enter_t = 0.0
+        self._enter_anim.stop()
+        self._enter_anim.start()
+        self.update()
+
+    def _on_press_val(self, val: object) -> None:
+        self._press_t = float(val)
+        self.update()
+
+    def trigger_press_feedback(self) -> None:
+        if self._press_anim is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(110)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.valueChanged.connect(self._on_press_val)
+            self._press_anim = anim
+        self._press_t = 1.0
+        self._press_anim.stop()
+        self._press_anim.start()
+
+    def _on_bars_tick(self) -> None:
+        self._bars_phase = (self._bars_phase + 1) % 6
+        self.update()
+
+    def set_playing_bars(self, active: bool) -> None:
+        active = bool(active)
+        if self._playing_bars == active:
+            return
+        self._playing_bars = active
+        if active:
+            if self._bars_timer is None:
+                timer = QTimer(self)
+                timer.setInterval(85)
+                timer.timeout.connect(self._on_bars_tick)
+                self._bars_timer = timer
+            if self.isVisible():
+                self._bars_timer.start()
+        else:
+            if self._bars_timer is not None:
+                self._bars_timer.stop()
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._playing_bars and self._bars_timer is not None:
+            self._bars_timer.start()
+
+    def hideEvent(self, event) -> None:
+        if self._bars_timer is not None:
+            self._bars_timer.stop()
+        super().hideEvent(event)
 
     def _on_hover_val(self, val: object) -> None:
         self._hover_t = float(val)
@@ -355,6 +430,14 @@ class RoundedThumbWidget(QWidget):
             if (self._enable_hover_zoom and self._hover_t > 0.001)
             else 1.0
         )
+        if self._enter_t < 1.0:
+            zoom *= 0.94 + 0.06 * self._enter_t
+        if self._press_t > 0.001:
+            zoom *= 1.0 - 0.03 * self._press_t
+
+        old_op = painter.opacity()
+        if self._enter_t < 1.0:
+            painter.setOpacity(0.35 + 0.65 * self._enter_t)
 
         if (
             self._prev_pixmap is not None
@@ -365,26 +448,47 @@ class RoundedThumbWidget(QWidget):
             if self._pixmap is not None and not self._pixmap.isNull():
                 painter.setOpacity(self._fade_t)
                 self._draw_pixmap_cover(painter, self._pixmap, w, h, zoom=zoom)
-                painter.setOpacity(1.0)
+                painter.setOpacity(old_op)
         elif self._pixmap is not None and not self._pixmap.isNull():
             self._draw_pixmap_cover(painter, self._pixmap, w, h, zoom=zoom)
+        painter.setOpacity(old_op)
 
         ov_t = 1.0 if self._force_play_overlay else (
             self._hover_t if (self._show_play_on_hover and self._hover_t > 0.01) else 0.0
         )
         if ov_t > 0.0:
             painter.fillRect(rect, QColor(11, 12, 14, int(125 * ov_t)))
-            tri = max(12.0, min(36.0, min(w, h) * 0.24)) * (0.86 + 0.14 * ov_t)
-            cx = w / 2.0
-            cy = h / 2.0
-            play_path = QPainterPath()
-            play_path.moveTo(cx - tri * 0.36, cy - tri * 0.50)
-            play_path.lineTo(cx + tri * 0.52, cy)
-            play_path.lineTo(cx - tri * 0.36, cy + tri * 0.50)
-            play_path.closeSubpath()
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(255, 255, 255, int(255 * ov_t)))
-            painter.drawPath(play_path)
+            if self._force_play_overlay and self._playing_bars:
+                heights = (
+                    (0.45, 0.85, 0.60),
+                    (0.75, 0.50, 0.90),
+                    (0.90, 0.70, 0.45),
+                    (0.55, 0.95, 0.70),
+                    (0.40, 0.65, 0.85),
+                    (0.80, 0.45, 0.55),
+                )[self._bars_phase]
+                bw = max(2.5, min(w, h) * 0.09)
+                gap = bw * 0.8
+                total_w = bw * 3 + gap * 2
+                max_h = min(w, h) * 0.44
+                x0 = (w - total_w) / 2.0
+                base_y = (h + max_h) / 2.0
+                for idx_b, ratio_b in enumerate(heights):
+                    bh = max(4.0, max_h * ratio_b)
+                    bx = x0 + idx_b * (bw + gap)
+                    painter.drawRoundedRect(QRectF(bx, base_y - bh, bw, bh), 1.5, 1.5)
+            else:
+                tri = max(12.0, min(36.0, min(w, h) * 0.24)) * (0.86 + 0.14 * ov_t)
+                cx = w / 2.0
+                cy = h / 2.0
+                play_path = QPainterPath()
+                play_path.moveTo(cx - tri * 0.36, cy - tri * 0.50)
+                play_path.lineTo(cx + tri * 0.52, cy)
+                play_path.lineTo(cx - tri * 0.36, cy + tri * 0.50)
+                play_path.closeSubpath()
+                painter.drawPath(play_path)
 
         if self._duration_text:
             font = QFont(self.font())
@@ -502,6 +606,8 @@ class VideoGridCard(QFrame):
     watch_later_toggled = Signal(object)  # MediaItem
     download_requested = Signal(object)   # MediaItem
     remove_requested = Signal(object)     # MediaItem
+    hover_entered = Signal(object)        # MediaItem
+    hover_left = Signal(object)           # MediaItem
 
     THUMB_FETCH_SIZE = QSize(320, 180)
     AVATAR_SIZE = QSize(34, 34)
@@ -667,8 +773,17 @@ class VideoGridCard(QFrame):
             )
         self.more_btn.setIcon(render_icon("more", palette.text2, 16))
 
+    def enterEvent(self, event) -> None:
+        self.hover_entered.emit(self.item)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.hover_left.emit(self.item)
+        super().leaveEvent(event)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            self.thumb_widget.trigger_press_feedback()
             self.play_requested.emit(self.item)
         super().mousePressEvent(event)
 
@@ -788,6 +903,7 @@ class MusicTileWidget(QFrame):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            self.thumb_widget.trigger_press_feedback()
             self.play_requested.emit(self.item)
         super().mousePressEvent(event)
 
@@ -1252,8 +1368,14 @@ class MusicRowWidget(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
         self.thumb_label.set_force_play_overlay(is_current)
+        if not is_current:
+            self.thumb_label.set_playing_bars(False)
         color = self._palette.accent if is_current else self._palette.text
         self.title_lbl.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {color};")
+        self.update()
+
+    def set_playing_indicator(self, playing: bool) -> None:
+        self.thumb_label.set_playing_bars(self._is_current and bool(playing))
 
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette

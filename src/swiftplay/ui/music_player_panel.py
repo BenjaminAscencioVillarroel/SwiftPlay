@@ -51,6 +51,7 @@ class MusicNowPlayingPanel(QWidget):
         self._in_my_music = False
         self._autoplay_enabled = bool(autoplay_enabled)
         self._radio_loading = False
+        self._is_playing = False
         self._queue_rows: list[MusicRowWidget] = []
         self._queue_scroll_anim: QPropertyAnimation | None = None
 
@@ -257,6 +258,14 @@ class MusicNowPlayingPanel(QWidget):
         self._radio_loading = bool(loading)
         self.radio_status_lbl.setText("Cargando más canciones..." if loading else "")
 
+    def play_entrance_animation(self) -> None:
+        self.cover_widget.play_entrance()
+
+    def set_playing_state(self, playing: bool) -> None:
+        self._is_playing = bool(playing)
+        for row in self._queue_rows:
+            row.set_playing_indicator(self._is_playing)
+
     def render_queue(
         self,
         queue: list[MediaItem],
@@ -300,6 +309,7 @@ class MusicNowPlayingPanel(QWidget):
             self._queue_rows.append(row)
             self.queue_lay.insertWidget(self.queue_lay.count() - 1, row)
             if is_cur:
+                row.set_playing_indicator(self._is_playing)
                 current_row = row
 
         if current_row is not None:

@@ -54,6 +54,7 @@ class MediaPlayer(QObject):
         self._speed = clamp_speed(initial_speed)
         self._normalization = bool(normalization)
         self._last_mouse_xy: tuple[int | None, int | None] | None = None
+        self._applied_af: str | None = None
         self._mpv: mpv.MPV | None = None
 
         if not lazy:
@@ -69,6 +70,7 @@ class MediaPlayer(QObject):
             # CRÍTICO en Windows en español: libmpv requiere LC_NUMERIC = "C"
             locale.setlocale(locale.LC_NUMERIC, "C")
 
+            target_af = NORMALIZATION_FILTER if self._normalization else ""
             kwargs: dict = dict(
                 idle="yes",
                 keep_open="no",
@@ -81,10 +83,13 @@ class MediaPlayer(QObject):
                 audio_pitch_correction=True,
                 ytdl=False,
                 cache="yes",
-                cache_secs=12,
+                cache_secs=8,
+                cache_pause_initial="no",
+                demuxer_lavf_probesize=1048576,
+                demuxer_lavf_analyzeduration=0.5,
                 volume=self._volume,
                 speed=self._speed,
-                af=NORMALIZATION_FILTER if self._normalization else "",
+                af=target_af,
             )
             if self._wid is not None:
                 kwargs["wid"] = str(int(self._wid))
@@ -100,6 +105,7 @@ class MediaPlayer(QObject):
                 kwargs["demuxer_max_back_bytes"] = "1MiB"
 
             self._mpv = mpv.MPV(**kwargs)
+            self._applied_af = target_af
             self._register_observers()
             return self._mpv
 
@@ -217,7 +223,10 @@ class MediaPlayer(QObject):
             player.start = f"+{start_pos:.1f}" if start_pos > 0.5 else "none"
             player.volume = self._volume
             player.speed = self._speed
-            player.af = NORMALIZATION_FILTER if self._normalization else ""
+            target_af = NORMALIZATION_FILTER if self._normalization else ""
+            if target_af != self._applied_af:
+                player.af = target_af
+                self._applied_af = target_af
 
             headers = http_headers or {}
             ua = headers.get("User-Agent")
@@ -231,7 +240,7 @@ class MediaPlayer(QObject):
             player.http_header_fields = extra_headers
             player["audio-files"] = [audio_url] if audio_url else []
             player.pause = False
-            player.play(primary_url)
+            player.loadfile(primary_url, "replace")
 
     def set_pause(self, paused: bool) -> None:
         with self._lock:
@@ -247,6 +256,10 @@ class MediaPlayer(QObject):
         with self._lock:
             if not self._shutdown and self._mpv is not None:
                 self._user_stopped = True
+                try:
+                    self._mpv["audio-files"] = []
+                except Exception:
+                    pass
                 self._mpv.command("stop")
 
     def seek(self, seconds: float) -> None:
@@ -278,8 +291,11 @@ class MediaPlayer(QObject):
     def set_normalization(self, enabled: bool) -> None:
         with self._lock:
             self._normalization = bool(enabled)
+            target_af = NORMALIZATION_FILTER if self._normalization else ""
             if not self._shutdown and self._mpv is not None:
-                self._mpv.af = NORMALIZATION_FILTER if self._normalization else ""
+                if target_af != self._applied_af:
+                    self._mpv.af = target_af
+                    self._applied_af = target_af
 
     def set_video_enabled(self, enabled: bool) -> None:
         with self._lock:
