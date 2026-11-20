@@ -71,7 +71,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
 
     QFrame#Sidebar {{
         background-color: {p.surface1};
-        border-right: 1px solid {p.border};
+        border-right: 1px solid rgba(255, 255, 255, 14);
     }}
 
     QLabel#BrandTitle {{
@@ -86,12 +86,13 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         font-size: 10px;
         font-weight: 700;
         letter-spacing: 1.3px;
-        padding: 10px 10px 4px 10px;
+        padding: 12px 10px 4px 10px;
     }}
 
     QLabel#ViewTitle {{
-        font-size: 19px;
+        font-size: 21px;
         font-weight: 700;
+        letter-spacing: -0.2px;
         color: {p.text};
     }}
 
@@ -101,21 +102,21 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     }}
 
     QLabel#DeckTag {{
-        background-color: {p.surface2};
+        background-color: rgba(255, 255, 255, 14);
         color: {p.accent};
-        border: 1px solid {p.border_bright};
-        border-radius: 5px;
-        padding: 1px 6px;
-        font-size: 10px;
+        border: none;
+        border-radius: 4px;
+        padding: 2px 6px;
+        font-size: 9px;
         font-weight: 700;
-        letter-spacing: 0.6px;
+        letter-spacing: 0.7px;
     }}
 
     QPushButton#NavBtn {{
         background-color: transparent;
         color: {p.text2};
         border: 1px solid transparent;
-        border-radius: 8px;
+        border-radius: 9px;
         text-align: left;
         padding: 8px 12px;
         font-size: 13px;
@@ -123,22 +124,22 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     }}
 
     QPushButton#NavBtn:hover {{
-        background-color: {p.surface2};
+        background-color: rgba(255, 255, 255, 9);
         color: {p.text};
-        border: 1px solid {p.border};
+        border: 1px solid transparent;
     }}
 
     QPushButton#NavBtn[active="true"] {{
-        background-color: {p.surface2};
+        background-color: rgba(255, 255, 255, 15);
         color: {p.text};
-        border: 1px solid {p.border_bright};
+        border: 1px solid transparent;
         border-left: 3px solid {p.accent};
         font-weight: 600;
     }}
 
     QFrame#TopBar {{
         background-color: {p.base};
-        border-bottom: 1px solid {p.border};
+        border-bottom: 1px solid rgba(255, 255, 255, 12);
     }}
 
     QLineEdit, QPlainTextEdit {{
@@ -156,15 +157,33 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
 
     QLineEdit#SearchInput {{
         background-color: {p.surface1};
-        border: 1px solid {p.border};
-        border-radius: 18px;
-        padding: 8px 16px;
+        border: 1px solid rgba(255, 255, 255, 18);
+        border-radius: 19px;
+        padding: 7px 16px;
+        min-height: 22px;
         font-size: 13px;
     }}
 
     QLineEdit#SearchInput:focus {{
         border: 1px solid {p.accent};
         background-color: {p.surface2};
+    }}
+
+    QPushButton#SearchSubmitBtn {{
+        background-color: rgba(255, 255, 255, 14);
+        color: {p.text};
+        border: 1px solid rgba(255, 255, 255, 20);
+        border-radius: 18px;
+        padding: 0px;
+    }}
+
+    QPushButton#SearchSubmitBtn:hover {{
+        background-color: rgba(255, 255, 255, 26);
+        border-color: {p.border_bright};
+    }}
+
+    QPushButton#SearchSubmitBtn:pressed {{
+        background-color: {p.surface1};
     }}
 
     QPushButton {{
@@ -211,7 +230,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #EAEEF4, stop:1 #C2C9D4);
         color: {p.accent_text};
         border: 1px solid #F2F4F8;
-        border-radius: 10px;
+        border-radius: 17px;
         padding: 0px;
         font-weight: 700;
     }}
@@ -337,7 +356,18 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
 
     QFrame#PlayerBar, QFrame#VideoControlsBar {{
         background-color: {p.surface1};
-        border-top: 1px solid {p.border};
+        border-top: 1px solid rgba(255, 255, 255, 16);
+    }}
+
+    QFrame#ContinueBanner {{
+        background-color: rgba(255, 255, 255, 9);
+        border: 1px solid rgba(255, 255, 255, 18);
+        border-radius: 12px;
+    }}
+
+    QFrame#ContinueBanner:hover {{
+        background-color: rgba(255, 255, 255, 14);
+        border-color: {p.border_bright};
     }}
 
     QFrame#MiniClickArea {{
@@ -418,9 +448,9 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QComboBox {{
         background-color: {p.surface2};
         color: {p.text};
-        border: 1px solid {p.border};
-        border-radius: 6px;
-        padding: 4px 10px;
+        border: 1px solid rgba(255, 255, 255, 18);
+        border-radius: 14px;
+        padding: 3px 10px;
         min-height: 22px;
     }}
 
@@ -465,31 +495,32 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     }}
 
     QSlider::groove:horizontal {{
-        height: 4px;
-        background: rgba(255, 255, 255, 28);
-        border-radius: 2px;
+        height: 3px;
+        background: rgba(255, 255, 255, 26);
+        border-radius: 1px;
     }}
 
     QSlider::sub-page:horizontal {{
         background: {p.accent};
-        border-radius: 2px;
+        border-radius: 1px;
     }}
 
     QSlider::handle:horizontal {{
-        background: {p.text};
-        border: 2px solid {p.accent};
-        width: 12px;
-        height: 12px;
-        margin: -4px 0;
-        border-radius: 7px;
+        background: {p.accent};
+        border: 1px solid {p.base};
+        width: 9px;
+        height: 9px;
+        margin: -3px 0;
+        border-radius: 5px;
     }}
 
     QSlider::handle:horizontal:hover {{
         background: #FFFFFF;
-        width: 14px;
-        height: 14px;
+        border: 1px solid {p.accent};
+        width: 13px;
+        height: 13px;
         margin: -5px 0;
-        border-radius: 8px;
+        border-radius: 7px;
     }}
 
     QScrollArea {{
@@ -499,18 +530,18 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
 
     QScrollBar:vertical {{
         background: transparent;
-        width: 8px;
-        margin: 2px;
+        width: 6px;
+        margin: 2px 1px;
     }}
 
     QScrollBar::handle:vertical {{
-        background: {p.border};
-        border-radius: 4px;
-        min-height: 30px;
+        background: rgba(255, 255, 255, 26);
+        border-radius: 3px;
+        min-height: 28px;
     }}
 
     QScrollBar::handle:vertical:hover {{
-        background: {p.text2};
+        background: rgba(255, 255, 255, 58);
     }}
 
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,

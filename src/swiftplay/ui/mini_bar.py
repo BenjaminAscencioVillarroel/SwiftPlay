@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QSize, Qt, Signal
+from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QSize, Qt, Signal
 from PySide6.QtGui import QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -17,7 +17,7 @@ from swiftplay.models import MediaItem
 from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
-from swiftplay.ui.widgets import ClickableSlider
+from swiftplay.ui.widgets import ClickableSlider, RoundedThumbWidget
 
 
 class MiniBarWindow(QWidget):
@@ -50,10 +50,15 @@ class MiniBarWindow(QWidget):
         self._seeking = False
         self._current_thumb_url = ""
         self._drag_pos: QPoint | None = None
+        self._fading_out = False
 
         self._apply_window_flags()
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(440, 78)
+
+        self._opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self._opacity_anim.finished.connect(self._on_anim_finished)
+        self._pos_anim = QPropertyAnimation(self, b"pos", self)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -69,9 +74,12 @@ class MiniBarWindow(QWidget):
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
-        self.thumb_lbl = QLabel()
+        self.thumb_lbl = RoundedThumbWidget(
+            radius=8,
+            enable_crossfade=True,
+            bg_color=palette.surface1,
+        )
         self.thumb_lbl.setFixedSize(self.THUMB_SIZE)
-        self.thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         top_row.addWidget(self.thumb_lbl)
 
         text_col = QVBoxLayout()
@@ -109,11 +117,11 @@ class MiniBarWindow(QWidget):
         self.next_btn.clicked.connect(self.next_requested.emit)
         top_row.addWidget(self.next_btn)
 
-        self.vol_slider = ClickableSlider(Qt.Orientation.Horizontal)
+        self.vol_slider = ClickableSlider(Qt.Orientation.Horizontal, volume_wheel=True)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(initial_volume)
         self.vol_slider.setFixedWidth(56)
-        self.vol_slider.setToolTip("Volumen")
+        self.vol_slider.setToolTip("Volumen (rueda: ±5%, Shift: ±1%)")
         self.vol_slider.valueChanged.connect(self.volume_changed.emit)
         top_row.addWidget(self.vol_slider)
 
@@ -170,6 +178,52 @@ class MiniBarWindow(QWidget):
         if self._duration > 0:
             self.seek_requested.emit((self.seek_slider.value() / 1000.0) * self._duration)
 
+    def _on_anim_finished(self) -> None:
+        if self._fading_out:
+            self._fading_out = False
+            super().hide()
+
+    def show_animated(self, target_pos: QPoint) -> None:
+        self._opacity_anim.stop()
+        self._pos_anim.stop()
+        self._fading_out = False
+        start_pos = QPoint(target_pos.x(), target_pos.y() + 8)
+        self.setWindowOpacity(0.0)
+        self.move(start_pos)
+        self.show()
+        self.raise_()
+
+        self._opacity_anim.setDuration(140)
+        self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._opacity_anim.setStartValue(0.0)
+        self._opacity_anim.setEndValue(1.0)
+        self._opacity_anim.start()
+
+        self._pos_anim.setDuration(140)
+        self._pos_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._pos_anim.setStartValue(start_pos)
+        self._pos_anim.setEndValue(target_pos)
+        self._pos_anim.start()
+
+    def hide_animated(self) -> None:
+        if not self.isVisible() or self._fading_out:
+            return
+        cur = float(self.windowOpacity())
+        self._opacity_anim.stop()
+        self._pos_anim.stop()
+        self._fading_out = True
+        self._opacity_anim.setDuration(max(70, int(140 * cur)))
+        self._opacity_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._opacity_anim.setStartValue(cur)
+        self._opacity_anim.setEndValue(0.0)
+        self._opacity_anim.start()
+
+        self._pos_anim.setDuration(max(70, int(140 * cur)))
+        self._pos_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._pos_anim.setStartValue(self.pos())
+        self._pos_anim.setEndValue(QPoint(self.x(), self.y() + 8))
+        self._pos_anim.start()
+
     def set_item(self, item: MediaItem | None) -> None:
         if item is None:
             self.title_lbl.setText("Sin reproducción")
@@ -186,11 +240,13 @@ class MiniBarWindow(QWidget):
         self._current_thumb_url = item.normalized_thumb()
         pix = self._thumb_cache.get_or_fetch(self._current_thumb_url, self.THUMB_SIZE)
         if pix is not None:
-            self.thumb_lbl.setPixmap(pix)
+            self.thumb_lbl.set_pixmap(pix)
+        else:
+            self.thumb_lbl.clear()
 
     def _on_thumb_ready(self, url: str, pix: QPixmap) -> None:
-        if url == self._current_thumb_url:
-            self.thumb_lbl.setPixmap(pix)
+        if url == self._current_thumb_url and pix.size() == self.THUMB_SIZE:
+            self.thumb_lbl.set_pixmap(pix)
 
     def set_duration(self, duration: float) -> None:
         self._duration = max(0.0, duration)
@@ -220,9 +276,7 @@ class MiniBarWindow(QWidget):
 
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
-        self.thumb_lbl.setStyleSheet(
-            f"background-color: {palette.base}; border-radius: 6px; border: 1px solid {palette.border};"
-        )
+        self.thumb_lbl.set_bg_color(palette.surface1)
         self.prev_btn.setIcon(render_icon("prev", palette.text, 15))
         self.next_btn.setIcon(render_icon("next", palette.text, 15))
         self.expand_btn.setIcon(render_icon("fullscreen", palette.text, 14))

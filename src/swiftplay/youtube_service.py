@@ -86,6 +86,23 @@ def _pick_best_thumb(thumbnails: list[dict] | None, video_id: str = "") -> str:
     return ""
 
 
+_DATE_TOKENS = (
+    "hace ",
+    "emitido",
+    "transmitido",
+    "estrenado",
+    "ago",
+    "streamed",
+    "premiered",
+    "en vivo",
+    "directo",
+)
+
+
+def _normalize_space(text: str) -> str:
+    return " ".join((text or "").replace("\xa0", " ").split()).strip()
+
+
 def _extract_text(obj: Any) -> str:
     if isinstance(obj, str):
         return obj.strip()
@@ -98,6 +115,32 @@ def _extract_text(obj: Any) -> str:
         if isinstance(runs, list):
             return "".join(str(r.get("text", "")) for r in runs if isinstance(r, dict)).strip()
     return ""
+
+
+def _extract_published_from_lockup_rows(rows: Any) -> str:
+    if not isinstance(rows, list):
+        return ""
+    candidates: list[str] = []
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        parts = row.get("metadataParts") or []
+        if not isinstance(parts, list):
+            continue
+        row_texts = [
+            _normalize_space(_extract_text(p.get("text")))
+            for p in parts
+            if isinstance(p, dict)
+        ]
+        row_texts = [t for t in row_texts if t]
+        search_slice = row_texts[1:] if idx == 0 else row_texts
+        for t in search_slice:
+            low = t.lower()
+            if any(tok in low for tok in _DATE_TOKENS):
+                return t
+        if idx == 1 and len(row_texts) >= 2:
+            candidates.append(row_texts[-1])
+    return candidates[0] if candidates else ""
 
 
 def _build_sapisid_hash(sapisid: str, origin: str) -> str:
@@ -222,16 +265,18 @@ def _extract_innertube_videos(
                         .get("image", {})
                         .get("sources")
                     )
+                    published = _normalize_space(_extract_text(vr.get("publishedTimeText")))
                     results.append(
                         MediaItem(
                             video_id=vid,
                             title=title,
-                            author=author or "YouTube",
+                            author=_normalize_space(author) or "YouTube",
                             duration=dur_str or ("EN VIVO" if is_live else ""),
                             duration_sec=dur_sec,
                             thumb_url=thumb,
                             kind="video",
                             channel_avatar_url=avatar,
+                            published_text=published,
                         )
                     )
             return
@@ -301,16 +346,18 @@ def _extract_innertube_videos(
                         .get("image", {})
                         .get("sources")
                     )
+                    published = _extract_published_from_lockup_rows(rows)
                     results.append(
                         MediaItem(
                             video_id=vid,
                             title=title,
-                            author=author or "YouTube",
+                            author=_normalize_space(author) or "YouTube",
                             duration=dur_str or ("EN VIVO" if is_live else ""),
                             duration_sec=dur_sec,
                             thumb_url=thumb,
                             kind="video",
                             channel_avatar_url=avatar,
+                            published_text=published,
                         )
                     )
             return
@@ -825,7 +872,7 @@ class YouTubeService:
     # ------------------------------------------------------------------
 
     _STREAM_CACHE_TTL = 1500.0
-    _STREAM_CACHE_MAX = 20
+    _STREAM_CACHE_MAX = 12
 
     def _stream_key(
         self, video_id: str, audio_only: bool, quality: str
@@ -972,6 +1019,8 @@ class YouTubeService:
                 if self._inflight_streams.get(key) is inflight_entry:
                     self._inflight_streams.pop(key, None)
             ev.set()
+            if is_owner:
+                gc.collect()
 
     def download_media(
         self,

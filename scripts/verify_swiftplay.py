@@ -13,7 +13,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from PySide6.QtCore import QSize, QTimer  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, QSize, QTimer  # noqa: E402
 from PySide6.QtGui import QImage, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -27,12 +27,15 @@ from swiftplay.security import (  # noqa: E402
     save_account_profile,
     save_cookies_encrypted,
 )
+from swiftplay.session_state import SessionState, load_session_state, save_session_state  # noqa: E402
 from swiftplay.storage import LocalLibrary  # noqa: E402
 from swiftplay.themes import THEMES, build_stylesheet  # noqa: E402
 from swiftplay.thumb_cache import ThumbnailCache  # noqa: E402
+from swiftplay.ui.icons import render_icon  # noqa: E402
 from swiftplay.ui.main_window import MainWindow  # noqa: E402
 from swiftplay.ui.settings_dialog import SettingsDialog  # noqa: E402
 from swiftplay.ui.shortcuts_dialog import ShortcutsDialog  # noqa: E402
+from swiftplay.ui.widgets import VideoGridCard  # noqa: E402
 from swiftplay.windows_os import (  # noqa: E402
     apply_window_taskbar_properties,
     get_desktop_shortcut_path,
@@ -148,6 +151,29 @@ def test_storage_config_themes() -> None:
         assert db.count_music_history() == 0
         db.close()
 
+        # Persistencia de última sesión (video + música + cola <= 15)
+        st_path = Path(tmp) / "session_state.json"
+        long_q = [MediaItem(f"q{i}", f"Track {i}", "Art", "3:00", 180, "", "music") for i in range(25)]
+        st = SessionState(
+            active_deck="video",
+            video_item=MediaItem("v_last", "Último Video", "Canal", "10:00", 600, "", "video", published_text="hace 2 días"),
+            video_pos=145.5,
+            video_dur=600.0,
+            music_item=long_q[10],
+            music_pos=32.0,
+            music_dur=180.0,
+            music_queue=long_q,
+            queue_index=10,
+        )
+        save_session_state(st, st_path)
+        st2 = load_session_state(st_path)
+        assert st2.video_item is not None and st2.video_item.video_id == "v_last"
+        assert st2.video_item.published_text == "hace 2 días"
+        assert abs(st2.video_pos - 145.5) < 0.2
+        assert len(st2.music_queue) <= 15
+        assert 0 <= st2.queue_index < len(st2.music_queue)
+        assert st2.music_queue[st2.queue_index].video_id == "q10"
+
     assert upgrade_thumb_url("https://lh3.googleusercontent.com/abc=w120-h120-l90", 544) == (
         "https://lh3.googleusercontent.com/abc=w544-h544-l90"
     )
@@ -173,6 +199,9 @@ def test_storage_config_themes() -> None:
     assert tc.get_or_fetch("https://example.com/av.jpg", QSize(24, 24), circular=True) is not None
     tc._on_loaded("https://example.com/rnd.jpg|48x48|r10", img)
     assert tc.get_or_fetch("https://example.com/rnd.jpg", QSize(48, 48), radius=10) is not None
+    assert render_icon("play", "#CFD5DF", 18) is render_icon("play", "#CFD5DF", 18), (
+        "render_icon debe usar caché LRU en RAM"
+    )
 
     expected_tokens = ["#0B0C0E", "#121418", "#1A1E26", "#262B36", "#F1F3F6", "#CFD5DF"]
     assert "matte_silver" in THEMES
@@ -195,7 +224,9 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
     feed = yt.get_video_home_feed(limit=10)
     assert len(feed) >= 1, "El feed de video no devolvió resultados"
     assert all(not is_short_video(x.duration_sec, title=x.title) for x in feed)
-    print(f"   Feed de video sin Shorts OK ({len(feed)} videos).")
+    dated_count = sum(1 for x in feed if x.published_text)
+    assert dated_count >= 1, "Se esperaba al menos un video del feed con fecha de subida"
+    print(f"   Feed de video sin Shorts OK ({len(feed)} videos, {dated_count} con fecha).")
 
     songs = yt.search_music("daft punk", search_filter="songs", limit=10)
     assert len(songs) >= 5, f"Se esperaban >= 5 canciones, llegaron {len(songs)}"
@@ -222,185 +253,273 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
 def test_gui_and_libmpv_smoke(
     video_stream: ResolvedStream, audio_stream: ResolvedStream
 ) -> float:
-    print("[4/5] Probando GUI Qt6 + Reproductor Dual libmpv + Overlays + Atajos + RAM...")
+    print("[4/5] Probando GUI Qt6 + Reproductor Dual lazy libmpv + Persistencia + RAM...")
     if sys.platform == "win32":
         assert set_process_app_user_model_id(), "Falló SetCurrentProcessExplicitAppUserModelID"
     app = QApplication.instance() or QApplication(sys.argv)
-    win = MainWindow()
-    if sys.platform == "win32":
-        assert apply_window_taskbar_properties(int(win.winId())), "Falló SHGetPropertyStoreForWindow"
-    win.show()
-    app.processEvents()
 
-    assert win.video_player is not win.music_player, "Deben existir dos instancias independientes"
-    assert win.music_player._mpv is None, "music_player debe inicializarse en modo lazy hasta reproducir música"
-    assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH, "Debe abrir en YouTube (Modo Video)"
-    af_val = win.video_player.get_property("af")
-    assert bool(af_val) == win.cfg.audio_normalization, (
-        f"Estado inicial de af ({af_val!r}) no coincide con config ({win.cfg.audio_normalization})"
-    )
-    sub_val = win.video_player.get_property("sub")
-    assert sub_val in ("no", False), f"Subtítulos deben estar desactivados (sub={sub_val!r})"
-
-    # Verificar modo teatro (ocultar/mostrar barra lateral) y restauración de tamaño tras fullscreen
-    assert win.sidebar.isVisible() and not win.video_panel._is_theater
-    win.toggle_sidebar()
-    app.processEvents()
-    assert not win.sidebar.isVisible() and win.video_panel._is_theater
-    win.toggle_sidebar()
-    app.processEvents()
-    assert win.sidebar.isVisible() and not win.video_panel._is_theater
-
-    win.resize(1040, 680)
-    app.processEvents()
-    win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
-    app.processEvents()
-    win.toggle_fullscreen()
-    app.processEvents()
-    win.fs_overlay.reveal(win.geometry())
-    app.processEvents()
-    assert win.fs_overlay.isVisible()
-    win.fs_overlay.fade_out()
-    app.processEvents()
-    win.fs_overlay.hide_immediately()
-    assert not win.fs_overlay.isVisible()
-    win.toggle_fullscreen()
-    app.processEvents()
-    assert abs(win.width() - 1040) <= 20 and abs(win.height() - 680) <= 20, (
-        f"No se preservó el tamaño previo al fullscreen: {win.size()}"
-    )
-    win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
-    app.processEvents()
-
-    # Verificar switch Tab entre Video y Música
-    assert not hasattr(win, "nav_queue"), "El ítem 'Cola' ya no debe existir en la barra lateral"
-    assert hasattr(win, "nav_music_history"), "Falta 'Historial' bajo Música en la barra lateral"
-    assert hasattr(win, "music_panel"), "Falta el panel completo de música con cola integrada"
-
-    win.switch_music_video_tab()
-    app.processEvents()
-    assert win.stack.currentIndex() in (
-        MainWindow.PAGE_MUSIC_SEARCH,
-        MainWindow.PAGE_MY_MUSIC,
-        MainWindow.PAGE_MUSIC_PLAYER,
-        MainWindow.PAGE_MUSIC_HISTORY,
-    )
-    win.switch_music_video_tab()
-    app.processEvents()
-    assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH
-
-    # Verificar página Historial (Video y Música) y vista completa de Música
-    assert hasattr(win, "nav_history")
-    win._switch_page(MainWindow.PAGE_HISTORY)
-    app.processEvents()
-    assert win.stack.currentIndex() == MainWindow.PAGE_HISTORY
-    win._switch_page(MainWindow.PAGE_MUSIC_HISTORY)
-    app.processEvents()
-    assert win.stack.currentIndex() == MainWindow.PAGE_MUSIC_HISTORY
-    win._switch_page(MainWindow.PAGE_MUSIC_PLAYER)
-    app.processEvents()
-    assert win.stack.currentIndex() == MainWindow.PAGE_MUSIC_PLAYER
-    win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
-    app.processEvents()
-
-    combo_speeds = [
-        win.video_panel.speed_combo.itemData(i)
-        for i in range(win.video_panel.speed_combo.count())
-    ]
-    assert tuple(combo_speeds) == VALID_SPEEDS == (1.0, 1.5, 2.0, 2.5), (
-        f"Velocidades inesperadas: {combo_speeds}"
-    )
-
-    # Probar reproducción silenciada con libmpv (video + audio_url DASH, normalización, solo audio)
-    win.player.set_volume(0)
-    win.player.play_stream(
-        primary_url=video_stream.primary_url,
-        audio_url=video_stream.audio_url,
-        video_enabled=True,
-        http_headers=video_stream.http_headers,
-        start_pos=0.0,
-    )
-    win.player.set_pause(True)
-    deadline = time.monotonic() + 0.8
-    while time.monotonic() < deadline:
+    with tempfile.TemporaryDirectory() as tmp_sess:
+        temp_state_path = Path(tmp_sess) / "session_state.json"
+        win = MainWindow(session_state_path=temp_state_path)
+        if sys.platform == "win32":
+            assert apply_window_taskbar_properties(int(win.winId())), "Falló SHGetPropertyStoreForWindow"
+        win.show()
         app.processEvents()
-        time.sleep(0.05)
 
-    win.player.set_normalization(True)
-    assert win.player.get_property("af"), "Normalización debería estar activa"
-    win.player.set_normalization(False)
-    assert not win.player.get_property("af"), "Normalización debería volver a OFF"
-    win.player.set_normalization(win.cfg.audio_normalization)
+        assert win.video_player is not win.music_player, "Deben existir dos instancias independientes"
+        assert win.video_player._mpv is None, "video_player debe inicializar en modo lazy"
+        assert win.music_player._mpv is None, "music_player debe inicializar en modo lazy"
+        assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH, "Debe abrir en Inicio (Modo Video)"
+        af_val = win.video_player.get_property("af")
+        assert bool(af_val) == win.cfg.audio_normalization, (
+            f"Estado inicial de af ({af_val!r}) no coincide con config ({win.cfg.audio_normalization})"
+        )
+        sub_val = win.video_player.get_property("sub")
+        assert sub_val in ("no", False), f"Subtítulos deben estar desactivados (sub={sub_val!r})"
 
-    # Verificar clic simple para pausar/reanudar video (con debounce) y cancelación en doble clic
-    win._video_item = MediaItem("vid_click", "Test Click", "Canal", "1:00", 60, "", "video")
-    win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
-    app.processEvents()
-    win.video_player.set_pause(False)
-    app.processEvents()
-    win.video_panel.video_surface.clicked.emit()
-    assert win._video_click_timer.isActive(), "Clic simple debe iniciar timer debounce"
-    win.video_panel.video_surface.double_clicked.emit()
-    assert not win._video_click_timer.isActive(), "Doble clic debe cancelar timer de pausa"
-    if win._is_fullscreen:
+        # Verificar modo teatro animado (ocultar/mostrar barra lateral) y restauración de tamaño tras fullscreen
+        assert win.sidebar.isVisible() and not win.video_panel._is_theater
+        win.toggle_sidebar()
+        deadline_sb = time.monotonic() + 0.26
+        while time.monotonic() < deadline_sb:
+            app.processEvents()
+            time.sleep(0.02)
+        assert not win.sidebar.isVisible() and win.video_panel._is_theater
+        win.toggle_sidebar()
+        deadline_sb2 = time.monotonic() + 0.26
+        while time.monotonic() < deadline_sb2:
+            app.processEvents()
+            time.sleep(0.02)
+        assert win.sidebar.isVisible() and not win.video_panel._is_theater
+
+        win.resize(1040, 680)
+        app.processEvents()
+        win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
+        app.processEvents()
         win.toggle_fullscreen()
-    win._last_video_dbl_ts = 0.0
-    win.video_panel.video_surface.clicked.emit()
-    wait_click = time.monotonic() + 0.35
-    while time.monotonic() < wait_click:
         app.processEvents()
-        time.sleep(0.03)
-    assert win.video_player.get_property("pause") is True, "Clic simple debe pausar el video"
-    win._video_item = None
-    win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
-    app.processEvents()
+        win.fs_overlay.reveal(win.geometry())
+        app.processEvents()
+        assert win.fs_overlay.isVisible()
+        win.fs_overlay.fade_out()
+        app.processEvents()
+        win.fs_overlay.hide_immediately()
+        assert not win.fs_overlay.isVisible()
+        win.toggle_fullscreen()
+        app.processEvents()
+        assert abs(win.width() - 1040) <= 20 and abs(win.height() - 680) <= 20, (
+            f"No se preservó el tamaño previo al fullscreen: {win.size()}"
+        )
+        win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+        app.processEvents()
 
-    # Probar music_player solo audio (lazy init) + HUD de volumen + ShortcutsDialog
-    win.music_player.set_volume(0)
-    win.music_player.play_stream(
-        primary_url=audio_stream.primary_url,
-        audio_url=None,
-        video_enabled=False,
-        http_headers=audio_stream.http_headers,
-        start_pos=2.0,
-    )
-    assert win.music_player._mpv is not None, "music_player debe instanciar libmpv al reproducir"
-    win.music_player.set_pause(True)
-    app.processEvents()
-    win.music_player.stop()
-    win.music_player.set_volume(win.cfg.music_volume)
-    win.video_player.set_volume(win.cfg.video_volume)
-    win.vol_hud.show_volume(65, win.geometry())
-    app.processEvents()
-    win.vol_hud.hide()
+        # Verificar switch Tab entre Video y Música
+        assert not hasattr(win, "nav_queue"), "El ítem 'Cola' ya no debe existir en la barra lateral"
+        assert hasattr(win, "nav_music_history"), "Falta 'Historial' bajo Música en la barra lateral"
+        assert hasattr(win, "music_panel"), "Falta el panel completo de música con cola integrada"
 
-    # Probar MiniBarWindow, ShortcutsDialog y SettingsDialog
-    win.toggle_mini_bar()
-    app.processEvents()
-    assert win.mini_bar.isVisible()
-    win._restore_from_mini_bar()
-    app.processEvents()
-    assert not win.mini_bar.isVisible()
+        win.switch_music_video_tab()
+        app.processEvents()
+        assert win.stack.currentIndex() in (
+            MainWindow.PAGE_MUSIC_SEARCH,
+            MainWindow.PAGE_MY_MUSIC,
+            MainWindow.PAGE_MUSIC_PLAYER,
+            MainWindow.PAGE_MUSIC_HISTORY,
+        )
+        win.switch_music_video_tab()
+        app.processEvents()
+        assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH
 
-    sdlg = ShortcutsDialog(win.palette, parent=win)
-    QTimer.singleShot(120, sdlg.accept)
-    sdlg.exec()
-    app.processEvents()
+        # Verificar página Historial (Video y Música) y vista completa de Música sin ventanas fantasma
+        stray_popups: list[str] = []
 
-    dlg = SettingsDialog(win.cfg, win.yt, thumb_cache=win.thumb_cache, parent=win)
-    QTimer.singleShot(150, dlg.accept)
-    dlg.exec()
-    app.processEvents()
+        class _StrayWindowWatcher(QObject):
+            def eventFilter(self, obj, ev) -> bool:
+                if ev.type() == QEvent.Type.Show and getattr(obj, "isWindow", lambda: False)():
+                    if obj is not win:
+                        stray_popups.append(type(obj).__name__)
+                return False
 
-    ram_mb = get_process_ram_mb()
-    assert ram_mb > 10.0, f"Medición de RAM inválida: {ram_mb}"
-    print(f"   Uso de RAM medido en vivo (Qt6 + libmpv inicializado): {ram_mb:.1f} MB")
+        watcher = _StrayWindowWatcher(win)
+        app.installEventFilter(watcher)
+        try:
+            test_card = VideoGridCard(
+                MediaItem("v_dt", "Video Con Fecha", "Canal", "4:10", 250, "", "video", published_text="hace 2 horas"),
+                False,
+                win.thumb_cache,
+                win.palette,
+            )
+            test_card.hide()
+            test_card.deleteLater()
+            assert hasattr(win, "nav_history")
+            win._switch_page(MainWindow.PAGE_HISTORY)
+            app.processEvents()
+            assert win.stack.currentIndex() == MainWindow.PAGE_HISTORY
+            win._switch_page(MainWindow.PAGE_MUSIC_HISTORY)
+            app.processEvents()
+            assert win.stack.currentIndex() == MainWindow.PAGE_MUSIC_HISTORY
+            win._switch_page(MainWindow.PAGE_MUSIC_PLAYER)
+            app.processEvents()
+            assert win.stack.currentIndex() == MainWindow.PAGE_MUSIC_PLAYER
+            win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+            app.processEvents()
+        finally:
+            app.removeEventFilter(watcher)
+        assert not stray_popups, f"Se detectaron ventanas emergentes inesperadas: {stray_popups}"
 
-    win._force_quit = True
-    win._cleanup_before_exit()
-    win.close()
-    app.processEvents()
-    print("   OK: Smoke test completo de GUI + libmpv pasado.")
+        # Probar volumen por rueda (±5% normal, ±1% Shift) en Video y Música + clic en portada Música
+        orig_v_vol = win.cfg.video_volume
+        orig_m_vol = win.cfg.music_volume
+        win._on_video_volume_changed(50)
+        win.video_panel.wheel_scrolled.emit(5)
+        assert win.cfg.video_volume == 55, f"Esperado 55%, obtenido {win.cfg.video_volume}"
+        win.video_panel.wheel_scrolled.emit(-1)
+        assert win.cfg.video_volume == 54, f"Esperado 54% (Shift -1), obtenido {win.cfg.video_volume}"
+        win._on_video_volume_changed(orig_v_vol)
+
+        win._on_music_volume_changed(50)
+        win.music_panel.wheel_scrolled.emit(5)
+        assert win.cfg.music_volume == 55, f"Esperado 55% en música, obtenido {win.cfg.music_volume}"
+        win.music_panel.wheel_scrolled.emit(-1)
+        assert win.cfg.music_volume == 54, f"Esperado 54% en música, obtenido {win.cfg.music_volume}"
+        win._on_music_volume_changed(orig_m_vol)
+        win.vol_hud.hide()
+
+        stage_clicks: list[bool] = []
+        win.music_panel._current_item = MediaItem("m_clk", "Canción", "Artista", "3:00", 180, "", "music")
+        win.music_panel.play_pause_requested.connect(lambda: stage_clicks.append(True))
+        win.music_panel.stage_area.clicked.emit()
+        assert len(stage_clicks) == 1, "Clic en el área de música debe emitir play_pause_requested"
+        win.music_panel._current_item = None
+
+        combo_speeds = [
+            win.video_panel.speed_combo.itemData(i)
+            for i in range(win.video_panel.speed_combo.count())
+        ]
+        assert tuple(combo_speeds) == VALID_SPEEDS == (1.0, 1.5, 2.0, 2.5), (
+            f"Velocidades inesperadas: {combo_speeds}"
+        )
+
+        # Probar reproducción silenciada con libmpv (video + audio_url DASH, normalización, unload)
+        win.player.set_volume(0)
+        win.player.play_stream(
+            primary_url=video_stream.primary_url,
+            audio_url=video_stream.audio_url,
+            video_enabled=True,
+            http_headers=video_stream.http_headers,
+            start_pos=0.0,
+        )
+        win.player.set_pause(True)
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.05)
+
+        win.player.set_normalization(True)
+        assert win.player.get_property("af"), "Normalización debería estar activa"
+        win.player.set_normalization(False)
+        assert not win.player.get_property("af"), "Normalización debería volver a OFF"
+        win.player.set_normalization(win.cfg.audio_normalization)
+
+        # Verificar clic simple para pausar/reanudar video (con debounce) y cancelación en doble clic
+        win._video_item = MediaItem("vid_click", "Test Click", "Canal", "1:00", 60, "", "video")
+        win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
+        app.processEvents()
+        win.video_player.set_pause(False)
+        app.processEvents()
+        win.video_panel.video_surface.clicked.emit()
+        assert win._video_click_timer.isActive(), "Clic simple debe iniciar timer debounce"
+        win.video_panel.video_surface.double_clicked.emit()
+        assert not win._video_click_timer.isActive(), "Doble clic debe cancelar timer de pausa"
+        if win._is_fullscreen:
+            win.toggle_fullscreen()
+        win._last_video_dbl_ts = 0.0
+        win.video_panel.video_surface.clicked.emit()
+        wait_click = time.monotonic() + 0.35
+        while time.monotonic() < wait_click:
+            app.processEvents()
+            time.sleep(0.03)
+        assert win.video_player.get_property("pause") is True, "Clic simple debe pausar el video"
+
+        # Verificar unload de libmpv en reposo
+        win.video_player.unload()
+        assert win.video_player._mpv is None and not win.video_player.has_active_stream
+
+        win._video_item = None
+        win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+        app.processEvents()
+
+        # Probar music_player solo audio (lazy init) + HUD de volumen + ShortcutsDialog
+        win.music_player.set_volume(0)
+        win.music_player.play_stream(
+            primary_url=audio_stream.primary_url,
+            audio_url=None,
+            video_enabled=False,
+            http_headers=audio_stream.http_headers,
+            start_pos=2.0,
+        )
+        assert win.music_player._mpv is not None, "music_player debe instanciar libmpv al reproducir"
+        win.music_player.set_pause(True)
+        app.processEvents()
+        win.music_player.stop()
+        win.music_player.set_volume(win.cfg.music_volume)
+        win.video_player.set_volume(win.cfg.video_volume)
+        win.vol_hud.show_volume(65, win.geometry())
+        app.processEvents()
+        win.vol_hud.hide()
+
+        # Probar MiniBarWindow, ShortcutsDialog y SettingsDialog
+        win.toggle_mini_bar()
+        app.processEvents()
+        assert win.mini_bar.isVisible()
+        win._restore_from_mini_bar()
+        app.processEvents()
+        assert not win.mini_bar.isVisible()
+
+        sdlg = ShortcutsDialog(win.palette, parent=win)
+        QTimer.singleShot(120, sdlg.accept)
+        sdlg.exec()
+        app.processEvents()
+
+        dlg = SettingsDialog(win.cfg, win.yt, thumb_cache=win.thumb_cache, parent=win)
+        QTimer.singleShot(150, dlg.accept)
+        dlg.exec()
+        app.processEvents()
+
+        ram_mb = get_process_ram_mb()
+        assert ram_mb > 10.0, f"Medición de RAM inválida: {ram_mb}"
+        print(f"   Uso de RAM medido en vivo (Qt6 + libmpv): {ram_mb:.1f} MB")
+
+        win._force_quit = True
+        win._cleanup_before_exit()
+        win.close()
+        app.processEvents()
+
+        # Probar restauración de sesión al abrir (barra inferior + banner Continuar sin cargar libmpv)
+        restore_path = Path(tmp_sess) / "restore_state.json"
+        save_session_state(
+            SessionState(
+                active_deck="video",
+                video_item=MediaItem("v_res", "Video Guardado", "Canal", "8:00", 480, "", "video"),
+                video_pos=95.0,
+                video_dur=480.0,
+            ),
+            restore_path,
+        )
+        win2 = MainWindow(session_state_path=restore_path)
+        win2.show()
+        app.processEvents()
+        assert win2.video_player._mpv is None, "Sesión restaurada no debe cargar libmpv todavía"
+        assert win2._video_item is not None and win2._video_item.video_id == "v_res"
+        assert abs(win2._video_pos - 95.0) < 0.2
+        assert win2.continue_banner.isVisible(), "El banner Continuar debe verse al restaurar"
+        assert win2.bottom_bar.isVisible(), "La barra inferior debe verse al restaurar"
+        win2._force_quit = True
+        win2._cleanup_before_exit()
+        win2.close()
+        app.processEvents()
+
+    print("   OK: Smoke test completo de GUI + libmpv lazy + restauración de sesión pasado.")
     return ram_mb
 
 

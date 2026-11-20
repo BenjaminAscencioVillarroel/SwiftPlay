@@ -2,9 +2,32 @@
 setlocal
 cd /d "%~dp0"
 
-echo Configurando entorno, binarios y accesos directos de SwiftPlay en:
+echo Actualizando codigo, entorno, binarios y accesos directos de SwiftPlay en:
 echo %CD%
 echo.
+
+if exist ".venv\Scripts\python.exe" (
+    echo Cerrando instancia abierta de SwiftPlay ^(si existe^)...
+    ".venv\Scripts\python.exe" "launch_swiftplay.pyw" --quit >nul 2>&1
+    timeout /t 1 /nobreak >nul
+)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'pythonw.exe' -or $_.Name -eq 'python.exe') -and $_.CommandLine -like '*launch_swiftplay.pyw*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+
+if exist ".git" (
+    where git >nul 2>&1
+    if not errorlevel 1 (
+        set "DIRTY_TREE="
+        for /f "delims=" %%i in ('git status --porcelain 2^>nul') do set "DIRTY_TREE=1"
+        if defined DIRTY_TREE (
+            echo [Aviso] Hay cambios locales sin guardar; omitiendo git pull.
+        ) else (
+            echo Descargando ultimas actualizaciones desde GitHub...
+            git pull --ff-only
+            if errorlevel 1 echo [Aviso] No se pudo completar git pull; continuando con la version local...
+        )
+        echo.
+    )
+)
 
 set "UV_CMD="
 where uv >nul 2>&1
@@ -65,7 +88,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo Listo! Entorno, binarios y accesos directos actualizados. Abriendo SwiftPlay...
+echo Listo! Entorno, codigo y accesos directos actualizados. Abriendo SwiftPlay...
 start "" ".venv\Scripts\pythonw.exe" "launch_swiftplay.pyw"
 timeout /t 2 >nul
 exit /b 0

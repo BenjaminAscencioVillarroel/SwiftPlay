@@ -21,7 +21,7 @@ from swiftplay.models import MediaItem, format_duration
 from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
-from swiftplay.ui.widgets import ClickableSlider, RoundedThumbWidget
+from swiftplay.ui.widgets import ClickableSlider, ElidedLabel, RoundedThumbWidget
 
 
 class _LoadingShimmerBar(QWidget):
@@ -111,9 +111,10 @@ class VideoSurface(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        delta = event.angleDelta().y()
+        delta = event.angleDelta().y() or event.angleDelta().x()
         if delta != 0:
-            self.wheel_scrolled.emit(1 if delta > 0 else -1)
+            step = 1 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 5
+            self.wheel_scrolled.emit(step if delta > 0 else -step)
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -161,6 +162,7 @@ class VideoPlayerPanel(QWidget):
         self._current_thumb_url = ""
         self._current_avatar_url = ""
         self._has_avatar_pix = False
+        self._is_resume_preview = False
         self._prev_volume = max(10, initial_volume)
 
         root = QVBoxLayout(self)
@@ -174,7 +176,7 @@ class VideoPlayerPanel(QWidget):
         header_lay.setContentsMargins(12, 8, 12, 8)
         header_lay.setSpacing(10)
 
-        self.back_btn = QPushButton(" Feed / Resultados")
+        self.back_btn = QPushButton(" Volver")
         self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.back_btn.clicked.connect(self.back_requested.emit)
         header_lay.addWidget(self.back_btn)
@@ -185,7 +187,7 @@ class VideoPlayerPanel(QWidget):
         self.channel_avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header_lay.addWidget(self.channel_avatar_lbl)
 
-        self.video_title_lbl = QLabel("Selecciona un video")
+        self.video_title_lbl = ElidedLabel("Selecciona un video", max_lines=1)
         self.video_title_lbl.setStyleSheet("font-size: 14px; font-weight: 600;")
         header_lay.addWidget(self.video_title_lbl, 1)
 
@@ -236,21 +238,26 @@ class VideoPlayerPanel(QWidget):
         audio_page_lay.addWidget(self.audio_banner)
         self.media_stack.addWidget(audio_page)
 
-        # Página 2: Vista previa instantánea al cambiar de video
+        # Página 2: Vista previa instantánea al cambiar de video o retomar sesión
         loading_page = QWidget()
         loading_page_lay = QVBoxLayout(loading_page)
         loading_page_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.loading_card = QFrame()
-        self.loading_card.setObjectName("AudioOnlyBanner")
-        self.loading_card.setFixedWidth(400)
+        self.loading_card = QWidget()
+        self.loading_card.setFixedWidth(440)
         load_lay = QVBoxLayout(self.loading_card)
-        load_lay.setContentsMargins(20, 20, 20, 20)
-        load_lay.setSpacing(10)
+        load_lay.setContentsMargins(16, 16, 16, 16)
+        load_lay.setSpacing(12)
         load_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.loading_thumb = RoundedThumbWidget(radius=10, bg_color=palette.surface1)
-        self.loading_thumb.setFixedSize(320, 180)
+        self.loading_thumb = RoundedThumbWidget(
+            radius=12,
+            show_play_on_hover=True,
+            bg_color=palette.surface1,
+            ambient_shadow=True,
+        )
+        self.loading_thumb.setFixedSize(384, 216)
+        self.loading_thumb.installEventFilter(self)
         load_lay.addWidget(self.loading_thumb, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.loading_title = QLabel("")
@@ -265,7 +272,7 @@ class VideoPlayerPanel(QWidget):
         load_lay.addWidget(self.loading_sub)
 
         self.loading_bar = _LoadingShimmerBar(palette.accent)
-        self.loading_bar.setFixedWidth(280)
+        self.loading_bar.setFixedWidth(300)
         load_lay.addWidget(self.loading_bar, 0, Qt.AlignmentFlag.AlignCenter)
 
         loading_page_lay.addWidget(self.loading_card)
@@ -305,7 +312,7 @@ class VideoPlayerPanel(QWidget):
 
         self.play_btn = QPushButton()
         self.play_btn.setObjectName("PlayAccentBtn")
-        self.play_btn.setFixedSize(38, 34)
+        self.play_btn.setFixedSize(36, 36)
         self.play_btn.setIconSize(QSize(18, 18))
         self.play_btn.setToolTip("Reproducir / Pausar [Espacio]")
         self.play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -315,26 +322,24 @@ class VideoPlayerPanel(QWidget):
         self.mute_btn = QPushButton()
         self.mute_btn.setObjectName("IconBtn")
         self.mute_btn.setFixedSize(32, 32)
-        self.mute_btn.setToolTip("Silenciar / Activar sonido [M]  •  Rueda sobre video: ±5%")
+        self.mute_btn.setToolTip("Silenciar / Activar sonido [M]  •  Rueda: ±5% (Shift: ±1%)")
         self.mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mute_btn.clicked.connect(self._toggle_mute)
         btn_row.addWidget(self.mute_btn)
 
-        self.vol_slider = ClickableSlider(Qt.Orientation.Horizontal)
+        self.vol_slider = ClickableSlider(Qt.Orientation.Horizontal, volume_wheel=True)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(initial_volume)
         self.vol_slider.setFixedWidth(92)
+        self.vol_slider.setToolTip("Volumen (rueda: ±5%, Shift: ±1%)")
         self.vol_slider.valueChanged.connect(self._on_vol_changed)
         btn_row.addWidget(self.vol_slider)
 
         btn_row.addStretch()
 
         # Velocidades estrictamente: 1x, 1.5x, 2x, 2.5x
-        speed_lbl = QLabel("Velocidad:")
-        speed_lbl.setObjectName("MutedLabel")
-        btn_row.addWidget(speed_lbl)
-
         self.speed_combo = QComboBox()
+        self.speed_combo.setToolTip("Velocidad de reproducción")
         for sp in VALID_SPEEDS:
             label = f"{int(sp)}x" if sp.is_integer() else f"{sp}x"
             self.speed_combo.addItem(label, sp)
@@ -343,11 +348,8 @@ class VideoPlayerPanel(QWidget):
         self.speed_combo.currentIndexChanged.connect(self._on_speed_combo)
         btn_row.addWidget(self.speed_combo)
 
-        qual_lbl = QLabel("Calidad:")
-        qual_lbl.setObjectName("MutedLabel")
-        btn_row.addWidget(qual_lbl)
-
         self.quality_combo = QComboBox()
+        self.quality_combo.setToolTip("Calidad de video")
         for q in VALID_QUALITIES:
             self.quality_combo.addItem(q, q)
         qidx = self.quality_combo.findData(initial_quality)
@@ -467,11 +469,36 @@ class VideoPlayerPanel(QWidget):
 
     def set_loading_state(self, loading: bool) -> None:
         if loading and not self.audio_only_btn.isChecked():
+            self._is_resume_preview = False
+            self.loading_thumb.set_force_play_overlay(False)
+            self.loading_thumb.setCursor(Qt.CursorShape.ArrowCursor)
+            self.loading_sub.setText("Cargando video...")
+            self.loading_bar.setVisible(True)
             self.media_stack.setCurrentIndex(2)
             self.loading_bar.start()
         else:
+            self._is_resume_preview = False
+            self.loading_thumb.set_force_play_overlay(False)
+            self.loading_thumb.setCursor(Qt.CursorShape.ArrowCursor)
             self.loading_bar.stop()
+            self.loading_bar.setVisible(False)
             self.media_stack.setCurrentIndex(1 if self.audio_only_btn.isChecked() else 0)
+
+    def set_resume_preview(self, item: MediaItem, position: float) -> None:
+        """Muestra vista previa limpia para retomar un video sin cargar libmpv aún."""
+        self.set_item(item, self._in_watch_later)
+        if self.audio_only_btn.isChecked():
+            return
+        self._is_resume_preview = True
+        self.loading_thumb.set_force_play_overlay(True)
+        self.loading_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.loading_bar.stop()
+        self.loading_bar.setVisible(False)
+        pos_str = format_duration(position) if position >= 3.0 else ""
+        self.loading_sub.setText(
+            f"Continuar desde {pos_str}" if pos_str else "Clic para reproducir"
+        )
+        self.media_stack.setCurrentIndex(2)
 
     def set_item(self, item: MediaItem, in_watch_later: bool) -> None:
         self.video_title_lbl.setText(f"{item.title}  —  {item.author}" if item.author else item.title)
@@ -487,7 +514,7 @@ class VideoPlayerPanel(QWidget):
         else:
             self.audio_thumb.clear()
 
-        lpix = self._thumb_cache.get_or_fetch(self._current_thumb_url, QSize(320, 180))
+        lpix = self._thumb_cache.get_or_fetch(self._current_thumb_url, QSize(384, 216))
         if lpix is not None:
             self.loading_thumb.set_pixmap(lpix)
         else:
@@ -525,7 +552,7 @@ class VideoPlayerPanel(QWidget):
         if url == self._current_thumb_url:
             if pix.size() == QSize(256, 144):
                 self.audio_thumb.setPixmap(pix)
-            elif pix.size() == QSize(320, 180):
+            elif pix.size() == QSize(384, 216):
                 self.loading_thumb.set_pixmap(pix)
         elif (
             self._current_avatar_url
@@ -621,16 +648,20 @@ class VideoPlayerPanel(QWidget):
         )
 
     def eventFilter(self, obj, event) -> bool:
-        if obj is self.audio_banner and event.type() == QEvent.Type.MouseButtonPress:
+        if event.type() == QEvent.Type.MouseButtonPress:
             if isinstance(event, QMouseEvent) and event.button() == Qt.MouseButton.LeftButton:
-                self.video_clicked.emit()
-                return True
+                if obj is self.audio_banner or (
+                    obj is self.loading_thumb and self._is_resume_preview
+                ):
+                    self.video_clicked.emit()
+                    return True
         return super().eventFilter(obj, event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        delta = event.angleDelta().y()
+        delta = event.angleDelta().y() or event.angleDelta().x()
         if delta != 0:
-            self.wheel_scrolled.emit(1 if delta > 0 else -1)
+            step = 1 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 5
+            self.wheel_scrolled.emit(step if delta > 0 else -step)
         event.accept()
 
     def update_theme(self, palette: ThemePalette) -> None:

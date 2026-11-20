@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QCoreApplication, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
@@ -19,12 +19,13 @@ from swiftplay.windows_os import (
 IPC_SERVER_NAME = "SwiftPlaySingleInstanceIPC"
 
 
-def _notify_existing_instance() -> bool:
+def _send_ipc_command(cmd: bytes = b"SHOW") -> bool:
     sock = QLocalSocket()
     sock.connectToServer(IPC_SERVER_NAME)
     if sock.waitForConnected(600):
-        allow_set_foreground_window()
-        sock.write(b"SHOW")
+        if cmd == b"SHOW":
+            allow_set_foreground_window()
+        sock.write(cmd)
         sock.flush()
         sock.waitForBytesWritten(300)
         sock.disconnectFromServer()
@@ -33,6 +34,11 @@ def _notify_existing_instance() -> bool:
 
 
 def main() -> int:
+    if "--quit" in sys.argv[1:]:
+        _app = QCoreApplication(sys.argv)
+        _send_ipc_command(b"QUIT")
+        return 0
+
     set_process_app_user_model_id()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -43,7 +49,7 @@ def main() -> int:
     if ICON_ICO_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_ICO_PATH)))
 
-    if _notify_existing_instance():
+    if _send_ipc_command(b"SHOW"):
         return 0
 
     QLocalServer.removeServer(IPC_SERVER_NAME)
@@ -51,14 +57,23 @@ def main() -> int:
     ipc_server.listen(IPC_SERVER_NAME)
 
     win = MainWindow()
+    app.commitDataRequest.connect(lambda _mgr: win.persist_session_state(force=True))
+    app.aboutToQuit.connect(lambda: win.persist_session_state(force=True))
 
     def _on_new_connection() -> None:
         conn = ipc_server.nextPendingConnection()
+        cmd = b"SHOW"
         if conn is not None:
             conn.waitForReadyRead(200)
+            raw = bytes(conn.readAll()).strip()
+            if raw:
+                cmd = raw
             conn.close()
             conn.deleteLater()
-        win.restore_window()
+        if cmd == b"QUIT":
+            win.quit_app()
+        else:
+            win.restore_window()
 
     ipc_server.newConnection.connect(_on_new_connection)
     win.show()

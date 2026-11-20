@@ -57,6 +57,7 @@ class MediaItem:
     kind: Literal["video", "music"] = "video"
     channel_avatar_url: str = ""
     resume_pos: float = 0.0
+    published_text: str = ""
 
     def normalized_thumb(self) -> str:
         if self.thumb_url:
@@ -64,6 +65,47 @@ class MediaItem:
         if self.video_id:
             return f"https://i.ytimg.com/vi/{self.video_id}/hqdefault.jpg"
         return ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "video_id": self.video_id,
+            "title": self.title,
+            "author": self.author,
+            "duration": self.duration,
+            "duration_sec": int(self.duration_sec or 0),
+            "thumb_url": self.thumb_url,
+            "kind": self.kind,
+            "channel_avatar_url": self.channel_avatar_url,
+            "resume_pos": float(self.resume_pos or 0.0),
+            "published_text": self.published_text,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MediaItem:
+        if not isinstance(data, dict):
+            return cls(video_id="", title="")
+        raw_kind = str(data.get("kind") or "video")
+        kind: Literal["video", "music"] = "music" if raw_kind == "music" else "video"
+        try:
+            dur_sec = int(data.get("duration_sec") or 0)
+        except (TypeError, ValueError):
+            dur_sec = 0
+        try:
+            res_pos = max(0.0, float(data.get("resume_pos") or 0.0))
+        except (TypeError, ValueError):
+            res_pos = 0.0
+        return cls(
+            video_id=str(data.get("video_id") or "").strip(),
+            title=str(data.get("title") or "").strip(),
+            author=str(data.get("author") or "").strip(),
+            duration=str(data.get("duration") or "").strip(),
+            duration_sec=dur_sec,
+            thumb_url=str(data.get("thumb_url") or "").strip(),
+            kind=kind,
+            channel_avatar_url=str(data.get("channel_avatar_url") or "").strip(),
+            resume_pos=res_pos,
+            published_text=str(data.get("published_text") or "").strip(),
+        )
 
 
 @dataclass(slots=True)

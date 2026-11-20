@@ -23,13 +23,14 @@ Cliente nativo ultraliviano para **YouTube** y **YouTube Music** en Windows, con
 2. Haz doble clic en **`Actualizar_Ruta.bat`** (o ejecútalo desde la terminal).
 
    Este script realiza automáticamente todo lo necesario:
+   - Cierra SwiftPlay si estaba abierto en segundo plano y descarga actualizaciones (`git pull --ff-only`) si la carpeta no tiene cambios locales pendientes.
    - Crea el entorno virtual e instala las dependencias definidas en `pyproject.toml` / `uv.lock` (`uv sync --python 3.12`).
    - Descarga los binarios nativos faltantes (`libmpv-2.dll`, `ffmpeg.exe` y `ffprobe.exe`) dentro de `bin/`.
    - Crea accesos directos en el **Escritorio** y en el **Menú Inicio**.
    - Habilita el **inicio automático con Windows** *(puedes desactivarlo cuando quieras desde Ajustes dentro de la app)*.
    - Abre **SwiftPlay**.
 
-> **¿Moviste la carpeta del proyecto a otra ruta?** Vuelve a ejecutar `Actualizar_Ruta.bat` para regenerar el entorno y actualizar los accesos directos.
+> **¿Cómo actualizar en el futuro o tras mover la carpeta?** Haz doble clic nuevamente en **`Actualizar_Ruta.bat`** para bajar los últimos cambios de GitHub, regenerar el entorno/accesos directos y relanzar SwiftPlay en un paso.
 
 ---
 

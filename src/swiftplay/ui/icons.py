@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 
 
+@lru_cache(maxsize=160)
 def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
     # Renderizar a 2x para HiDPI nítido
     px_size = size * 2

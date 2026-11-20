@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCompleter,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -54,9 +55,10 @@ from PySide6.QtWidgets import (
 from swiftplay.config import AppConfig, load_config, save_config
 from swiftplay.media_keys import GlobalMediaKeyFilter
 from swiftplay.models import FeedSection, MediaItem, ResolvedStream, format_duration
-from swiftplay.paths import APP_NAME, ICON_ICO_PATH, ICON_PNG_PATH
+from swiftplay.paths import APP_NAME, ICON_ICO_PATH, ICON_PNG_PATH, SESSION_STATE_PATH
 from swiftplay.player import MediaPlayer
 from swiftplay.security import has_saved_session, load_account_profile
+from swiftplay.session_state import SessionState, load_session_state, save_session_state
 from swiftplay.storage import LocalLibrary
 from swiftplay.themes import (
     ThemePalette,
@@ -77,11 +79,15 @@ from swiftplay.ui.video_overlays import (
 )
 from swiftplay.ui.video_surface import VideoPlayerPanel
 from swiftplay.ui.widgets import (
+    AnimatedToastWidget,
     ClickableSlider,
+    ContinueWatchingBanner,
+    ElidedLabel,
     MusicRowWidget,
     MusicShelfWidget,
     MusicTileWidget,
     ResponsiveGridWidget,
+    RoundedThumbWidget,
     SectionTitleWidget,
     VideoCardWidget,
     VideoGridCard,
@@ -139,13 +145,16 @@ class MainWindow(QMainWindow):
     PAGE_HISTORY = 6
     PAGE_MUSIC_HISTORY = 7
 
-    def __init__(self) -> None:
+    def __init__(self, session_state_path: Path | None = None) -> None:
         super().__init__()
+        self._session_state_path: Path = (
+            Path(session_state_path) if session_state_path is not None else SESSION_STATE_PATH
+        )
         self.cfg: AppConfig = load_config()
         self.palette: ThemePalette = get_theme(self.cfg.theme)
         self.db = LocalLibrary()
         self.yt = YouTubeService()
-        self.thumb_cache = ThumbnailCache(max_items=75, parent=self)
+        self.thumb_cache = ThumbnailCache(max_items=48, parent=self)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(4)
 
@@ -172,6 +181,7 @@ class MainWindow(QMainWindow):
         self._music_showing_search = False
         self._music_filter: str = "songs"
         self._account_avatar_url = ""
+        self._bb_thumb_url = ""
         self._cleaned_up = False
 
         # Debounce clic simple vs doble clic en la superficie de video
@@ -186,10 +196,26 @@ class MainWindow(QMainWindow):
         self._prefetch_inflight: int = 0
         self._video_prefetch_timer = QTimer(self)
         self._video_prefetch_timer.setSingleShot(True)
-        self._video_prefetch_timer.setInterval(380)
+        self._video_prefetch_timer.setInterval(550)
         self._video_prefetch_timer.timeout.connect(self._run_hover_video_prefetch)
+
+        # Descarga automática de libmpv en reposo para mantener RAM mínima
+        self._video_idle_unload_timer = QTimer(self)
+        self._video_idle_unload_timer.setSingleShot(True)
+        self._video_idle_unload_timer.setInterval(30_000)
+        self._video_idle_unload_timer.timeout.connect(self._unload_idle_video_player)
+
+        self._music_idle_unload_timer = QTimer(self)
+        self._music_idle_unload_timer.setSingleShot(True)
+        self._music_idle_unload_timer.setInterval(45_000)
+        self._music_idle_unload_timer.timeout.connect(self._unload_idle_music_player)
+
         self._sidebar_anim: QPropertyAnimation | None = None
+        self._sidebar_hiding = False
         self._bottom_bar_anim: QPropertyAnimation | None = None
+        self._bottom_bar_hiding = False
+        self._page_fade_anim: QPropertyAnimation | None = None
+        self._page_fade_widget: QWidget | None = None
 
         # Estado independiente del Reproductor Dual
         self._search_mode: Literal["video", "music"] = "video"
@@ -204,6 +230,7 @@ class MainWindow(QMainWindow):
         self._video_paused: bool = True
         self._last_saved_video_pos: float = 0.0
         self._last_saved_video_ts: float = 0.0
+        self._last_saved_session_ts: float = 0.0
         self._prev_video_vol: int = max(10, self.cfg.video_volume)
 
         self._music_item: MediaItem | None = None
@@ -229,12 +256,13 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
-        # Dos instancias ligeras de libmpv en paralelo (Video GPU + Música Solo-Audio)
+        # Dos instancias ligeras lazy de libmpv en paralelo (Video GPU + Música Solo-Audio)
         self.video_player = MediaPlayer(
             wid=int(self.video_panel.video_surface.winId()),
             initial_volume=self.cfg.video_volume,
             initial_speed=self.cfg.video_speed,
             normalization=self.cfg.audio_normalization,
+            lazy=True,
             parent=self,
         )
         self.music_player = MediaPlayer(
@@ -281,6 +309,7 @@ class MainWindow(QMainWindow):
         self.apply_theme(self.cfg.theme)
         apply_window_taskbar_properties(int(self.winId()))
         self._refresh_badges()
+        self._restore_last_session()
         self._switch_page(self.PAGE_VIDEO_SEARCH)
 
         QTimer.singleShot(150, self._load_video_feed)
@@ -445,13 +474,16 @@ class MainWindow(QMainWindow):
         self.filter_videos_btn.clicked.connect(lambda: self._set_music_filter("videos"))
         top_lay.addWidget(self.filter_videos_btn)
 
-        self.search_btn = QPushButton(" Buscar")
-        self.search_btn.setObjectName("AccentBtn")
+        self.search_btn = QPushButton()
+        self.search_btn.setObjectName("SearchSubmitBtn")
+        self.search_btn.setFixedSize(36, 36)
+        self.search_btn.setToolTip("Buscar")
         self.search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.search_btn.clicked.connect(self._on_search_submitted)
         top_lay.addWidget(self.search_btn)
 
-        self.back_to_video_btn = QPushButton("Volver al video")
+        self.back_to_video_btn = QPushButton(" Video")
+        self.back_to_video_btn.setObjectName("PillBtn")
         self.back_to_video_btn.setVisible(False)
         self.back_to_video_btn.setToolTip("Ir al reproductor de video [Tab]")
         self.back_to_video_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -470,7 +502,7 @@ class MainWindow(QMainWindow):
         # Stack de vistas
         self.stack = QStackedWidget()
 
-        # Pág 0: YouTube Feed (sin Shorts) + Búsqueda en grilla estilo YouTube
+        # Pág 0: Inicio (YouTube Feed sin Shorts + Búsqueda)
         self.video_back_feed_btn: QPushButton | None = None
         self.video_refresh_btn: QPushButton | None = None
         (
@@ -480,17 +512,28 @@ class MainWindow(QMainWindow):
             self.video_view_title,
             video_hdr_btns,
         ) = self._make_grid_page(
-            "YouTube — Tu Feed (sin Shorts)",
-            "Cargando recomendaciones sin Shorts...",
+            "Inicio",
+            "Cargando videos...",
             header_actions=[
-                ("Volver al feed", self._show_video_feed_view, False),
-                ("Actualizar feed", self._load_video_feed, False),
+                ("Inicio", self._show_video_feed_view, False),
+                ("", self._load_video_feed, False),
             ],
             return_header=True,
         )
         self.video_back_feed_btn = video_hdr_btns[0]
         self.video_back_feed_btn.setVisible(False)
         self.video_refresh_btn = video_hdr_btns[1]
+        self.video_refresh_btn.setObjectName("IconBtn")
+        self.video_refresh_btn.setFixedSize(32, 32)
+        self.video_refresh_btn.setToolTip("Actualizar")
+
+        self.continue_banner = ContinueWatchingBanner(self.thumb_cache, self.palette)
+        self.continue_banner.setVisible(False)
+        self.continue_banner.resume_requested.connect(self._on_continue_banner_resume)
+        v_lay = self.video_grid.parentWidget().layout()
+        if v_lay is not None:
+            v_lay.insertWidget(0, self.continue_banner)
+
         self.stack.addWidget(self.video_search_page)
 
         # Pág 1: Reproductor de Video embebido
@@ -504,14 +547,14 @@ class MainWindow(QMainWindow):
         )
         self.stack.addWidget(self.video_panel)
 
-        # Pág 2: Ver más tarde (local) en grilla
+        # Pág 2: Ver más tarde
         self.wl_page, self.wl_grid, self.wl_empty_lbl = self._make_grid_page(
-            "Ver más tarde (Local)",
+            "Ver más tarde",
             "Aún no tienes videos guardados. Usa el menú ⋮ de cualquier video para añadirlo.",
         )
         self.stack.addWidget(self.wl_page)
 
-        # Pág 3: YT Music Inicio (estanterías horizontales) + Búsqueda
+        # Pág 3: Música (YT Music Inicio + Búsqueda)
         self.music_back_home_btn: QPushButton | None = None
         self.music_refresh_btn: QPushButton | None = None
         (
@@ -521,22 +564,25 @@ class MainWindow(QMainWindow):
             self.music_view_title,
             music_hdr_btns,
         ) = self._make_scroll_page(
-            "YouTube Music — Inicio",
-            "Cargando secciones de música...",
+            "Música",
+            "Cargando música...",
             header_actions=[
-                ("Volver al inicio", self._show_music_home_view, False),
-                ("Actualizar", self._load_music_home, False),
+                ("Música", self._show_music_home_view, False),
+                ("", self._load_music_home, False),
             ],
             return_header=True,
         )
         self.music_back_home_btn = music_hdr_btns[0]
         self.music_back_home_btn.setVisible(False)
         self.music_refresh_btn = music_hdr_btns[1]
+        self.music_refresh_btn.setObjectName("IconBtn")
+        self.music_refresh_btn.setFixedSize(32, 32)
+        self.music_refresh_btn.setToolTip("Actualizar")
         self.stack.addWidget(self.music_search_page)
 
-        # Pág 4: Mi música (local)
+        # Pág 4: Mi música
         self.my_music_page, self.my_music_lay, self.my_music_empty_lbl = self._make_scroll_page(
-            "Mi música (Local)",
+            "Mi música",
             "Aún no tienes canciones guardadas. Pulsa el corazón en cualquier canción para guardarla.",
             header_actions=[
                 ("Reproducir todo", self._play_all_my_music, True),
@@ -552,6 +598,8 @@ class MainWindow(QMainWindow):
             autoplay_enabled=self.cfg.autoplay_music,
         )
         self.music_panel.back_requested.connect(self._on_music_panel_back)
+        self.music_panel.play_pause_requested.connect(self._on_music_stage_clicked)
+        self.music_panel.wheel_scrolled.connect(self._on_music_wheel_volume)
         self.music_panel.queue_index_requested.connect(self._play_queue_index)
         self.music_panel.remove_from_queue_requested.connect(self._remove_from_queue)
         self.music_panel.my_music_toggled.connect(self._toggle_my_music_item)
@@ -560,25 +608,25 @@ class MainWindow(QMainWindow):
         self.music_panel.clear_queue_requested.connect(self._clear_queue)
         self.stack.addWidget(self.music_panel)
 
-        # Pág 6: Historial local de video con progreso exacto
+        # Pág 6: Historial de video con progreso exacto
         self.history_page, self.history_grid, self.history_empty_lbl = self._make_grid_page(
-            "Historial (Local)",
+            "Historial",
             "Aún no hay videos en tu historial. Los videos que veas aparecerán aquí con el minuto exacto donde los dejaste.",
-            header_actions=[("Limpiar historial", self._clear_video_history, False)],
+            header_actions=[("Limpiar", self._clear_video_history, False)],
         )
         self.stack.addWidget(self.history_page)
 
-        # Pág 7: Historial local de música
+        # Pág 7: Historial de música
         (
             self.music_history_page,
             self.music_history_lay,
             self.music_history_empty_lbl,
         ) = self._make_scroll_page(
-            "Historial de música (Local)",
+            "Historial",
             "Aún no hay canciones en tu historial. Las canciones que escuches aparecerán aquí.",
             header_actions=[
-                ("Reproducir todo", self._play_all_music_history, True),
-                ("Limpiar historial", self._clear_music_history, False),
+                ("Reproducir", self._play_all_music_history, True),
+                ("Limpiar", self._clear_music_history, False),
             ],
         )
         self.stack.addWidget(self.music_history_page)
@@ -592,14 +640,8 @@ class MainWindow(QMainWindow):
         self.bottom_bar.setVisible(False)
         outer.addWidget(self.bottom_bar)
 
-        # Toast flotante no intrusivo
-        self.toast_lbl = QLabel("", self)
-        self.toast_lbl.setObjectName("ToastLabel")
-        self.toast_lbl.setVisible(False)
-        self._toast_anim: QPropertyAnimation | None = None
-        self._toast_timer = QTimer(self)
-        self._toast_timer.setSingleShot(True)
-        self._toast_timer.timeout.connect(lambda: self.toast_lbl.setVisible(False))
+        # Toast flotante animado no intrusivo
+        self.toast_lbl = AnimatedToastWidget(self.palette, self)
 
         self._update_music_filter_visibility()
         self._refresh_search_completer()
@@ -743,9 +785,12 @@ class MainWindow(QMainWindow):
         click_lay.setContentsMargins(4, 2, 8, 2)
         click_lay.setSpacing(10)
 
-        self.bb_thumb = QLabel()
+        self.bb_thumb = RoundedThumbWidget(
+            radius=8,
+            enable_crossfade=True,
+            bg_color=self.palette.base,
+        )
         self.bb_thumb.setFixedSize(48, 48)
-        self.bb_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         click_lay.addWidget(self.bb_thumb)
 
         info_col = QVBoxLayout()
@@ -756,15 +801,15 @@ class MainWindow(QMainWindow):
         self.bb_deck_tag.setObjectName("DeckTag")
         title_line.addWidget(self.bb_deck_tag)
 
-        self.bb_title = QLabel("Sin reproducción")
+        self.bb_title = ElidedLabel("Sin reproducción", max_lines=1)
         self.bb_title.setStyleSheet("font-size: 13px; font-weight: 600;")
-        self.bb_title.setMaximumWidth(210)
+        self.bb_title.setMaximumWidth(230)
         title_line.addWidget(self.bb_title, 1)
         info_col.addLayout(title_line)
 
-        self.bb_author = QLabel("")
+        self.bb_author = ElidedLabel("", max_lines=1)
         self.bb_author.setObjectName("MutedLabel")
-        self.bb_author.setMaximumWidth(250)
+        self.bb_author.setMaximumWidth(270)
         info_col.addWidget(self.bb_author)
         click_lay.addLayout(info_col)
         lay.addWidget(self.bb_click_area)
@@ -858,10 +903,11 @@ class MainWindow(QMainWindow):
         self.bb_vol_icon.clicked.connect(self._toggle_bb_mute)
         lay.addWidget(self.bb_vol_icon)
 
-        self.bb_vol = ClickableSlider(Qt.Orientation.Horizontal)
+        self.bb_vol = ClickableSlider(Qt.Orientation.Horizontal, volume_wheel=True)
         self.bb_vol.setRange(0, 100)
         self.bb_vol.setValue(self.cfg.music_volume)
         self.bb_vol.setFixedWidth(84)
+        self.bb_vol.setToolTip("Volumen (rueda: ±5%, Shift: ±1%)")
         self.bb_vol.valueChanged.connect(self._on_bb_volume_changed)
         lay.addWidget(self.bb_vol)
 
@@ -1051,6 +1097,8 @@ class MainWindow(QMainWindow):
             self._show_volume_hud(self.cfg.video_volume)
         else:
             self._toggle_music_mute()
+            if self.stack.currentIndex() == self.PAGE_MUSIC_PLAYER:
+                self._show_music_volume_hud(self.cfg.music_volume)
 
     def _shortcut_seek(self, delta: float) -> None:
         if not self._typing_in_input():
@@ -1075,8 +1123,9 @@ class MainWindow(QMainWindow):
 
     def _stop_all(self) -> None:
         self._save_current_video_progress(force=True)
-        self.video_player.stop()
-        self.music_player.stop()
+        self.persist_session_state(force=True)
+        self.video_player.unload()
+        self.music_player.unload()
         trim_process_memory()
 
     def open_shortcuts_dialog(self) -> None:
@@ -1111,11 +1160,12 @@ class MainWindow(QMainWindow):
         self.minibar_btn.setIcon(render_icon("mini_bar", p.text2, 16))
         self.shortcuts_btn.setIcon(render_icon("help", p.text2, 16))
         self.settings_btn.setIcon(render_icon("settings", p.text2, 16))
-        self.search_btn.setIcon(render_icon("search", p.accent_text, 15))
+        self.search_btn.setIcon(render_icon("search", p.text, 16))
+        self.back_to_video_btn.setIcon(render_icon("video", p.text, 15))
+        self.continue_banner.update_theme(p)
+        self.toast_lbl.update_theme(p)
 
-        self.bb_thumb.setStyleSheet(
-            f"background-color: {p.base}; border-radius: 6px; border: 1px solid {p.border};"
-        )
+        self.bb_thumb.set_bg_color(p.base)
         self.bb_prev.setIcon(render_icon("prev", p.text, 17))
         self.bb_next.setIcon(render_icon("next", p.text, 17))
         self.bb_dl.setIcon(render_icon("download", p.text2, 17))
@@ -1141,6 +1191,90 @@ class MainWindow(QMainWindow):
             shelf.update_theme(p)
 
     # ------------------------------------------------------------------
+    # Persistencia de última sesión + liberación en reposo
+    # ------------------------------------------------------------------
+
+    def persist_session_state(self, force: bool = True) -> None:
+        if not force and (time.monotonic() - self._last_saved_session_ts) < 5.0:
+            return
+        self._last_saved_session_ts = time.monotonic()
+        state = SessionState(
+            active_deck=self._active_deck,
+            video_item=self._video_item,
+            video_pos=float(self._video_pos or 0.0),
+            video_dur=float(self._video_dur or 0.0),
+            music_item=self._music_item,
+            music_pos=float(self._music_pos or 0.0),
+            music_dur=float(self._music_dur or 0.0),
+            music_queue=list(self._music_queue),
+            queue_index=self._queue_index,
+        )
+        try:
+            save_session_state(state, self._session_state_path)
+        except Exception:
+            pass
+
+    def _restore_last_session(self) -> None:
+        state = load_session_state(self._session_state_path)
+        if state.video_item is not None:
+            v_it = state.video_item
+            self._video_item = v_it
+            self._video_pos = state.video_pos
+            self._video_dur = max(state.video_dur, float(v_it.duration_sec or 0))
+            self._video_paused = True
+            self._last_saved_video_pos = self._video_pos
+            wl_saved = self.db.is_in_watch_later(v_it.video_id)
+            self.video_panel.set_item(v_it, wl_saved)
+            if self._video_dur > 0:
+                self.video_panel.set_duration(self._video_dur)
+                self.fs_overlay.set_duration(self._video_dur)
+                self.video_panel.set_position(self._video_pos)
+                self.fs_overlay.set_position(self._video_pos)
+            self.video_panel.set_paused(True)
+            self.video_panel.set_resume_preview(v_it, self._video_pos)
+            self.fs_overlay.set_item(v_it, wl_saved)
+            self.continue_banner.set_item(v_it, self._video_pos, self._video_dur)
+        else:
+            self.continue_banner.setVisible(False)
+
+        if state.music_item is not None:
+            m_it = state.music_item
+            self._music_item = m_it
+            self._music_pos = state.music_pos
+            self._music_dur = max(state.music_dur, float(m_it.duration_sec or 0))
+            self._music_paused = True
+            self._music_queue = list(state.music_queue)
+            self._queue_index = state.queue_index
+            self.music_panel.set_current_item(m_it, self.db.is_in_my_music(m_it.video_id))
+
+        if state.active_deck == "music" and self._music_item is not None:
+            self._active_deck = "music"
+        elif self._video_item is not None:
+            self._active_deck = "video"
+        elif self._music_item is not None:
+            self._active_deck = "music"
+
+    def _on_continue_banner_resume(self, item: MediaItem, pos: float) -> None:
+        self.play_video(item, start_pos=pos)
+
+    def _unload_idle_video_player(self) -> None:
+        if (
+            self.video_player.is_loaded
+            and self._video_paused
+            and self.stack.currentIndex() != self.PAGE_VIDEO_PLAYER
+        ):
+            self._save_current_video_progress(force=True)
+            self.persist_session_state(force=True)
+            self.video_player.unload()
+            trim_process_memory()
+
+    def _unload_idle_music_player(self) -> None:
+        if self.music_player.is_loaded and self._music_paused:
+            self.persist_session_state(force=True)
+            self.music_player.unload()
+            trim_process_memory()
+
+    # ------------------------------------------------------------------
     # Navegación rápida (Tab Switch) y Vistas
     # ------------------------------------------------------------------
 
@@ -1164,18 +1298,66 @@ class MainWindow(QMainWindow):
         else:
             self._last_music_page = cur
             self._active_deck = "video"
-            if self._video_item is not None:
+            if self._video_item is not None and self.video_player.has_active_stream:
                 target = self.PAGE_VIDEO_PLAYER
             else:
                 target = self._last_video_page
             self._switch_page(target)
+
+    def _clear_page_fade(self) -> None:
+        if self._page_fade_anim is not None:
+            self._page_fade_anim.stop()
+            self._page_fade_anim = None
+        if self._page_fade_widget is not None:
+            try:
+                self._page_fade_widget.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+            self._page_fade_widget = None
+
+    def _animate_page_fade(self, widget: QWidget | None) -> None:
+        self._clear_page_fade()
+        if widget is None or widget is self.video_panel:
+            return
+        eff = QGraphicsOpacityEffect(widget)
+        eff.setOpacity(0.90)
+        widget.setGraphicsEffect(eff)
+        self._page_fade_widget = widget
+        anim = QPropertyAnimation(eff, b"opacity", self)
+        anim.setDuration(130)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(0.90)
+        anim.setEndValue(1.0)
+        anim.finished.connect(self._clear_page_fade)
+        self._page_fade_anim = anim
+        anim.start()
 
     def _switch_page(self, page_idx: int) -> None:
         if self._is_fullscreen and page_idx != self.PAGE_VIDEO_PLAYER:
             self.toggle_fullscreen()
 
         prev_idx = self.stack.currentIndex()
+        if prev_idx != page_idx:
+            if prev_idx == self.PAGE_WATCH_LATER:
+                self.wl_grid.clear_widgets()
+            elif prev_idx == self.PAGE_HISTORY:
+                self.history_grid.clear_widgets()
+            elif prev_idx == self.PAGE_MY_MUSIC:
+                self._clear_layout_widgets(self.my_music_lay, keep_widget=self.my_music_empty_lbl)
+            elif prev_idx == self.PAGE_MUSIC_HISTORY:
+                self._clear_layout_widgets(
+                    self.music_history_lay, keep_widget=self.music_history_empty_lbl
+                )
+
+        if page_idx == self.PAGE_VIDEO_PLAYER:
+            self._video_idle_unload_timer.stop()
+        elif self._video_paused and self.video_player.is_loaded:
+            if not self._video_idle_unload_timer.isActive():
+                self._video_idle_unload_timer.start()
+
         self.stack.setCurrentIndex(page_idx)
+        if page_idx != self.PAGE_VIDEO_PLAYER and prev_idx != page_idx:
+            self._animate_page_fade(self.stack.currentWidget())
         if page_idx == self.PAGE_MUSIC_PLAYER and prev_idx != self.PAGE_MUSIC_PLAYER:
             self.music_panel.play_entrance_animation()
 
@@ -1287,11 +1469,11 @@ class MainWindow(QMainWindow):
 
         if self._search_mode == "video":
             self._video_showing_search = True
-            self.video_view_title.setText(f"Resultados en YouTube: '{query}'")
+            self.video_view_title.setText(f"«{query}»")
             if self.video_back_feed_btn is not None:
                 self.video_back_feed_btn.setVisible(True)
             self._switch_page(self.PAGE_VIDEO_SEARCH)
-            self.video_empty_lbl.setText(f"Buscando '{query}' en YouTube...")
+            self.video_empty_lbl.setText(f"Buscando '{query}'...")
             self.video_empty_lbl.setVisible(True)
             self.video_grid.clear_widgets()
             self._video_cards.clear()
@@ -1302,11 +1484,11 @@ class MainWindow(QMainWindow):
             )
         else:
             self._music_showing_search = True
-            self.music_view_title.setText(f"Resultados en YT Music: '{query}'")
+            self.music_view_title.setText(f"«{query}»")
             if self.music_back_home_btn is not None:
                 self.music_back_home_btn.setVisible(True)
             self._switch_page(self.PAGE_MUSIC_SEARCH)
-            self.music_empty_lbl.setText(f"Buscando '{query}' en YouTube Music...")
+            self.music_empty_lbl.setText(f"Buscando '{query}'...")
             self.music_empty_lbl.setVisible(True)
             self._clear_layout_widgets(self.music_results_lay, keep_widget=self.music_empty_lbl)
             self._music_rows.clear()
@@ -1321,19 +1503,19 @@ class MainWindow(QMainWindow):
 
     def _show_video_feed_view(self) -> None:
         self._video_showing_search = False
-        self.video_view_title.setText("YouTube — Tu Feed (sin Shorts)")
+        self.video_view_title.setText("Inicio")
         if self.video_back_feed_btn is not None:
             self.video_back_feed_btn.setVisible(False)
         self._load_video_feed()
 
     def _load_video_feed(self) -> None:
         self._video_showing_search = False
-        self.video_view_title.setText("YouTube — Tu Feed (sin Shorts)")
+        self.video_view_title.setText("Inicio")
         if self.video_back_feed_btn is not None:
             self.video_back_feed_btn.setVisible(False)
         if self.video_refresh_btn is not None:
             self.video_refresh_btn.setEnabled(False)
-        self.video_empty_lbl.setText("Cargando feed recomendado sin Shorts...")
+        self.video_empty_lbl.setText("Cargando videos...")
         self.video_empty_lbl.setVisible(True)
         self.video_grid.clear_widgets()
         self._video_cards.clear()
@@ -1369,6 +1551,7 @@ class MainWindow(QMainWindow):
             self._video_cards.append(card)
             cards.append(card)
         self.video_grid.set_items_widgets(cards)
+        QTimer.singleShot(800, trim_process_memory)
 
     def _on_video_feed_error(self, gen: int, err: str) -> None:
         if gen != self._video_feed_gen:
@@ -1381,19 +1564,19 @@ class MainWindow(QMainWindow):
 
     def _show_music_home_view(self) -> None:
         self._music_showing_search = False
-        self.music_view_title.setText("YouTube Music — Inicio")
+        self.music_view_title.setText("Música")
         if self.music_back_home_btn is not None:
             self.music_back_home_btn.setVisible(False)
         self._load_music_home()
 
     def _load_music_home(self) -> None:
         self._music_showing_search = False
-        self.music_view_title.setText("YouTube Music — Inicio")
+        self.music_view_title.setText("Música")
         if self.music_back_home_btn is not None:
             self.music_back_home_btn.setVisible(False)
         if self.music_refresh_btn is not None:
             self.music_refresh_btn.setEnabled(False)
-        self.music_empty_lbl.setText("Cargando 'Volver a escuchar' y recomendaciones...")
+        self.music_empty_lbl.setText("Cargando música...")
         self.music_empty_lbl.setVisible(True)
         self._clear_layout_widgets(self.music_results_lay, keep_widget=self.music_empty_lbl)
         self._music_rows.clear()
@@ -1437,6 +1620,7 @@ class MainWindow(QMainWindow):
             shelf = MusicShelfWidget(sec.title, tiles, self.palette)
             self._music_shelves.append(shelf)
             self.music_results_lay.insertWidget(self.music_results_lay.count() - 1, shelf)
+        QTimer.singleShot(800, trim_process_memory)
 
     def _on_music_home_error(self, gen: int, err: str) -> None:
         if gen != self._music_home_gen:
@@ -1649,6 +1833,7 @@ class MainWindow(QMainWindow):
             item = lay.itemAt(i)
             w = item.widget() if item else None
             if w is not None and w is not keep_widget:
+                w.hide()
                 lay.removeWidget(w)
                 w.deleteLater()
 
@@ -1824,11 +2009,13 @@ class MainWindow(QMainWindow):
     def play_video(self, item: MediaItem, start_pos: float | None = None) -> None:
         self._video_click_timer.stop()
         self._video_prefetch_timer.stop()
+        self._video_idle_unload_timer.stop()
+        self.continue_banner.setVisible(False)
         self._save_current_video_progress(force=True)
         self._pause_other_if_auto("video")
 
         # Cierre instantáneo del video anterior al cambiar a uno nuevo
-        if self._video_item is not None:
+        if self._video_item is not None and self.video_player.has_active_stream:
             self.video_player.stop()
 
         if start_pos is None:
@@ -1852,6 +2039,7 @@ class MainWindow(QMainWindow):
         self._last_saved_video_ts = time.monotonic()
 
         self.db.record_play(item)
+        self.persist_session_state(force=True)
         self.video_player.set_speed(self.cfg.video_speed)
         self._switch_page(self.PAGE_VIDEO_PLAYER)
 
@@ -2066,6 +2254,7 @@ class MainWindow(QMainWindow):
         if item.video_id:
             self._radio_seen_ids.append(item.video_id)
         self._refresh_badges()
+        self.persist_session_state(force=True)
         self.show_toast(f"Agregado a la cola: {item.title}")
         if self.stack.currentIndex() == self.PAGE_MUSIC_PLAYER:
             self._render_queue()
@@ -2080,6 +2269,7 @@ class MainWindow(QMainWindow):
                     self._queue_index = min(self._queue_index, len(self._music_queue) - 1)
                 break
         self._refresh_badges()
+        self.persist_session_state(force=True)
         self._render_queue()
 
     def _clear_queue(self) -> None:
@@ -2087,6 +2277,7 @@ class MainWindow(QMainWindow):
         self._queue_index = -1
         self._reset_radio_session()
         self._refresh_badges()
+        self.persist_session_state(force=True)
         self._render_queue()
 
     def _toggle_autoplay(self) -> None:
@@ -2097,12 +2288,19 @@ class MainWindow(QMainWindow):
             self._maybe_extend_radio(force=False)
         self._render_queue()
 
-    def _play_music_item(self, item: MediaItem) -> None:
+    def _play_music_item(self, item: MediaItem, start_pos: float = 0.0) -> None:
+        self._music_idle_unload_timer.stop()
         self._pause_other_if_auto("music")
         self._active_deck = "music"
+        eff_start = max(0.0, float(start_pos))
         self._music_item = item
-        self._music_pos = 0.0
+        self._music_pos = eff_start
+        self._music_dur = max(
+            self._music_dur if item is self._music_item else 0.0,
+            float(item.duration_sec or 0),
+        )
         self.db.record_play(item)
+        self.persist_session_state(force=True)
         self.music_player.set_speed(1.0)
         self.music_panel.set_current_item(item, self.db.is_in_my_music(item.video_id))
         self._sync_bottom_bar()
@@ -2120,11 +2318,13 @@ class MainWindow(QMainWindow):
         gen = self._music_play_gen
         self._run_async(
             lambda: self.yt.resolve_stream(item.video_id, audio_only=True),
-            on_done=lambda stream: self._on_music_stream_resolved(gen, stream),
+            on_done=lambda stream: self._on_music_stream_resolved(gen, stream, eff_start),
             on_error=lambda err: self._on_music_play_error(gen, err),
         )
 
-    def _on_music_stream_resolved(self, gen: int, stream: ResolvedStream) -> None:
+    def _on_music_stream_resolved(
+        self, gen: int, stream: ResolvedStream, start_pos: float = 0.0
+    ) -> None:
         if gen != self._music_play_gen:
             return
         if stream.duration > 0:
@@ -2134,7 +2334,7 @@ class MainWindow(QMainWindow):
             audio_url=None,
             video_enabled=False,
             http_headers=stream.http_headers,
-            start_pos=0.0,
+            start_pos=start_pos,
         )
         self._sync_bottom_bar()
         self._update_bottom_bar_visibility()
@@ -2180,12 +2380,18 @@ class MainWindow(QMainWindow):
         if deck == "video":
             if self._video_item is None:
                 return
+            if not self.video_player.has_active_stream:
+                self.play_video(self._video_item, start_pos=self._video_pos)
+                return
             if self._video_paused:
                 self._pause_other_if_auto("video")
                 self._active_deck = "video"
             self.video_player.toggle_pause()
         else:
             if self._music_item is None:
+                return
+            if not self.music_player.has_active_stream:
+                self._play_music_item(self._music_item, start_pos=self._music_pos)
                 return
             if self._music_paused:
                 self._pause_other_if_auto("music")
@@ -2224,6 +2430,7 @@ class MainWindow(QMainWindow):
             )
             self._last_saved_video_pos = 0.0
             self._video_pos = 0.0
+        self.persist_session_state(force=True)
         self.video_panel.set_paused(True)
         self.fs_overlay.set_paused(True)
         self._sync_bottom_bar()
@@ -2253,6 +2460,7 @@ class MainWindow(QMainWindow):
         if self._get_minibar_deck() == "video":
             self.mini_bar.set_position(pos)
         self._save_current_video_progress(force=False)
+        self.persist_session_state(force=False)
 
     def _on_video_dur_changed(self, dur: float) -> None:
         self._video_dur = max(0.0, dur)
@@ -2280,9 +2488,14 @@ class MainWindow(QMainWindow):
         self.video_panel.set_paused(paused)
         self.fs_overlay.set_paused(paused)
         if not paused:
+            self._video_idle_unload_timer.stop()
+            self.continue_banner.setVisible(False)
             self._active_deck = "video"
         else:
             self._save_current_video_progress(force=True)
+            self.persist_session_state(force=True)
+            if self.stack.currentIndex() != self.PAGE_VIDEO_PLAYER and self.video_player.is_loaded:
+                self._video_idle_unload_timer.start()
         self._sync_bottom_bar()
         self._sync_mini_bar()
 
@@ -2295,6 +2508,7 @@ class MainWindow(QMainWindow):
             self._update_bb_position(pos, self._music_dur)
         if self._get_minibar_deck() == "music":
             self.mini_bar.set_position(pos)
+        self.persist_session_state(force=False)
 
     def _on_music_dur_changed(self, dur: float) -> None:
         self._music_dur = max(0.0, dur)
@@ -2307,7 +2521,12 @@ class MainWindow(QMainWindow):
         self._music_paused = paused
         self.music_panel.set_playing_state(not paused)
         if not paused:
+            self._music_idle_unload_timer.stop()
             self._active_deck = "music"
+        else:
+            self.persist_session_state(force=True)
+            if self.music_player.is_loaded:
+                self._music_idle_unload_timer.start()
         self._sync_bottom_bar()
         self._sync_mini_bar()
 
@@ -2350,10 +2569,31 @@ class MainWindow(QMainWindow):
         else:
             self._on_music_volume_changed(max(10, self._prev_music_vol))
 
-    def _on_video_wheel_volume(self, step: int) -> None:
-        new_vol = max(0, min(100, self.cfg.video_volume + int(step) * 5))
+    def _on_video_wheel_volume(self, delta: int) -> None:
+        new_vol = max(0, min(100, self.cfg.video_volume + int(delta)))
         self._on_video_volume_changed(new_vol)
         self._show_volume_hud(new_vol)
+
+    def _show_music_volume_hud(self, percent: int) -> None:
+        anchor_w = self.music_panel.stage_area
+        top_left = anchor_w.mapToGlobal(QPoint(0, 0))
+        self.vol_hud.show_volume(percent, QRect(top_left, anchor_w.size()))
+
+    def _on_music_wheel_volume(self, delta: int) -> None:
+        new_vol = max(0, min(100, self.cfg.music_volume + int(delta)))
+        self._on_music_volume_changed(new_vol)
+        self._show_music_volume_hud(new_vol)
+
+    def _on_music_stage_clicked(self) -> None:
+        if self._music_item is None:
+            return
+        anchor_w = self.music_panel.stage_area
+        top_left = anchor_w.mapToGlobal(QPoint(0, 0))
+        self.action_hud.show_action(
+            "play" if self._music_paused else "pause",
+            QRect(top_left, anchor_w.size()),
+        )
+        self.toggle_deck_play_pause("music")
 
     def _show_volume_hud(self, percent: int) -> None:
         if self._is_fullscreen:
@@ -2476,6 +2716,8 @@ class MainWindow(QMainWindow):
         if deck == "video" and self._video_item is not None:
             self._active_deck = "video"
             self._switch_page(self.PAGE_VIDEO_PLAYER)
+            if not self.video_player.has_active_stream:
+                self.video_panel.set_resume_preview(self._video_item, self._video_pos)
         elif deck == "music" and self._music_item is not None:
             self._active_deck = "music"
             if self.stack.currentIndex() == self.PAGE_MUSIC_PLAYER:
@@ -2565,6 +2807,7 @@ class MainWindow(QMainWindow):
     def _sync_bottom_bar(self) -> None:
         deck = self._get_bottom_bar_deck()
         if deck is None:
+            self._bb_thumb_url = ""
             self.bb_title.setText("Sin reproducción")
             self.bb_author.setText("")
             self.bb_thumb.clear()
@@ -2579,13 +2822,28 @@ class MainWindow(QMainWindow):
 
         self.bb_deck_tag.setText("VIDEO" if deck == "video" else "MÚSICA")
         if it is not None:
-            fm_t = self.bb_title.fontMetrics()
-            self.bb_title.setText(fm_t.elidedText(it.title, Qt.TextElideMode.ElideRight, 205))
-            fm_a = self.bb_author.fontMetrics()
-            self.bb_author.setText(fm_a.elidedText(it.author or "", Qt.TextElideMode.ElideRight, 240))
-            pix = self.thumb_cache.get_or_fetch(it.normalized_thumb(), QSize(48, 48))
+            self.bb_title.setText(it.title)
+            if (
+                deck == "video"
+                and pos >= 3.0
+                and not self.video_player.has_active_stream
+            ):
+                sub = f"{it.author or 'YouTube'}  ·  Continuar en {format_duration(pos)}"
+            elif (
+                deck == "music"
+                and pos >= 3.0
+                and not self.music_player.has_active_stream
+            ):
+                sub = f"{it.author or 'YouTube Music'}  ·  Continuar en {format_duration(pos)}"
+            else:
+                sub = it.author or ""
+            self.bb_author.setText(sub)
+            self._bb_thumb_url = it.normalized_thumb()
+            pix = self.thumb_cache.get_or_fetch(self._bb_thumb_url, QSize(48, 48))
             if pix is not None:
-                self.bb_thumb.setPixmap(pix)
+                self.bb_thumb.set_pixmap(pix)
+            else:
+                self.bb_thumb.clear()
 
         self.bb_play.setIcon(
             render_icon("play" if paused else "pause", self.palette.accent_text, 18)
@@ -2601,7 +2859,7 @@ class MainWindow(QMainWindow):
         both_loaded = self._video_item is not None and self._music_item is not None
         self.bb_switch_btn.setVisible(both_loaded)
         if both_loaded:
-            self.bb_switch_btn.setText("Ir a Música" if deck == "video" else "Ir a Video")
+            self.bb_switch_btn.setText("Música" if deck == "video" else "Video")
 
     def _sync_mini_bar(self) -> None:
         deck = self._get_minibar_deck()
@@ -2618,10 +2876,12 @@ class MainWindow(QMainWindow):
         self.mini_bar.set_volume_silent(vol)
 
     def _on_bb_thumb_ready(self, url: str, pix: QPixmap) -> None:
-        deck = self._get_bottom_bar_deck()
-        it = self._video_item if deck == "video" else self._music_item
-        if it is not None and url == it.normalized_thumb():
-            self.bb_thumb.setPixmap(pix)
+        if (
+            self._bb_thumb_url
+            and url == self._bb_thumb_url
+            and pix.size() == QSize(48, 48)
+        ):
+            self.bb_thumb.set_pixmap(pix)
 
     def _refresh_bb_vol_icon(self) -> None:
         vol = self.bb_vol.value()
@@ -2648,6 +2908,7 @@ class MainWindow(QMainWindow):
         if self._is_fullscreen:
             if self._bottom_bar_anim is not None:
                 self._bottom_bar_anim.stop()
+            self._bottom_bar_hiding = False
             self.bottom_bar.setFixedHeight(74)
             self.bottom_bar.setVisible(False)
             return
@@ -2655,28 +2916,43 @@ class MainWindow(QMainWindow):
         has_any = self._video_item is not None or self._music_item is not None
         should_show = has_any and not on_video_player
         was_visible = self.bottom_bar.isVisible()
-        if should_show and not was_visible:
+        if should_show and (not was_visible or self._bottom_bar_hiding):
             if self._bottom_bar_anim is not None:
                 self._bottom_bar_anim.stop()
+            self._bottom_bar_hiding = False
+            cur_h = self.bottom_bar.height() if was_visible else 0
             self.bottom_bar.setMinimumHeight(0)
-            self.bottom_bar.setMaximumHeight(0)
+            self.bottom_bar.setMaximumHeight(cur_h)
             self.bottom_bar.setVisible(True)
             anim = QPropertyAnimation(self.bottom_bar, b"maximumHeight", self)
-            anim.setDuration(180)
+            anim.setDuration(max(70, int(180 * (1.0 - cur_h / 74.0))))
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.setStartValue(0)
+            anim.setStartValue(cur_h)
             anim.setEndValue(74)
-            anim.finished.connect(self._on_bottom_bar_shown)
+            anim.finished.connect(self._on_bottom_bar_anim_finished)
             self._bottom_bar_anim = anim
             anim.start()
-        elif not should_show:
+        elif not should_show and was_visible and not self._bottom_bar_hiding:
             if self._bottom_bar_anim is not None:
                 self._bottom_bar_anim.stop()
-            self.bottom_bar.setFixedHeight(74)
-            self.bottom_bar.setVisible(False)
+            self._bottom_bar_hiding = True
+            cur_h = max(0, min(74, self.bottom_bar.height()))
+            self.bottom_bar.setMinimumHeight(0)
+            anim = QPropertyAnimation(self.bottom_bar, b"maximumHeight", self)
+            anim.setDuration(max(60, int(160 * (cur_h / 74.0))))
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(cur_h)
+            anim.setEndValue(0)
+            anim.finished.connect(self._on_bottom_bar_anim_finished)
+            self._bottom_bar_anim = anim
+            anim.start()
 
-    def _on_bottom_bar_shown(self) -> None:
-        if self.bottom_bar.isVisible():
+    def _on_bottom_bar_anim_finished(self) -> None:
+        if self._bottom_bar_hiding:
+            self._bottom_bar_hiding = False
+            self.bottom_bar.setVisible(False)
+            self.bottom_bar.setFixedHeight(74)
+        elif self.bottom_bar.isVisible():
             self.bottom_bar.setFixedHeight(74)
 
     # ------------------------------------------------------------------
@@ -2694,24 +2970,40 @@ class MainWindow(QMainWindow):
         if self._sidebar_anim is not None:
             self._sidebar_anim.stop()
         if self._sidebar_hidden:
-            self.sidebar.setFixedWidth(220)
-            self.sidebar.setVisible(False)
-        else:
+            self._sidebar_hiding = True
+            cur_w = self.sidebar.width() if self.sidebar.isVisible() else 220
             self.sidebar.setMinimumWidth(0)
-            self.sidebar.setMaximumWidth(0)
+            self.sidebar.setMaximumWidth(cur_w)
+            anim = QPropertyAnimation(self.sidebar, b"maximumWidth", self)
+            anim.setDuration(160)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(cur_w)
+            anim.setEndValue(0)
+            anim.finished.connect(self._on_sidebar_anim_finished)
+            self._sidebar_anim = anim
+            anim.start()
+        else:
+            self._sidebar_hiding = False
+            cur_w = self.sidebar.width() if self.sidebar.isVisible() else 0
+            self.sidebar.setMinimumWidth(0)
+            self.sidebar.setMaximumWidth(cur_w)
             self.sidebar.setVisible(True)
             anim = QPropertyAnimation(self.sidebar, b"maximumWidth", self)
             anim.setDuration(170)
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.setStartValue(0)
+            anim.setStartValue(cur_w)
             anim.setEndValue(220)
-            anim.finished.connect(self._on_sidebar_shown)
+            anim.finished.connect(self._on_sidebar_anim_finished)
             self._sidebar_anim = anim
             anim.start()
         self._refresh_sidebar_toggle_ui()
 
-    def _on_sidebar_shown(self) -> None:
-        if not self._sidebar_hidden:
+    def _on_sidebar_anim_finished(self) -> None:
+        if self._sidebar_hiding:
+            self._sidebar_hiding = False
+            self.sidebar.setVisible(False)
+            self.sidebar.setFixedWidth(220)
+        else:
             self.sidebar.setFixedWidth(220)
 
     def _refresh_sidebar_toggle_ui(self) -> None:
@@ -2781,17 +3073,23 @@ class MainWindow(QMainWindow):
             if self._is_fullscreen:
                 self.toggle_fullscreen()
             self.hide()
+            if self._video_paused and self.video_player.is_loaded:
+                self.video_player.unload()
+            if self._music_paused and self.music_player.is_loaded:
+                self.music_player.unload()
+            self.thumb_cache.trim(12)
             trim_process_memory()
             self._sync_mini_bar()
             screen = QApplication.primaryScreen()
             if screen:
                 geo = screen.availableGeometry()
-                self.mini_bar.move(
+                target = QPoint(
                     geo.right() - self.mini_bar.width() - 24,
                     geo.bottom() - self.mini_bar.height() - 24,
                 )
-            self.mini_bar.show()
-            self.mini_bar.raise_()
+            else:
+                target = QPoint(40, 40)
+            self.mini_bar.show_animated(target)
 
     def _restore_from_mini_bar(self) -> None:
         self.mini_bar.hide()
@@ -2868,37 +3166,16 @@ class MainWindow(QMainWindow):
         self.pool.start(task)
 
     def show_toast(self, message: str, duration_ms: int = 3500) -> None:
-        self.toast_lbl.setText(message)
-        self.toast_lbl.adjustSize()
-        margin = 18
-        y_offset = self.bottom_bar.height() + margin if self.bottom_bar.isVisible() else margin
-        x = max(margin, self.width() - self.toast_lbl.width() - margin)
-        y = max(margin, self.height() - self.toast_lbl.height() - y_offset)
-        if self._toast_anim is None:
-            anim = QPropertyAnimation(self.toast_lbl, b"pos", self)
-            anim.setDuration(180)
-            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            self._toast_anim = anim
-        self._toast_anim.stop()
-        self.toast_lbl.move(x, y + 12)
-        self.toast_lbl.setVisible(True)
-        self.toast_lbl.raise_()
-        self._toast_anim.setStartValue(QPoint(x, y + 12))
-        self._toast_anim.setEndValue(QPoint(x, y))
-        self._toast_anim.start()
-        self._toast_timer.start(duration_ms)
+        y_offset = self.bottom_bar.height() + 18 if self.bottom_bar.isVisible() else 18
+        self.toast_lbl.show_message(
+            message, self.size(), y_offset, duration_ms=duration_ms
+        )
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self.toast_lbl.isVisible():
-            if self._toast_anim is not None:
-                self._toast_anim.stop()
-            margin = 18
-            y_offset = self.bottom_bar.height() + margin if self.bottom_bar.isVisible() else margin
-            self.toast_lbl.move(
-                max(margin, self.width() - self.toast_lbl.width() - margin),
-                max(margin, self.height() - self.toast_lbl.height() - y_offset),
-            )
+            y_offset = self.bottom_bar.height() + 18 if self.bottom_bar.isVisible() else 18
+            self.toast_lbl.reposition(self.size(), y_offset)
 
     def restore_window(self) -> None:
         self.mini_bar.hide()
@@ -2913,9 +3190,15 @@ class MainWindow(QMainWindow):
         if not self._force_quit and self.cfg.minimize_to_tray and self.tray_icon.isVisible():
             event.ignore()
             self._save_current_video_progress(force=True)
+            self.persist_session_state(force=True)
             if self._is_fullscreen:
                 self.toggle_fullscreen()
             self.hide()
+            if self._video_paused and self.video_player.is_loaded:
+                self.video_player.unload()
+            if self._music_paused and self.music_player.is_loaded:
+                self.music_player.unload()
+            self.thumb_cache.trim(12)
             trim_process_memory()
             if not self._tray_notified:
                 self._tray_notified = True
@@ -2942,6 +3225,10 @@ class MainWindow(QMainWindow):
         self._cleaned_up = True
         try:
             self._save_current_video_progress(force=True)
+        except Exception:
+            pass
+        try:
+            self.persist_session_state(force=True)
         except Exception:
             pass
         try:

@@ -19,6 +19,7 @@ USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = USER_DATA_DIR / "config.json"
 DB_PATH = USER_DATA_DIR / "library.db"
 SESSION_PATH = USER_DATA_DIR / "session.dpapi"
+SESSION_STATE_PATH = USER_DATA_DIR / "session_state.json"
 ACCOUNT_PROFILE_PATH = USER_DATA_DIR / "account_profile.json"
 ICON_ICO_PATH = ASSETS_DIR / "swiftplay.ico"
 ICON_PNG_PATH = ASSETS_DIR / "swiftplay.png"

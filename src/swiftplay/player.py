@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
 import locale
 import os
+import sys
 import threading
 
 from PySide6.QtCore import QObject, Signal
@@ -18,6 +20,15 @@ os.environ["PATH"] = f"{BIN_DIR}{os.pathsep}{os.environ.get('PATH', '')}"
 import mpv  # noqa: E402
 
 NORMALIZATION_FILTER = "lavfi=[dynaudnorm=f=150:g=15:p=0.9]"
+
+
+def _is_shift_pressed() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000)
+    except Exception:
+        return False
 
 
 class MediaPlayer(QObject):
@@ -47,6 +58,7 @@ class MediaPlayer(QObject):
         self._lock = threading.RLock()
         self._shutdown = False
         self._user_stopped = False
+        self._has_media = False
         self._loading_generation = 0
         self._wid = wid
         self._is_audio_only_instance = wid is None
@@ -59,6 +71,16 @@ class MediaPlayer(QObject):
 
         if not lazy:
             self._ensure_mpv()
+
+    @property
+    def is_loaded(self) -> bool:
+        with self._lock:
+            return self._mpv is not None
+
+    @property
+    def has_active_stream(self) -> bool:
+        with self._lock:
+            return self._mpv is not None and self._has_media
 
     def _ensure_mpv(self) -> mpv.MPV | None:
         with self._lock:
@@ -83,8 +105,9 @@ class MediaPlayer(QObject):
                 audio_pitch_correction=True,
                 ytdl=False,
                 cache="yes",
-                cache_secs=8,
+                cache_secs=6,
                 cache_pause_initial="no",
+                vd_lavc_threads=4,
                 demuxer_lavf_probesize=1048576,
                 demuxer_lavf_analyzeduration=0.5,
                 volume=self._volume,
@@ -95,13 +118,14 @@ class MediaPlayer(QObject):
                 kwargs["wid"] = str(int(self._wid))
                 kwargs["hwdec"] = "auto-safe"
                 kwargs["vo"] = "gpu"
-                kwargs["demuxer_max_bytes"] = "12MiB"
-                kwargs["demuxer_max_back_bytes"] = "4MiB"
+                kwargs["gpu_dumb_mode"] = "yes"
+                kwargs["demuxer_max_bytes"] = "8MiB"
+                kwargs["demuxer_max_back_bytes"] = "2MiB"
                 kwargs["cursor_autohide"] = "no"
             else:
                 kwargs["vo"] = "null"
                 kwargs["vid"] = "no"
-                kwargs["demuxer_max_bytes"] = "4MiB"
+                kwargs["demuxer_max_bytes"] = "3MiB"
                 kwargs["demuxer_max_back_bytes"] = "1MiB"
 
             self._mpv = mpv.MPV(**kwargs)
@@ -153,9 +177,12 @@ class MediaPlayer(QObject):
                 error_code = ev.get("error", 0)
 
             # Solo EOF genuino (0 / 'eof') dispara autoplay/siguiente pista
-            if reason in (0, "eof", b"eof") and not self._user_stopped:
-                self.track_ended.emit()
+            if reason in (0, "eof", b"eof"):
+                self._has_media = False
+                if not self._user_stopped:
+                    self.track_ended.emit()
             elif reason in (4, "error", b"error"):
+                self._has_media = False
                 self.error_occurred.emit(
                     f"Error de reproducción en libmpv (código {error_code})."
                 )
@@ -165,10 +192,20 @@ class MediaPlayer(QObject):
                 @player.on_key_press("WHEEL_UP")
                 def _on_wheel_up():
                     if not self._shutdown:
-                        self.wheel_scrolled.emit(1)
+                        self.wheel_scrolled.emit(1 if _is_shift_pressed() else 5)
 
                 @player.on_key_press("WHEEL_DOWN")
                 def _on_wheel_down():
+                    if not self._shutdown:
+                        self.wheel_scrolled.emit(-1 if _is_shift_pressed() else -5)
+
+                @player.on_key_press("Shift+WHEEL_UP")
+                def _on_shift_wheel_up():
+                    if not self._shutdown:
+                        self.wheel_scrolled.emit(1)
+
+                @player.on_key_press("Shift+WHEEL_DOWN")
+                def _on_shift_wheel_down():
                     if not self._shutdown:
                         self.wheel_scrolled.emit(-1)
 
@@ -215,6 +252,7 @@ class MediaPlayer(QObject):
                 return
             self._loading_generation += 1
             self._user_stopped = False
+            self._has_media = True
 
             if self._is_audio_only_instance:
                 player.vid = "no"
@@ -254,13 +292,27 @@ class MediaPlayer(QObject):
 
     def stop(self) -> None:
         with self._lock:
+            self._user_stopped = True
+            self._has_media = False
             if not self._shutdown and self._mpv is not None:
-                self._user_stopped = True
                 try:
                     self._mpv["audio-files"] = []
                 except Exception:
                     pass
                 self._mpv.command("stop")
+
+    def unload(self) -> None:
+        """Libera la instancia de libmpv manteniendo el objeto reutilizable al dar Play."""
+        with self._lock:
+            self._user_stopped = True
+            self._has_media = False
+            self._applied_af = None
+            if self._mpv is not None:
+                try:
+                    self._mpv.terminate()
+                except Exception:
+                    pass
+                self._mpv = None
 
     def seek(self, seconds: float) -> None:
         with self._lock:
@@ -321,6 +373,7 @@ class MediaPlayer(QObject):
                 return
             self._shutdown = True
             self._user_stopped = True
+            self._has_media = False
             if self._mpv is not None:
                 try:
                     self._mpv.terminate()

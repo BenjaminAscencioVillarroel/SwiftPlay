@@ -154,3 +154,9 @@ class ThumbnailCache(QObject):
 
     def clear(self) -> None:
         self._cache.clear()
+
+    def trim(self, keep: int = 12) -> None:
+        """Reduce la caché LRU en memoria conservando solo las más recientes."""
+        limit = max(0, int(keep))
+        while len(self._cache) > limit:
+            self._cache.popitem(last=False)

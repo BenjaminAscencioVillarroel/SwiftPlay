@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Callable
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QMouseEvent, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -23,10 +23,33 @@ from swiftplay.ui.icons import render_icon
 from swiftplay.ui.widgets import ElidedLabel, MusicRowWidget, RoundedThumbWidget
 
 
+class _MusicStageArea(QWidget):
+    """Área izquierda (portada y alrededores): clic para pausar/reanudar y rueda para volumen."""
+
+    clicked = Signal()
+    wheel_scrolled = Signal(int)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        delta = event.angleDelta().y() or event.angleDelta().x()
+        if delta != 0:
+            step = 1 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 5
+            self.wheel_scrolled.emit(step if delta > 0 else -step)
+        event.accept()
+
+
 class MusicNowPlayingPanel(QWidget):
     """Vista dedicada para música: portada grande a la izquierda y cola 'A continuación' a la derecha."""
 
     back_requested = Signal()
+    play_pause_requested = Signal()
+    wheel_scrolled = Signal(int)
     queue_index_requested = Signal(int)
     remove_from_queue_requested = Signal(object)  # MediaItem
     my_music_toggled = Signal(object)             # MediaItem
@@ -73,14 +96,17 @@ class MusicNowPlayingPanel(QWidget):
 
         hdr.addStretch()
 
-        self.autoplay_btn = QPushButton()
+        self.autoplay_btn = QPushButton("Radio infinita")
         self.autoplay_btn.setObjectName("PillBtn")
         self.autoplay_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.autoplay_btn.setToolTip("Genera automáticamente nuevas canciones relacionadas al llegar al final")
         self.autoplay_btn.clicked.connect(self.autoplay_toggled.emit)
         hdr.addWidget(self.autoplay_btn)
 
-        self.clear_btn = QPushButton("Limpiar cola")
+        self.clear_btn = QPushButton()
+        self.clear_btn.setObjectName("IconBtn")
+        self.clear_btn.setFixedSize(30, 30)
+        self.clear_btn.setToolTip("Limpiar cola")
         self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clear_btn.clicked.connect(self.clear_queue_requested.emit)
         hdr.addWidget(self.clear_btn)
@@ -92,19 +118,27 @@ class MusicNowPlayingPanel(QWidget):
         body.setContentsMargins(24, 14, 22, 14)
         body.setSpacing(28)
 
-        # --- Columna izquierda: Portada y acciones ---
-        left_col = QVBoxLayout()
+        # --- Columna izquierda: Portada y acciones (clic = pausar, rueda = volumen) ---
+        self.stage_area = _MusicStageArea()
+        self.stage_area.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stage_area.setToolTip("Clic para pausar/reanudar  •  Rueda: ±5% (Shift: ±1%)")
+        self.stage_area.clicked.connect(self._on_stage_clicked)
+        self.stage_area.wheel_scrolled.connect(self.wheel_scrolled.emit)
+
+        left_col = QVBoxLayout(self.stage_area)
         left_col.setContentsMargins(8, 8, 8, 8)
         left_col.setSpacing(12)
         left_col.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_col.addStretch(1)
 
         self.cover_widget = RoundedThumbWidget(
-            radius=12,
+            radius=14,
             bg_color=palette.surface1,
             enable_crossfade=True,
+            ambient_shadow=True,
         )
         self.cover_widget.setFixedSize(320, 320)
+        self.cover_widget.setCursor(Qt.CursorShape.PointingHandCursor)
         left_col.addWidget(self.cover_widget, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.title_lbl = QLabel("Sin canción seleccionada")
@@ -112,7 +146,7 @@ class MusicNowPlayingPanel(QWidget):
         self.title_lbl.setWordWrap(True)
         self.title_lbl.setMaximumWidth(440)
         self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title_lbl.setStyleSheet("font-size: 20px; font-weight: 700;")
+        self.title_lbl.setStyleSheet("font-size: 21px; font-weight: 700;")
         left_col.addWidget(self.title_lbl, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.artist_lbl = ElidedLabel("", max_lines=1)
@@ -140,7 +174,7 @@ class MusicNowPlayingPanel(QWidget):
 
         left_col.addLayout(actions_row)
         left_col.addStretch(1)
-        body.addLayout(left_col, 3)
+        body.addWidget(self.stage_area, 3)
 
         # --- Columna derecha: Cola "A CONTINUACIÓN" ---
         right_panel = QWidget()
@@ -192,6 +226,11 @@ class MusicNowPlayingPanel(QWidget):
         self._thumb_cache.ready.connect(self._on_thumb_ready)
         self.set_autoplay_state(autoplay_enabled)
         self.update_theme(palette)
+
+    def _on_stage_clicked(self) -> None:
+        if self._current_item is not None:
+            self.cover_widget.trigger_press_feedback()
+            self.play_pause_requested.emit()
 
     def _on_fav_clicked(self) -> None:
         if self._current_item is not None:
@@ -247,8 +286,11 @@ class MusicNowPlayingPanel(QWidget):
 
     def set_autoplay_state(self, enabled: bool) -> None:
         self._autoplay_enabled = bool(enabled)
-        self.autoplay_btn.setText(
-            "Radio infinita: ON" if self._autoplay_enabled else "Radio infinita: OFF"
+        self.autoplay_btn.setText("Radio infinita")
+        self.autoplay_btn.setToolTip(
+            "Radio infinita activada (clic para desactivar)"
+            if self._autoplay_enabled
+            else "Radio infinita desactivada (clic para activar)"
         )
         self.autoplay_btn.setProperty("active", "true" if self._autoplay_enabled else "false")
         self.autoplay_btn.style().unpolish(self.autoplay_btn)
@@ -276,6 +318,7 @@ class MusicNowPlayingPanel(QWidget):
             item = self.queue_lay.itemAt(i)
             w = item.widget() if item else None
             if w is not None and w is not self.empty_lbl:
+                w.hide()
                 self.queue_lay.removeWidget(w)
                 w.deleteLater()
         self._queue_rows.clear()
@@ -360,6 +403,7 @@ class MusicNowPlayingPanel(QWidget):
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self.back_btn.setIcon(render_icon("back", palette.text, 15))
+        self.clear_btn.setIcon(render_icon("trash", palette.text2, 15))
         self.dl_btn.setIcon(render_icon("download", palette.text, 15))
         self.cover_widget.set_bg_color(palette.surface1)
         self.set_my_music_state(self._in_my_music)

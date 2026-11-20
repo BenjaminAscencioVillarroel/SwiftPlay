@@ -329,11 +329,11 @@ class FullscreenOverlayBar(QWidget):
         self.mute_btn.clicked.connect(self._toggle_mute)
         btn_row.addWidget(self.mute_btn)
 
-        self.vol_slider = ClickableSlider(Qt.Orientation.Horizontal)
+        self.vol_slider = ClickableSlider(Qt.Orientation.Horizontal, volume_wheel=True)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(initial_volume)
         self.vol_slider.setFixedWidth(88)
-        self.vol_slider.setToolTip("Volumen (también con rueda sobre el video)")
+        self.vol_slider.setToolTip("Volumen (rueda: ±5%, Shift: ±1%)")
         self.vol_slider.valueChanged.connect(self._on_vol_changed)
         btn_row.addWidget(self.vol_slider)
 
@@ -499,9 +499,10 @@ class FullscreenOverlayBar(QWidget):
         super().mouseMoveEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        delta = event.angleDelta().y()
+        delta = event.angleDelta().y() or event.angleDelta().x()
         if delta != 0:
-            self.wheel_scrolled.emit(1 if delta > 0 else -1)
+            step = 1 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 5
+            self.wheel_scrolled.emit(step if delta > 0 else -step)
             self._hide_timer.start(500)
         event.accept()
 
