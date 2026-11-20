@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from PySide6.QtCore import (
+    QEasingCurve,
     QEvent,
     QObject,
     QPoint,
+    QPropertyAnimation,
     QRect,
     QRunnable,
     QSize,
@@ -579,6 +581,7 @@ class MainWindow(QMainWindow):
         self.toast_lbl = QLabel("", self)
         self.toast_lbl.setObjectName("ToastLabel")
         self.toast_lbl.setVisible(False)
+        self._toast_anim: QPropertyAnimation | None = None
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(lambda: self.toast_lbl.setVisible(False))
@@ -632,7 +635,9 @@ class MainWindow(QMainWindow):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         container = QWidget()
+        container.setMinimumWidth(0)
         items_lay = QVBoxLayout(container)
         items_lay.setContentsMargins(0, 4, 4, 12)
         items_lay.setSpacing(8)
@@ -682,7 +687,9 @@ class MainWindow(QMainWindow):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         container = QWidget()
+        container.setMinimumWidth(0)
         items_lay = QVBoxLayout(container)
         items_lay.setContentsMargins(0, 4, 4, 12)
         items_lay.setSpacing(8)
@@ -2710,14 +2717,25 @@ class MainWindow(QMainWindow):
         y_offset = self.bottom_bar.height() + margin if self.bottom_bar.isVisible() else margin
         x = max(margin, self.width() - self.toast_lbl.width() - margin)
         y = max(margin, self.height() - self.toast_lbl.height() - y_offset)
-        self.toast_lbl.move(x, y)
+        if self._toast_anim is None:
+            anim = QPropertyAnimation(self.toast_lbl, b"pos", self)
+            anim.setDuration(180)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._toast_anim = anim
+        self._toast_anim.stop()
+        self.toast_lbl.move(x, y + 12)
         self.toast_lbl.setVisible(True)
         self.toast_lbl.raise_()
+        self._toast_anim.setStartValue(QPoint(x, y + 12))
+        self._toast_anim.setEndValue(QPoint(x, y))
+        self._toast_anim.start()
         self._toast_timer.start(duration_ms)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self.toast_lbl.isVisible():
+            if self._toast_anim is not None:
+                self._toast_anim.stop()
             margin = 18
             y_offset = self.bottom_bar.height() + margin if self.bottom_bar.isVisible() else margin
             self.toast_lbl.move(

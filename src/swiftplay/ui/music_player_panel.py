@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -20,7 +20,7 @@ from swiftplay.models import MediaItem, upgrade_thumb_url
 from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
-from swiftplay.ui.widgets import MusicRowWidget, RoundedThumbWidget
+from swiftplay.ui.widgets import ElidedLabel, MusicRowWidget, RoundedThumbWidget
 
 
 class MusicNowPlayingPanel(QWidget):
@@ -52,6 +52,7 @@ class MusicNowPlayingPanel(QWidget):
         self._autoplay_enabled = bool(autoplay_enabled)
         self._radio_loading = False
         self._queue_rows: list[MusicRowWidget] = []
+        self._queue_scroll_anim: QPropertyAnimation | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -97,18 +98,23 @@ class MusicNowPlayingPanel(QWidget):
         left_col.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_col.addStretch(1)
 
-        self.cover_widget = RoundedThumbWidget(radius=12, bg_color=palette.surface1)
+        self.cover_widget = RoundedThumbWidget(
+            radius=12,
+            bg_color=palette.surface1,
+            enable_crossfade=True,
+        )
         self.cover_widget.setFixedSize(320, 320)
         left_col.addWidget(self.cover_widget, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.title_lbl = QLabel("Sin canción seleccionada")
+        self.title_lbl.setMinimumWidth(0)
         self.title_lbl.setWordWrap(True)
         self.title_lbl.setMaximumWidth(440)
         self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.title_lbl.setStyleSheet("font-size: 20px; font-weight: 700;")
         left_col.addWidget(self.title_lbl, 0, Qt.AlignmentFlag.AlignCenter)
 
-        self.artist_lbl = QLabel("")
+        self.artist_lbl = ElidedLabel("", max_lines=1)
         self.artist_lbl.setObjectName("MutedLabel")
         self.artist_lbl.setMaximumWidth(440)
         self.artist_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -137,8 +143,8 @@ class MusicNowPlayingPanel(QWidget):
 
         # --- Columna derecha: Cola "A CONTINUACIÓN" ---
         right_panel = QWidget()
-        right_panel.setMinimumWidth(340)
-        right_panel.setMaximumWidth(500)
+        right_panel.setMinimumWidth(300)
+        right_panel.setMaximumWidth(480)
         right_lay = QVBoxLayout(right_panel)
         right_lay.setContentsMargins(0, 0, 0, 0)
         right_lay.setSpacing(8)
@@ -161,7 +167,9 @@ class MusicNowPlayingPanel(QWidget):
 
         self.queue_scroll = QScrollArea()
         self.queue_scroll.setWidgetResizable(True)
+        self.queue_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         queue_container = QWidget()
+        queue_container.setMinimumWidth(0)
         self.queue_lay = QVBoxLayout(queue_container)
         self.queue_lay.setContentsMargins(0, 2, 4, 8)
         self.queue_lay.setSpacing(2)
@@ -303,8 +311,25 @@ class MusicNowPlayingPanel(QWidget):
 
     def _scroll_to_row(self, row: MusicRowWidget) -> None:
         try:
-            if row in self._queue_rows:
-                self.queue_scroll.ensureWidgetVisible(row, 0, 80)
+            if row not in self._queue_rows:
+                return
+            vbar = self.queue_scroll.verticalScrollBar()
+            vh = self.queue_scroll.viewport().height()
+            target = max(
+                vbar.minimum(),
+                min(vbar.maximum(), row.y() - max(0, (vh - row.height()) // 2)),
+            )
+            if abs(vbar.value() - target) < 4:
+                return
+            if self._queue_scroll_anim is None:
+                anim = QPropertyAnimation(vbar, b"value", self)
+                anim.setDuration(220)
+                anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+                self._queue_scroll_anim = anim
+            self._queue_scroll_anim.stop()
+            self._queue_scroll_anim.setStartValue(vbar.value())
+            self._queue_scroll_anim.setEndValue(target)
+            self._queue_scroll_anim.start()
         except RuntimeError:
             pass
 

@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QVariantAnimation,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -10,7 +19,10 @@ from PySide6.QtGui import (
     QMouseEvent,
     QPainter,
     QPainterPath,
+    QPalette,
     QPixmap,
+    QTextLayout,
+    QTextOption,
 )
 from PySide6.QtWidgets import (
     QFrame,
@@ -67,8 +79,113 @@ class SectionTitleWidget(QLabel):
         )
 
 
+class ElidedLabel(QLabel):
+    """Etiqueta que recorta con '...' al ancho disponible sin forzar scroll horizontal."""
+
+    def __init__(
+        self, text: str = "", max_lines: int = 1, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self._full_text = str(text or "")
+        self._max_lines = max(1, int(max_lines))
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        if self._full_text:
+            self.setToolTip(self._full_text)
+
+    def text(self) -> str:
+        return self._full_text
+
+    def setText(self, text: str) -> None:
+        self._full_text = str(text or "")
+        self.setToolTip(self._full_text)
+        self.update()
+
+    def minimumSizeHint(self) -> QSize:
+        self.ensurePolished()
+        fm = self.fontMetrics()
+        h = (fm.lineSpacing() * 2 + 2) if self._max_lines >= 2 else (fm.height() + 2)
+        return QSize(0, h)
+
+    def sizeHint(self) -> QSize:
+        self.ensurePolished()
+        fm = self.fontMetrics()
+        if self._max_lines >= 2:
+            return QSize(180, fm.lineSpacing() * 2 + 2)
+        return QSize(120, fm.height() + 2)
+
+    def paintEvent(self, _event) -> None:
+        w = max(0, self.width())
+        h = max(0, self.height())
+        if w <= 0 or h <= 0 or not self._full_text:
+            return
+
+        painter = QPainter(self)
+        painter.setFont(self.font())
+        fm = QFontMetrics(self.font())
+        align_h = self.alignment() & Qt.AlignmentFlag.AlignHorizontal_Mask
+        if not align_h:
+            align_h = Qt.AlignmentFlag.AlignLeft
+
+        if self._max_lines == 1:
+            elided = fm.elidedText(self._full_text, Qt.TextElideMode.ElideRight, w)
+            self.style().drawItemText(
+                painter,
+                self.rect(),
+                int(align_h | Qt.AlignmentFlag.AlignVCenter),
+                self.palette(),
+                self.isEnabled(),
+                elided,
+                QPalette.ColorRole.WindowText,
+            )
+            painter.end()
+            return
+
+        layout = QTextLayout(self._full_text, self.font())
+        opt = QTextOption()
+        opt.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        layout.setTextOption(opt)
+        layout.beginLayout()
+        line1 = layout.createLine()
+        if line1.isValid():
+            line1.setLineWidth(float(w))
+        line2 = layout.createLine()
+        layout.endLayout()
+
+        line_h = fm.lineSpacing()
+        has_second = line2.isValid() and line1.textLength() < len(self._full_text)
+        y0 = 0 if has_second else max(0, (h - line_h) // 2)
+
+        if line1.isValid():
+            start1 = line1.textStart()
+            end1 = start1 + line1.textLength()
+            t1 = self._full_text[start1:end1].rstrip("\n")
+            self.style().drawItemText(
+                painter,
+                QRect(0, y0, w, line_h),
+                int(align_h | Qt.AlignmentFlag.AlignTop),
+                self.palette(),
+                self.isEnabled(),
+                t1,
+                QPalette.ColorRole.WindowText,
+            )
+            if has_second:
+                rest = self._full_text[end1:].lstrip()
+                t2 = fm.elidedText(rest, Qt.TextElideMode.ElideRight, w)
+                self.style().drawItemText(
+                    painter,
+                    QRect(0, y0 + line_h, w, max(line_h, h - y0 - line_h)),
+                    int(align_h | Qt.AlignmentFlag.AlignTop),
+                    self.palette(),
+                    self.isEnabled(),
+                    t2,
+                    QPalette.ColorRole.WindowText,
+                )
+        painter.end()
+
+
 class RoundedThumbWidget(QWidget):
-    """Miniatura con esquinas redondeadas, badge de duración, progreso y overlay Play."""
+    """Miniatura con esquinas redondeadas, badge, progreso, hover zoom y crossfade."""
 
     def __init__(
         self,
@@ -78,6 +195,8 @@ class RoundedThumbWidget(QWidget):
         show_play_on_hover: bool = False,
         force_play_overlay: bool = False,
         bg_color: str = "#121418",
+        enable_hover_zoom: bool = False,
+        enable_crossfade: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -87,15 +206,80 @@ class RoundedThumbWidget(QWidget):
         self._show_play_on_hover = show_play_on_hover
         self._force_play_overlay = force_play_overlay
         self._bg_color = bg_color
+        self._enable_hover_zoom = bool(enable_hover_zoom)
+        self._enable_crossfade = bool(enable_crossfade)
         self._hovered = False
+        self._hover_t = 0.0
+        self._hover_anim: QVariantAnimation | None = None
         self._pixmap: QPixmap | None = None
+        self._prev_pixmap: QPixmap | None = None
+        self._fade_t = 1.0
+        self._fade_anim: QVariantAnimation | None = None
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
+    def _on_hover_val(self, val: object) -> None:
+        self._hover_t = float(val)
+        self.update()
+
+    def _start_hover_anim(self, target: float) -> None:
+        if self._hover_anim is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(160)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.valueChanged.connect(self._on_hover_val)
+            self._hover_anim = anim
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover_t)
+        self._hover_anim.setEndValue(float(target))
+        self._hover_anim.start()
+
+    def _on_fade_val(self, val: object) -> None:
+        self._fade_t = float(val)
+        self.update()
+
+    def _on_fade_finished(self) -> None:
+        self._prev_pixmap = None
+        self._fade_t = 1.0
+        self.update()
+
     def set_pixmap(self, pix: QPixmap | None) -> None:
+        if (
+            self._enable_crossfade
+            and pix is not None
+            and not pix.isNull()
+            and self._pixmap is not None
+            and not self._pixmap.isNull()
+            and self._pixmap.cacheKey() != pix.cacheKey()
+        ):
+            self._prev_pixmap = self._pixmap
+            self._pixmap = pix
+            self._fade_t = 0.0
+            if self._fade_anim is None:
+                anim = QVariantAnimation(self)
+                anim.setDuration(220)
+                anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+                anim.valueChanged.connect(self._on_fade_val)
+                anim.finished.connect(self._on_fade_finished)
+                self._fade_anim = anim
+            self._fade_anim.stop()
+            self._fade_anim.setStartValue(0.0)
+            self._fade_anim.setEndValue(1.0)
+            self._fade_anim.start()
+            self.update()
+            return
+
+        if self._fade_anim is not None:
+            self._fade_anim.stop()
+        self._prev_pixmap = None
+        self._fade_t = 1.0
         self._pixmap = pix
         self.update()
 
     def clear(self) -> None:
+        if self._fade_anim is not None:
+            self._fade_anim.stop()
+        self._prev_pixmap = None
+        self._fade_t = 1.0
         self._pixmap = None
         self.update()
 
@@ -117,16 +301,37 @@ class RoundedThumbWidget(QWidget):
         self.update()
 
     def enterEvent(self, event) -> None:
-        if self._show_play_on_hover:
+        if self._show_play_on_hover or self._enable_hover_zoom:
             self._hovered = True
-            self.update()
+            self._start_hover_anim(1.0)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
-        if self._show_play_on_hover:
+        if self._show_play_on_hover or self._enable_hover_zoom:
             self._hovered = False
-            self.update()
+            self._start_hover_anim(0.0)
         super().leaveEvent(event)
+
+    def _draw_pixmap_cover(
+        self, painter: QPainter, pix: QPixmap, w: int, h: int, zoom: float = 1.0
+    ) -> None:
+        pw = pix.width()
+        ph = pix.height()
+        if pw <= 0 or ph <= 0:
+            return
+        if pw == w and ph == h and zoom == 1.0:
+            painter.drawPixmap(0, 0, pix)
+            return
+        scale = max(w / pw, h / ph) * zoom
+        dw = pw * scale
+        dh = ph * scale
+        dx = (w - dw) / 2.0
+        dy = (h - dh) / 2.0
+        painter.drawPixmap(
+            QRectF(dx, dy, dw, dh),
+            pix,
+            QRectF(0.0, 0.0, float(pw), float(ph)),
+        )
 
     def paintEvent(self, _event) -> None:
         w = self.width()
@@ -145,27 +350,31 @@ class RoundedThumbWidget(QWidget):
 
         painter.fillRect(rect, QColor(self._bg_color))
 
-        if self._pixmap is not None and not self._pixmap.isNull():
-            pw = self._pixmap.width()
-            ph = self._pixmap.height()
-            if pw > 0 and ph > 0:
-                if pw == w and ph == h:
-                    painter.drawPixmap(0, 0, self._pixmap)
-                else:
-                    scale = max(w / pw, h / ph)
-                    dw = pw * scale
-                    dh = ph * scale
-                    dx = (w - dw) / 2.0
-                    dy = (h - dh) / 2.0
-                    painter.drawPixmap(
-                        QRectF(dx, dy, dw, dh),
-                        self._pixmap,
-                        QRectF(0.0, 0.0, float(pw), float(ph)),
-                    )
+        zoom = (
+            1.0 + 0.04 * self._hover_t
+            if (self._enable_hover_zoom and self._hover_t > 0.001)
+            else 1.0
+        )
 
-        if self._force_play_overlay or (self._show_play_on_hover and self._hovered):
-            painter.fillRect(rect, QColor(11, 12, 14, 120))
-            tri = max(12.0, min(36.0, min(w, h) * 0.24))
+        if (
+            self._prev_pixmap is not None
+            and not self._prev_pixmap.isNull()
+            and self._fade_t < 1.0
+        ):
+            self._draw_pixmap_cover(painter, self._prev_pixmap, w, h, zoom=1.0)
+            if self._pixmap is not None and not self._pixmap.isNull():
+                painter.setOpacity(self._fade_t)
+                self._draw_pixmap_cover(painter, self._pixmap, w, h, zoom=zoom)
+                painter.setOpacity(1.0)
+        elif self._pixmap is not None and not self._pixmap.isNull():
+            self._draw_pixmap_cover(painter, self._pixmap, w, h, zoom=zoom)
+
+        ov_t = 1.0 if self._force_play_overlay else (
+            self._hover_t if (self._show_play_on_hover and self._hover_t > 0.01) else 0.0
+        )
+        if ov_t > 0.0:
+            painter.fillRect(rect, QColor(11, 12, 14, int(125 * ov_t)))
+            tri = max(12.0, min(36.0, min(w, h) * 0.24)) * (0.86 + 0.14 * ov_t)
             cx = w / 2.0
             cy = h / 2.0
             play_path = QPainterPath()
@@ -174,7 +383,7 @@ class RoundedThumbWidget(QWidget):
             play_path.lineTo(cx - tri * 0.36, cy + tri * 0.50)
             play_path.closeSubpath()
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#FFFFFF"))
+            painter.setBrush(QColor(255, 255, 255, int(255 * ov_t)))
             painter.drawPath(play_path)
 
         if self._duration_text:
@@ -233,6 +442,7 @@ class ResponsiveGridWidget(QWidget):
         self._grid.setContentsMargins(0, 4, 4, 16)
         self._grid.setHorizontalSpacing(self._spacing)
         self._grid.setVerticalSpacing(22)
+        self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
     def clear_widgets(self) -> None:
@@ -253,7 +463,7 @@ class ResponsiveGridWidget(QWidget):
             return
         m = self._grid.contentsMargins()
         avail_w = max(self.width(), self._min_col_width + m.left() + m.right())
-        inner_w = max(self._min_col_width, avail_w - m.left() - m.right())
+        inner_w = max(180, avail_w - m.left() - m.right() - 2)
         cols = max(
             1,
             min(
@@ -261,7 +471,7 @@ class ResponsiveGridWidget(QWidget):
                 (inner_w + self._spacing) // (self._min_col_width + self._spacing),
             ),
         )
-        col_w = max(200, (inner_w - self._spacing * (cols - 1)) // cols)
+        col_w = max(160, (inner_w - self._spacing * (cols - 1)) // cols)
 
         for w in self._widgets:
             set_w = getattr(w, "set_tile_width", None)
@@ -329,6 +539,7 @@ class VideoGridCard(QFrame):
             duration_text=item.duration,
             progress_ratio=ratio,
             bg_color=palette.surface1,
+            enable_hover_zoom=True,
         )
         self.thumb_widget.setFixedSize(272, 153)
         root.addWidget(self.thumb_widget)
@@ -349,9 +560,7 @@ class VideoGridCard(QFrame):
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(3)
 
-        self.title_lbl = QLabel(item.title)
-        self.title_lbl.setWordWrap(True)
-        self.title_lbl.setMaximumHeight(40)
+        self.title_lbl = ElidedLabel(item.title, max_lines=2)
         self.title_lbl.setStyleSheet("font-size: 13.5px; font-weight: 600;")
         text_col.addWidget(self.title_lbl)
 
@@ -360,9 +569,8 @@ class VideoGridCard(QFrame):
             res_str = format_duration(item.resume_pos)
             if res_str:
                 meta_parts.append(f"Continuar en {res_str}")
-        self.meta_lbl = QLabel("  •  ".join(meta_parts))
+        self.meta_lbl = ElidedLabel("  •  ".join(meta_parts), max_lines=1)
         self.meta_lbl.setObjectName("MutedLabel")
-        self.meta_lbl.setWordWrap(False)
         text_col.addWidget(self.meta_lbl)
 
         meta_row.addLayout(text_col, 1)
@@ -400,8 +608,8 @@ class VideoGridCard(QFrame):
             thumb_cache.ready.connect(self._on_thumb_ready)
 
     def set_tile_width(self, width: int) -> None:
-        w = max(200, int(width))
-        h = max(112, int(round(w * 9 / 16)))
+        w = max(160, int(width))
+        h = max(90, int(round(w * 9 / 16)))
         self.setFixedWidth(w)
         self.thumb_widget.setFixedSize(w, h)
 
@@ -501,6 +709,7 @@ class MusicTileWidget(QFrame):
             radius=8,
             show_play_on_hover=True,
             bg_color=palette.surface1,
+            enable_hover_zoom=True,
         )
         self.thumb_widget.setFixedSize(self.TILE_SIZE, self.TILE_SIZE)
         root.addWidget(self.thumb_widget)
@@ -513,19 +722,15 @@ class MusicTileWidget(QFrame):
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(2)
 
-        self.title_lbl = QLabel(item.title)
-        self.title_lbl.setWordWrap(True)
-        self.title_lbl.setMaximumHeight(36)
+        self.title_lbl = ElidedLabel(item.title, max_lines=2)
         self.title_lbl.setStyleSheet("font-size: 13px; font-weight: 600;")
         text_col.addWidget(self.title_lbl)
 
-        self.artist_lbl = QLabel()
-        self.artist_lbl.setObjectName("MutedLabel")
-        fm = self.artist_lbl.fontMetrics()
         sub_text = item.author or "YouTube Music"
         if item.duration:
             sub_text = f"{sub_text}  •  {item.duration}"
-        self.artist_lbl.setText(fm.elidedText(sub_text, Qt.TextElideMode.ElideRight, 138))
+        self.artist_lbl = ElidedLabel(sub_text, max_lines=1)
+        self.artist_lbl.setObjectName("MutedLabel")
         text_col.addWidget(self.artist_lbl)
 
         bottom_row.addLayout(text_col, 1)
@@ -600,6 +805,9 @@ class MusicShelfWidget(QWidget):
         super().__init__(parent)
         self._palette = palette
         self._tiles = list(tiles)
+        self._scroll_anim: QPropertyAnimation | None = None
+        self._scroll_target: int | None = None
+        self.setMinimumWidth(0)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 6, 0, 12)
@@ -633,6 +841,7 @@ class MusicShelfWidget(QWidget):
         root.addLayout(hdr)
 
         self.scroll = QScrollArea()
+        self.scroll.setMinimumWidth(0)
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -652,7 +861,26 @@ class MusicShelfWidget(QWidget):
 
     def _scroll_by(self, delta: int) -> None:
         bar = self.scroll.horizontalScrollBar()
-        bar.setValue(bar.value() + delta)
+        base = (
+            self._scroll_target
+            if (
+                self._scroll_anim is not None
+                and self._scroll_anim.state() == QPropertyAnimation.State.Running
+                and self._scroll_target is not None
+            )
+            else bar.value()
+        )
+        target = max(bar.minimum(), min(bar.maximum(), base + int(delta)))
+        self._scroll_target = target
+        if self._scroll_anim is None:
+            anim = QPropertyAnimation(bar, b"value", self)
+            anim.setDuration(260)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._scroll_anim = anim
+        self._scroll_anim.stop()
+        self._scroll_anim.setStartValue(bar.value())
+        self._scroll_anim.setEndValue(target)
+        self._scroll_anim.start()
 
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
@@ -888,13 +1116,18 @@ class MusicRowWidget(QFrame):
         self._is_current = is_current
         self._compact = compact
         self._thumb_url = item.normalized_thumb()
+        self._hover_t = 0.0
+        self._hover_anim: QVariantAnimation | None = None
         self.setObjectName("MusicRow")
         self.setProperty("current", "true" if is_current else "false")
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(58 if compact else 60)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         root = QHBoxLayout(self)
-        root.setContentsMargins(10 if not compact else 8, 6, 10 if not compact else 8, 6)
-        root.setSpacing(10)
+        root.setContentsMargins(8 if compact else 10, 6, 6 if compact else 10, 6)
+        root.setSpacing(8 if compact else 10)
 
         self.thumb_label = RoundedThumbWidget(
             radius=6,
@@ -908,20 +1141,20 @@ class MusicRowWidget(QFrame):
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(2)
 
-        self.title_lbl = QLabel(item.title)
+        self.title_lbl = ElidedLabel(item.title, max_lines=1)
         self.title_lbl.setStyleSheet(
             f"font-size: 13px; font-weight: 600; color: {palette.accent if is_current else palette.text};"
         )
         text_col.addWidget(self.title_lbl)
 
-        self.artist_lbl = QLabel(item.author or "YouTube Music")
+        self.artist_lbl = ElidedLabel(item.author or "YouTube Music", max_lines=1)
         self.artist_lbl.setObjectName("MutedLabel")
         text_col.addWidget(self.artist_lbl)
         root.addLayout(text_col, 1)
 
         self.dur_lbl = QLabel(item.duration)
         self.dur_lbl.setObjectName("MutedLabel")
-        self.dur_lbl.setFixedWidth(44)
+        self.dur_lbl.setFixedWidth(38)
         self.dur_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         root.addWidget(self.dur_lbl)
 
@@ -933,7 +1166,7 @@ class MusicRowWidget(QFrame):
         if compact:
             self.more_btn = QPushButton()
             self.more_btn.setObjectName("TileMoreBtn")
-            self.more_btn.setFixedSize(28, 28)
+            self.more_btn.setFixedSize(26, 26)
             self.more_btn.setToolTip("Opciones")
             self.more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self.more_btn.clicked.connect(self._open_compact_menu)
@@ -967,7 +1200,7 @@ class MusicRowWidget(QFrame):
         if show_remove:
             self.remove_btn = QPushButton()
             self.remove_btn.setObjectName("IconBtn")
-            self.remove_btn.setFixedSize(28 if compact else 32, 28 if compact else 32)
+            self.remove_btn.setFixedSize(26 if compact else 32, 26 if compact else 32)
             self.remove_btn.setToolTip("Quitar")
             self.remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self.item))
@@ -1036,6 +1269,41 @@ class MusicRowWidget(QFrame):
         if self.remove_btn is not None:
             self.remove_btn.setIcon(render_icon("close", palette.text2, 15))
         self.set_my_music(self._in_my_music)
+
+    def _on_hover_val(self, val: object) -> None:
+        self._hover_t = float(val)
+        self.update()
+
+    def _start_hover_anim(self, target: float) -> None:
+        if self._hover_anim is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(140)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.valueChanged.connect(self._on_hover_val)
+            self._hover_anim = anim
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover_t)
+        self._hover_anim.setEndValue(float(target))
+        self._hover_anim.start()
+
+    def enterEvent(self, event) -> None:
+        self._start_hover_anim(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._start_hover_anim(0.0)
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        alpha = (26 if self._is_current else 0) + int(18 * self._hover_t)
+        if alpha > 0:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, min(48, alpha)))
+            painter.drawRoundedRect(QRectF(self.rect()), 8.0, 8.0)
+            painter.end()
+        super().paintEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:

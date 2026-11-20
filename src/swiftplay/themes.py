@@ -300,15 +300,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QFrame#MusicRow {{
         background-color: transparent;
         border: none;
-        border-radius: 6px;
-    }}
-
-    QFrame#MusicRow:hover {{
-        background-color: rgba(255, 255, 255, 16);
-    }}
-
-    QFrame#MusicRow[current="true"] {{
-        background-color: rgba(255, 255, 255, 26);
+        border-radius: 8px;
     }}
 
     QPushButton#TileMoreBtn {{
