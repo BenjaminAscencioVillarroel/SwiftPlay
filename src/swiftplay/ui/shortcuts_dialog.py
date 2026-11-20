@@ -30,7 +30,7 @@ _SHORTCUT_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "REPRODUCCIÓN",
         (
-            ("Espacio", "Reproducir / Pausar el reproductor activo"),
+            ("Espacio  o  Clic en video", "Reproducir / Pausar el reproductor activo"),
             ("←  /  →", "Retroceder / Adelantar 5 segundos"),
             ("M", "Silenciar / Activar sonido"),
             ("Rueda del mouse", "Subir / Bajar volumen sobre el video (±5%)"),

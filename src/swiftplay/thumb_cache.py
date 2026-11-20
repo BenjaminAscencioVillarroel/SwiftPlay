@@ -14,12 +14,20 @@ class _ThumbSignals(QObject):
 
 
 class _ThumbFetchTask(QRunnable):
-    def __init__(self, key: str, url: str, target_size: QSize, circular: bool = False) -> None:
+    def __init__(
+        self,
+        key: str,
+        url: str,
+        target_size: QSize,
+        circular: bool = False,
+        radius: int = 0,
+    ) -> None:
         super().__init__()
         self.key = key
         self.url = url
         self.target_size = target_size
         self.circular = circular
+        self.radius = max(0, int(radius))
         self.signals = _ThumbSignals()
 
     def run(self) -> None:
@@ -61,6 +69,22 @@ class _ThumbFetchTask(QRunnable):
                     painter.drawImage(0, 0, scaled)
                     painter.end()
                     scaled = circ
+                elif self.radius > 0:
+                    w = self.target_size.width()
+                    h = self.target_size.height()
+                    rounded = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+                    rounded.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(rounded)
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                    path = QPainterPath()
+                    path.addRoundedRect(
+                        0.0, 0.0, float(w), float(h), float(self.radius), float(self.radius)
+                    )
+                    painter.setClipPath(path)
+                    painter.drawImage(0, 0, scaled)
+                    painter.end()
+                    scaled = rounded
 
                 self.signals.loaded.emit(self.key, scaled)
         except Exception:
@@ -81,16 +105,27 @@ class ThumbnailCache(QObject):
         self._pool.setMaxThreadCount(4)
         self._pool.setExpiryTimeout(10000)
 
-    def _make_key(self, url: str, size: QSize, circular: bool) -> str:
-        mode = "c" if circular else "r"
+    def _make_key(
+        self, url: str, size: QSize, circular: bool, radius: int = 0
+    ) -> str:
+        if circular:
+            mode = "c"
+        elif radius > 0:
+            mode = f"r{radius}"
+        else:
+            mode = "r"
         return f"{url}|{size.width()}x{size.height()}|{mode}"
 
     def get_or_fetch(
-        self, url: str, size: QSize, circular: bool = False
+        self,
+        url: str,
+        size: QSize,
+        circular: bool = False,
+        radius: int = 0,
     ) -> QPixmap | None:
         if not url:
             return None
-        key = self._make_key(url, size, circular)
+        key = self._make_key(url, size, circular, radius=radius)
         pix = self._cache.get(key)
         if pix is not None:
             self._cache.move_to_end(key)
@@ -100,7 +135,7 @@ class ThumbnailCache(QObject):
             return None
         self._inflight.add(key)
 
-        task = _ThumbFetchTask(key, url, size, circular=circular)
+        task = _ThumbFetchTask(key, url, size, circular=circular, radius=radius)
         task.signals.loaded.connect(self._on_loaded)
         self._pool.start(task)
         return None

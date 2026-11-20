@@ -2,8 +2,22 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Literal
+
+
+def upgrade_thumb_url(url: str, target_px: int = 544) -> str:
+    """Solicita mayor resolución en miniaturas de Google/YT Music sin afectar otros hosts."""
+    if not url:
+        return url
+    low = url.lower()
+    if "googleusercontent.com" in low or "ggpht.com" in low:
+        updated = re.sub(r"=w\d+-h\d+", f"=w{target_px}-h{target_px}", url)
+        if updated != url:
+            return updated
+        return re.sub(r"=s\d+", f"=s{target_px}", url)
+    return url
 
 
 def format_duration(seconds: int | float | None) -> str:

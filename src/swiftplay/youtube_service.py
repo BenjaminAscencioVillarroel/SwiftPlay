@@ -388,11 +388,13 @@ class YouTubeService:
 
     def __init__(self) -> None:
         self._ytmusic: YTMusic
+        self._ytmusic_search: YTMusic | None = None
         self._ytmusic_authenticated = False
         self.reload_auth()
 
     def reload_auth(self) -> None:
         """Recarga YTMusic con cookies DPAPI si existen, protegiendo LC_NUMERIC='C'."""
+        self._ytmusic_search = None
         raw = load_cookies_decrypted()
         try:
             if raw:
@@ -414,6 +416,30 @@ class YouTubeService:
                 locale.setlocale(locale.LC_NUMERIC, "C")
             except locale.Error:
                 pass
+
+    def _get_search_ytmusic(self) -> YTMusic:
+        """Cliente YTMusic en idioma base para evitar filtros vacíos en ytmusicapi."""
+        if self._ytmusic_search is not None:
+            return self._ytmusic_search
+        raw = load_cookies_decrypted()
+        try:
+            if raw:
+                headers = _build_innertube_headers("https://music.youtube.com")
+                if "authorization" in headers and "cookie" in headers:
+                    try:
+                        self._ytmusic_search = YTMusic(auth=headers)
+                        return self._ytmusic_search
+                    except Exception:
+                        pass
+            self._ytmusic_search = YTMusic()
+        except Exception:
+            self._ytmusic_search = self._ytmusic
+        finally:
+            try:
+                locale.setlocale(locale.LC_NUMERIC, "C")
+            except locale.Error:
+                pass
+        return self._ytmusic_search
 
     def is_authenticated(self) -> bool:
         return self._ytmusic_authenticated
@@ -513,7 +539,7 @@ class YouTubeService:
                         continue
                     title = str(shelf.get("title") or "").strip()
                     contents = shelf.get("contents") or []
-                    tracks = self._parse_ytm_items(contents, limit=8)
+                    tracks = self._parse_ytm_items(contents, limit=12)
                     if title and tracks:
                         sections.append(FeedSection(title=title, items=tracks))
                     if len(sections) >= 3:
@@ -529,7 +555,7 @@ class YouTubeService:
             if not has_listen_again:
                 try:
                     hist = self._ytmusic.get_history()
-                    hist_tracks = self._parse_ytm_items(hist or [], limit=8)
+                    hist_tracks = self._parse_ytm_items(hist or [], limit=12)
                     if hist_tracks:
                         sections.insert(
                             0, FeedSection(title="Volver a escuchar", items=hist_tracks)
@@ -543,16 +569,16 @@ class YouTubeService:
                 sections.append(
                     FeedSection(
                         title="Volver a escuchar (Local)",
-                        items=local_listen_again[:8],
+                        items=local_listen_again[:12],
                     )
                 )
                 try:
                     picks = self.get_music_radio_queue(
-                        local_listen_again[0].video_id, limit=8
+                        local_listen_again[0].video_id, limit=12
                     )
                     if picks:
                         sections.append(
-                            FeedSection(title="Selección rápida", items=picks[:8])
+                            FeedSection(title="Selección rápida", items=picks[:12])
                         )
                 except Exception:
                     pass
@@ -562,30 +588,30 @@ class YouTubeService:
                         recs = [
                             t
                             for t in self.get_music_radio_queue(
-                                local_listen_again[1].video_id, limit=12
+                                local_listen_again[1].video_id, limit=16
                             )
                             if t.video_id not in seen_ids
                         ]
                         if recs:
                             sections.append(
-                                FeedSection(title="Recomendados para ti", items=recs[:8])
+                                FeedSection(title="Recomendados para ti", items=recs[:12])
                             )
                     except Exception:
                         pass
             else:
                 try:
-                    top = self.search_music("éxitos musicales", limit=8)
+                    top = self.search_music("éxitos musicales", limit=12)
                     if top:
                         sections.append(
-                            FeedSection(title="Selección rápida", items=top[:8])
+                            FeedSection(title="Selección rápida", items=top[:12])
                         )
                 except Exception:
                     pass
                 try:
-                    chill = self.search_music("lofi chill beats", limit=8)
+                    chill = self.search_music("lofi chill beats", limit=12)
                     if chill:
                         sections.append(
-                            FeedSection(title="Para escuchar de fondo", items=chill[:8])
+                            FeedSection(title="Para escuchar de fondo", items=chill[:12])
                         )
                 except Exception:
                     pass
@@ -710,15 +736,78 @@ class YouTubeService:
         q = query.strip()
         if not q:
             return []
-        raw = self._ytmusic.search(q, filter=search_filter, limit=limit)
+        raw: list[dict] = []
+        if search_filter:
+            raw = self._get_search_ytmusic().search(q, filter=search_filter, limit=limit)
+        if not raw:
+            raw = self._ytmusic.search(q, limit=limit)
         return self._parse_ytm_items(raw, limit=limit)
 
-    def get_music_radio_queue(self, video_id: str, limit: int = 18) -> list[MediaItem]:
-        data = self._ytmusic.get_watch_playlist(videoId=video_id, limit=limit)
-        tracks = data.get("tracks") or []
-        results = [
-            t for t in self._parse_ytm_items(tracks, limit=limit + 1) if t.video_id != video_id
-        ]
+    def get_music_radio_queue(
+        self,
+        video_id: str,
+        limit: int = 25,
+        exclude_ids: set[str] | None = None,
+        fallback_seeds: list[str] | None = None,
+        artist_hint: str = "",
+    ) -> list[MediaItem]:
+        """Obtiene pistas de radio evitando duplicados y usando semillas/artista de respaldo."""
+        excluded: set[str] = set(exclude_ids or ())
+        if video_id:
+            excluded.add(video_id)
+        results: list[MediaItem] = []
+
+        def _collect_from_seed(seed_vid: str) -> None:
+            if not seed_vid or len(results) >= limit:
+                return
+            data: dict[str, Any] = {}
+            for use_radio in (True, False):
+                try:
+                    data = self._ytmusic.get_watch_playlist(
+                        videoId=seed_vid,
+                        limit=max(25, limit + 10),
+                        radio=use_radio,
+                    )
+                    if isinstance(data, dict) and data.get("tracks"):
+                        break
+                except Exception:
+                    data = {}
+            tracks = data.get("tracks") or [] if isinstance(data, dict) else []
+            parsed = self._parse_ytm_items(tracks, limit=max(30, limit + 15))
+            for t in parsed:
+                if t.video_id and t.video_id not in excluded:
+                    excluded.add(t.video_id)
+                    results.append(t)
+                    if len(results) >= limit:
+                        break
+
+        _collect_from_seed(video_id)
+
+        if len(results) < min(8, limit) and fallback_seeds:
+            tried = {video_id}
+            fb_count = 0
+            for fb in fallback_seeds:
+                if fb and fb not in tried:
+                    tried.add(fb)
+                    _collect_from_seed(fb)
+                    fb_count += 1
+                    if fb_count >= 2 or len(results) >= limit:
+                        break
+
+        if len(results) < 3 and artist_hint and artist_hint.strip():
+            try:
+                extra = self.search_music(
+                    artist_hint.strip(), search_filter="songs", limit=limit
+                )
+                for t in extra:
+                    if t.video_id and t.video_id not in excluded:
+                        excluded.add(t.video_id)
+                        results.append(t)
+                        if len(results) >= limit:
+                            break
+            except Exception:
+                pass
+
         return results[:limit]
 
     # ------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPalette, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QComboBox,
@@ -27,6 +27,7 @@ from swiftplay.ui.widgets import ClickableSlider
 class VideoSurface(QWidget):
     """Superficie nativa HWND para renderizado directo por hardware con libmpv."""
 
+    clicked = Signal()
     double_clicked = Signal()
     wheel_scrolled = Signal(int)
     mouse_moved = Signal()
@@ -43,6 +44,11 @@ class VideoSurface(QWidget):
         self.setAutoFillBackground(True)
         self.setMinimumHeight(240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -73,6 +79,8 @@ class VideoPlayerPanel(QWidget):
     watch_later_toggled = Signal()
     download_requested = Signal()
     fullscreen_toggled = Signal()
+    video_clicked = Signal()
+    video_double_clicked = Signal()
     theater_toggled = Signal()
     wheel_scrolled = Signal(int)
 
@@ -135,7 +143,8 @@ class VideoPlayerPanel(QWidget):
         # Área central: VideoSurface (pág 0) vs Banner Solo Audio (pág 1)
         self.media_stack = QStackedWidget()
         self.video_surface = VideoSurface()
-        self.video_surface.double_clicked.connect(self.fullscreen_toggled.emit)
+        self.video_surface.clicked.connect(self.video_clicked.emit)
+        self.video_surface.double_clicked.connect(self.video_double_clicked.emit)
         self.video_surface.wheel_scrolled.connect(self.wheel_scrolled.emit)
         self.media_stack.addWidget(self.video_surface)
 
@@ -146,6 +155,8 @@ class VideoPlayerPanel(QWidget):
         self.audio_banner = QFrame()
         self.audio_banner.setObjectName("AudioOnlyBanner")
         self.audio_banner.setFixedWidth(440)
+        self.audio_banner.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.audio_banner.installEventFilter(self)
         banner_lay = QVBoxLayout(self.audio_banner)
         banner_lay.setContentsMargins(20, 20, 20, 20)
         banner_lay.setSpacing(10)
@@ -493,6 +504,13 @@ class VideoPlayerPanel(QWidget):
             if self._is_fullscreen
             else "Pantalla completa [F]"
         )
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.audio_banner and event.type() == QEvent.Type.MouseButtonPress:
+            if isinstance(event, QMouseEvent) and event.button() == Qt.MouseButton.LeftButton:
+                self.video_clicked.emit()
+                return True
+        return super().eventFilter(obj, event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y()

@@ -281,26 +281,66 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         font-weight: 700;
     }}
 
+    QFrame#YtVideoTile, QFrame#YtMusicTile {{
+        background-color: transparent;
+        border: none;
+    }}
+
     QFrame#MediaCard {{
-        background-color: {p.surface1};
-        border: 1px solid {p.border};
+        background-color: transparent;
+        border: 1px solid transparent;
         border-radius: 10px;
     }}
 
     QFrame#MediaCard:hover {{
-        background-color: {p.surface2};
-        border-color: {p.border_bright};
+        background-color: rgba(255, 255, 255, 10);
+        border-color: {p.border};
     }}
 
     QFrame#MusicRow {{
-        background-color: {p.surface1};
-        border: 1px solid {p.border};
-        border-radius: 8px;
+        background-color: transparent;
+        border: none;
+        border-radius: 6px;
     }}
 
     QFrame#MusicRow:hover {{
+        background-color: rgba(255, 255, 255, 16);
+    }}
+
+    QFrame#MusicRow[current="true"] {{
+        background-color: rgba(255, 255, 255, 26);
+    }}
+
+    QPushButton#TileMoreBtn {{
+        background-color: transparent;
+        border: none;
+        border-radius: 14px;
+        padding: 2px;
+    }}
+
+    QPushButton#TileMoreBtn:hover {{
+        background-color: rgba(255, 255, 255, 24);
+    }}
+
+    QPushButton#ShelfNavBtn {{
+        background-color: rgba(255, 255, 255, 10);
+        border: 1px solid {p.border};
+        border-radius: 15px;
+        padding: 0px;
+    }}
+
+    QPushButton#ShelfNavBtn:hover {{
         background-color: {p.surface2};
         border-color: {p.border_bright};
+    }}
+
+    QLabel#QueueTabActive {{
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 1.1px;
+        padding: 6px 2px 8px 2px;
+        border-bottom: 2px solid {p.accent};
+        color: {p.text};
     }}
 
     QFrame#PlayerBar, QFrame#VideoControlsBar {{

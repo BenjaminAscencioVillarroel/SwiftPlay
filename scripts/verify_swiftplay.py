@@ -18,7 +18,7 @@ from PySide6.QtGui import QImage, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from swiftplay.config import AppConfig, VALID_SPEEDS, load_config, save_config  # noqa: E402
-from swiftplay.models import AccountProfile, MediaItem, ResolvedStream  # noqa: E402
+from swiftplay.models import AccountProfile, MediaItem, ResolvedStream, upgrade_thumb_url  # noqa: E402
 from swiftplay.security import (  # noqa: E402
     clear_credentials,
     has_saved_session,
@@ -139,7 +139,21 @@ def test_storage_config_themes() -> None:
         db.record_play(v)
         db.clear_video_history()
         assert db.count_video_history() == 0
+        # Historial local de música
+        db.record_play(m)
+        assert db.count_music_history() == 1
+        mhist = db.list_music_history(limit=10)
+        assert len(mhist) == 1 and mhist[0].video_id == "mus1"
+        db.clear_music_history()
+        assert db.count_music_history() == 0
         db.close()
+
+    assert upgrade_thumb_url("https://lh3.googleusercontent.com/abc=w120-h120-l90", 544) == (
+        "https://lh3.googleusercontent.com/abc=w544-h544-l90"
+    )
+    assert upgrade_thumb_url("https://i.ytimg.com/vi/xyz/hqdefault.jpg", 544) == (
+        "https://i.ytimg.com/vi/xyz/hqdefault.jpg"
+    )
 
     assert is_short_video(45, url="https://www.youtube.com/watch?v=abc")
     assert is_short_video(120, url="https://www.youtube.com/shorts/xyz")
@@ -147,15 +161,18 @@ def test_storage_config_themes() -> None:
     assert not is_short_video(180, url="https://www.youtube.com/watch?v=abc", title="Documental")
     assert not is_short_video(0, url="https://www.youtube.com/watch?v=live", is_live=True)
 
-    # ThumbnailCache circular key & avatar rendering
+    # ThumbnailCache circular key & avatar rendering & rounded radius
     tc = ThumbnailCache(max_items=10)
     assert tc._make_key("u", QSize(24, 24), False) != tc._make_key("u", QSize(24, 24), True)
+    assert tc._make_key("u", QSize(48, 48), False, radius=10) == "u|48x48|r10"
     img = QImage(32, 32, QImage.Format.Format_ARGB32_Premultiplied)
     img.fill(0xFFFFFFFF)
     app = QApplication.instance() or QApplication(sys.argv)
     assert app is not None
     tc._on_loaded("https://example.com/av.jpg|24x24|c", img)
     assert tc.get_or_fetch("https://example.com/av.jpg", QSize(24, 24), circular=True) is not None
+    tc._on_loaded("https://example.com/rnd.jpg|48x48|r10", img)
+    assert tc.get_or_fetch("https://example.com/rnd.jpg", QSize(48, 48), radius=10) is not None
 
     expected_tokens = ["#0B0C0E", "#121418", "#1A1E26", "#262B36", "#F1F3F6", "#CFD5DF"]
     assert "matte_silver" in THEMES
@@ -219,7 +236,9 @@ def test_gui_and_libmpv_smoke(
     assert win.music_player._mpv is None, "music_player debe inicializarse en modo lazy hasta reproducir música"
     assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH, "Debe abrir en YouTube (Modo Video)"
     af_val = win.video_player.get_property("af")
-    assert not af_val, f"Normalización debe estar OFF por defecto (af={af_val!r})"
+    assert bool(af_val) == win.cfg.audio_normalization, (
+        f"Estado inicial de af ({af_val!r}) no coincide con config ({win.cfg.audio_normalization})"
+    )
     sub_val = win.video_player.get_property("sub")
     assert sub_val in ("no", False), f"Subtítulos deben estar desactivados (sub={sub_val!r})"
 
@@ -254,22 +273,33 @@ def test_gui_and_libmpv_smoke(
     app.processEvents()
 
     # Verificar switch Tab entre Video y Música
+    assert not hasattr(win, "nav_queue"), "El ítem 'Cola' ya no debe existir en la barra lateral"
+    assert hasattr(win, "nav_music_history"), "Falta 'Historial' bajo Música en la barra lateral"
+    assert hasattr(win, "music_panel"), "Falta el panel completo de música con cola integrada"
+
     win.switch_music_video_tab()
     app.processEvents()
     assert win.stack.currentIndex() in (
         MainWindow.PAGE_MUSIC_SEARCH,
         MainWindow.PAGE_MY_MUSIC,
-        MainWindow.PAGE_QUEUE,
+        MainWindow.PAGE_MUSIC_PLAYER,
+        MainWindow.PAGE_MUSIC_HISTORY,
     )
     win.switch_music_video_tab()
     app.processEvents()
     assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH
 
-    # Verificar página Historial debajo de Ver más tarde
+    # Verificar página Historial (Video y Música) y vista completa de Música
     assert hasattr(win, "nav_history")
     win._switch_page(MainWindow.PAGE_HISTORY)
     app.processEvents()
     assert win.stack.currentIndex() == MainWindow.PAGE_HISTORY
+    win._switch_page(MainWindow.PAGE_MUSIC_HISTORY)
+    app.processEvents()
+    assert win.stack.currentIndex() == MainWindow.PAGE_MUSIC_HISTORY
+    win._switch_page(MainWindow.PAGE_MUSIC_PLAYER)
+    app.processEvents()
+    assert win.stack.currentIndex() == MainWindow.PAGE_MUSIC_PLAYER
     win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
     app.processEvents()
 
@@ -300,6 +330,30 @@ def test_gui_and_libmpv_smoke(
     assert win.player.get_property("af"), "Normalización debería estar activa"
     win.player.set_normalization(False)
     assert not win.player.get_property("af"), "Normalización debería volver a OFF"
+    win.player.set_normalization(win.cfg.audio_normalization)
+
+    # Verificar clic simple para pausar/reanudar video (con debounce) y cancelación en doble clic
+    win._video_item = MediaItem("vid_click", "Test Click", "Canal", "1:00", 60, "", "video")
+    win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
+    app.processEvents()
+    win.video_player.set_pause(False)
+    app.processEvents()
+    win.video_panel.video_surface.clicked.emit()
+    assert win._video_click_timer.isActive(), "Clic simple debe iniciar timer debounce"
+    win.video_panel.video_surface.double_clicked.emit()
+    assert not win._video_click_timer.isActive(), "Doble clic debe cancelar timer de pausa"
+    if win._is_fullscreen:
+        win.toggle_fullscreen()
+    win._last_video_dbl_ts = 0.0
+    win.video_panel.video_surface.clicked.emit()
+    wait_click = time.monotonic() + 0.35
+    while time.monotonic() < wait_click:
+        app.processEvents()
+        time.sleep(0.03)
+    assert win.video_player.get_property("pause") is True, "Clic simple debe pausar el video"
+    win._video_item = None
+    win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+    app.processEvents()
 
     # Probar music_player solo audio (lazy init) + HUD de volumen + ShortcutsDialog
     win.music_player.set_volume(0)

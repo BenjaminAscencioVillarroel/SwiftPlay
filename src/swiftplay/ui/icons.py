@@ -269,5 +269,24 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
         p.drawLine(QPointF(s * 0.50, s * 0.50), QPointF(s * 0.50, s * 0.33))
         p.drawLine(QPointF(s * 0.50, s * 0.50), QPointF(s * 0.64, s * 0.56))
 
+    elif name == "more":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        r = s * 0.068
+        for y in (0.26, 0.50, 0.74):
+            p.drawEllipse(QPointF(s * 0.50, s * y), r, r)
+
+    elif name == "chevron_left":
+        p.drawLine(QPointF(s * 0.62, s * 0.22), QPointF(s * 0.34, s * 0.50))
+        p.drawLine(QPointF(s * 0.34, s * 0.50), QPointF(s * 0.62, s * 0.78))
+
+    elif name == "chevron_right":
+        p.drawLine(QPointF(s * 0.38, s * 0.22), QPointF(s * 0.66, s * 0.50))
+        p.drawLine(QPointF(s * 0.66, s * 0.50), QPointF(s * 0.38, s * 0.78))
+
+    elif name == "chevron_down":
+        p.drawLine(QPointF(s * 0.22, s * 0.38), QPointF(s * 0.50, s * 0.66))
+        p.drawLine(QPointF(s * 0.50, s * 0.66), QPointF(s * 0.78, s * 0.38))
+
     p.end()
     return QIcon(pm)

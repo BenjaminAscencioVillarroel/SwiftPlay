@@ -405,6 +405,45 @@ class LocalLibrary:
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM play_history WHERE kind = 'video'")
 
+    def list_music_history(self, limit: int = 80) -> list[MediaItem]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT video_id, kind, title, author, duration, duration_sec,
+                       thumb_url, channel_avatar_url, last_position
+                FROM play_history
+                WHERE kind = 'music'
+                ORDER BY last_played_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [
+                MediaItem(
+                    video_id=r["video_id"],
+                    title=r["title"],
+                    author=r["author"],
+                    duration=r["duration"],
+                    duration_sec=r["duration_sec"],
+                    thumb_url=r["thumb_url"],
+                    kind="music",
+                    channel_avatar_url=r["channel_avatar_url"] or "",
+                    resume_pos=float(r["last_position"] or 0.0),
+                )
+                for r in rows
+            ]
+
+    def count_music_history(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM play_history WHERE kind = 'music'"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def clear_music_history(self) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM play_history WHERE kind = 'music'")
+
     def list_listen_again(self, kind: str = "music", limit: int = 8) -> list[MediaItem]:
         with self._lock:
             rows = self._conn.execute(

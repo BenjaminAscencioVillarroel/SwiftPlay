@@ -31,6 +31,7 @@ class MediaPlayer(QObject):
     error_occurred = Signal(str)
     wheel_scrolled = Signal(int)
     mouse_moved = Signal()
+    clicked = Signal()
     double_clicked = Signal()
 
     def __init__(
@@ -164,6 +165,11 @@ class MediaPlayer(QObject):
                 def _on_wheel_down():
                     if not self._shutdown:
                         self.wheel_scrolled.emit(-1)
+
+                @player.on_key_press("MBTN_LEFT")
+                def _on_left_click():
+                    if not self._shutdown:
+                        self.clicked.emit()
 
                 @player.on_key_press("MBTN_LEFT_DBL")
                 def _on_dbl_click():
