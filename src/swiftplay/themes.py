@@ -1,0 +1,588 @@
+"""Paleta unificada Grafito Oscuro y Plateado Mate de SwiftPlay + QSS."""
+
+from __future__ import annotations
+
+import ctypes
+import sys
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ThemePalette:
+    key: str
+    name: str
+    base: str
+    surface1: str
+    surface2: str
+    border: str
+    border_bright: str
+    text: str
+    text2: str
+    accent: str
+    accent_hover: str
+    accent_text: str
+
+
+THEMES: dict[str, ThemePalette] = {
+    "matte_silver": ThemePalette(
+        key="matte_silver",
+        name="Obsidian Graphite & Matte Silver",
+        base="#0B0C0E",
+        surface1="#121418",
+        surface2="#1A1E26",
+        border="#262B36",
+        border_bright="#3B4252",
+        text="#F1F3F6",
+        text2="#9299A8",
+        accent="#CFD5DF",
+        accent_hover="#E4E8EE",
+        accent_text="#0B0C0E",
+    ),
+}
+
+
+def get_theme(theme_key: str = "matte_silver") -> ThemePalette:
+    return THEMES.get(theme_key, THEMES["matte_silver"])
+
+
+def build_stylesheet(theme_key: str = "matte_silver") -> str:
+    p = get_theme(theme_key)
+    return f"""
+    QWidget {{
+        background-color: {p.base};
+        color: {p.text};
+        font-family: "Segoe UI", "Inter", sans-serif;
+        font-size: 13px;
+        selection-background-color: {p.accent};
+        selection-color: {p.accent_text};
+    }}
+
+    QLabel {{
+        background-color: transparent;
+    }}
+
+    QSlider {{
+        background-color: transparent;
+    }}
+
+    QMainWindow, QDialog {{
+        background-color: {p.base};
+    }}
+
+    QFrame#Sidebar {{
+        background-color: {p.surface1};
+        border-right: 1px solid {p.border};
+    }}
+
+    QLabel#BrandTitle {{
+        font-size: 16px;
+        font-weight: 700;
+        color: {p.text};
+        letter-spacing: 0.4px;
+    }}
+
+    QLabel#SectionHeader {{
+        color: {p.text2};
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 1.3px;
+        padding: 10px 10px 4px 10px;
+    }}
+
+    QLabel#ViewTitle {{
+        font-size: 19px;
+        font-weight: 700;
+        color: {p.text};
+    }}
+
+    QLabel#MutedLabel {{
+        color: {p.text2};
+        font-size: 12px;
+    }}
+
+    QLabel#DeckTag {{
+        background-color: {p.surface2};
+        color: {p.accent};
+        border: 1px solid {p.border_bright};
+        border-radius: 5px;
+        padding: 1px 6px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.6px;
+    }}
+
+    QPushButton#NavBtn {{
+        background-color: transparent;
+        color: {p.text2};
+        border: 1px solid transparent;
+        border-radius: 8px;
+        text-align: left;
+        padding: 8px 12px;
+        font-size: 13px;
+        font-weight: 500;
+    }}
+
+    QPushButton#NavBtn:hover {{
+        background-color: {p.surface2};
+        color: {p.text};
+        border: 1px solid {p.border};
+    }}
+
+    QPushButton#NavBtn[active="true"] {{
+        background-color: {p.surface2};
+        color: {p.text};
+        border: 1px solid {p.border_bright};
+        border-left: 3px solid {p.accent};
+        font-weight: 600;
+    }}
+
+    QFrame#TopBar {{
+        background-color: {p.base};
+        border-bottom: 1px solid {p.border};
+    }}
+
+    QLineEdit, QPlainTextEdit {{
+        background-color: {p.surface1};
+        color: {p.text};
+        border: 1px solid {p.border};
+        border-radius: 8px;
+        padding: 7px 12px;
+    }}
+
+    QLineEdit:focus, QPlainTextEdit:focus {{
+        border: 1px solid {p.accent};
+        background-color: {p.surface2};
+    }}
+
+    QLineEdit#SearchInput {{
+        background-color: {p.surface1};
+        border: 1px solid {p.border};
+        border-radius: 18px;
+        padding: 8px 16px;
+        font-size: 13px;
+    }}
+
+    QLineEdit#SearchInput:focus {{
+        border: 1px solid {p.accent};
+        background-color: {p.surface2};
+    }}
+
+    QPushButton {{
+        background-color: {p.surface2};
+        color: {p.text};
+        border: 1px solid {p.border};
+        border-radius: 8px;
+        padding: 6px 12px;
+        font-weight: 500;
+    }}
+
+    QPushButton:hover {{
+        border-color: {p.border_bright};
+        background-color: #212630;
+    }}
+
+    QPushButton:pressed {{
+        background-color: {p.surface1};
+    }}
+
+    QPushButton:disabled {{
+        color: {p.text2};
+        opacity: 0.55;
+    }}
+
+    QPushButton#AccentBtn {{
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #E4E8EE, stop:1 #BDC4D0);
+        color: {p.accent_text};
+        border: 1px solid #EDF0F5;
+        border-radius: 8px;
+        padding: 7px 16px;
+        font-weight: 700;
+    }}
+
+    QPushButton#AccentBtn:hover {{
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #F2F4F8, stop:1 #CFD5DF);
+    }}
+
+    QPushButton#AccentBtn:pressed {{
+        background-color: #B4BCC9;
+    }}
+
+    QPushButton#PlayAccentBtn {{
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #EAEEF4, stop:1 #C2C9D4);
+        color: {p.accent_text};
+        border: 1px solid #F2F4F8;
+        border-radius: 10px;
+        padding: 0px;
+        font-weight: 700;
+    }}
+
+    QPushButton#PlayAccentBtn:hover {{
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #F6F8FB, stop:1 #D3D9E3);
+        border-color: #FFFFFF;
+    }}
+
+    QPushButton#PlayAccentBtn:pressed {{
+        background-color: #AEB7C4;
+        border-color: {p.accent};
+    }}
+
+    QPushButton#DangerBtn {{
+        background-color: transparent;
+        color: #F87171;
+        border: 1px solid #7F1D1D;
+        border-radius: 8px;
+        padding: 7px 14px;
+        font-weight: 600;
+    }}
+
+    QPushButton#DangerBtn:hover {{
+        background-color: #7F1D1D;
+        color: #FFFFFF;
+    }}
+
+    QPushButton#IconBtn {{
+        background-color: transparent;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        padding: 5px;
+    }}
+
+    QPushButton#IconBtn:hover {{
+        background-color: {p.surface2};
+        border: 1px solid {p.border_bright};
+    }}
+
+    QPushButton#IconBtn[active="true"] {{
+        background-color: {p.surface2};
+        border: 1px solid {p.accent};
+        color: {p.accent};
+    }}
+
+    QPushButton#PillBtn {{
+        background-color: {p.surface1};
+        color: {p.text2};
+        border: 1px solid {p.border};
+        border-radius: 14px;
+        padding: 4px 12px;
+        font-size: 12px;
+        font-weight: 500;
+    }}
+
+    QPushButton#PillBtn:hover {{
+        color: {p.text};
+        background-color: {p.surface2};
+        border-color: {p.border_bright};
+    }}
+
+    QPushButton#PillBtn[active="true"] {{
+        background-color: {p.accent};
+        color: {p.accent_text};
+        border-color: {p.accent_hover};
+        font-weight: 700;
+    }}
+
+    QFrame#MediaCard {{
+        background-color: {p.surface1};
+        border: 1px solid {p.border};
+        border-radius: 10px;
+    }}
+
+    QFrame#MediaCard:hover {{
+        background-color: {p.surface2};
+        border-color: {p.border_bright};
+    }}
+
+    QFrame#MusicRow {{
+        background-color: {p.surface1};
+        border: 1px solid {p.border};
+        border-radius: 8px;
+    }}
+
+    QFrame#MusicRow:hover {{
+        background-color: {p.surface2};
+        border-color: {p.border_bright};
+    }}
+
+    QFrame#PlayerBar, QFrame#VideoControlsBar {{
+        background-color: {p.surface1};
+        border-top: 1px solid {p.border};
+    }}
+
+    QFrame#MiniClickArea {{
+        background-color: transparent;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        padding: 2px 6px;
+    }}
+
+    QFrame#MiniClickArea:hover {{
+        background-color: {p.surface2};
+        border: 1px solid {p.border};
+    }}
+
+    QFrame#MiniBarFrame {{
+        background-color: {p.surface1};
+        border: 1px solid {p.border_bright};
+        border-radius: 12px;
+    }}
+
+    QFrame#FsOverlayFrame {{
+        background-color: rgba(14, 16, 20, 212);
+        border: 1px solid rgba(207, 213, 223, 62);
+        border-radius: 14px;
+    }}
+
+    QFrame#VolumeHudFrame {{
+        background-color: rgba(14, 16, 20, 218);
+        border: 1px solid rgba(207, 213, 223, 72);
+        border-radius: 12px;
+    }}
+
+    QProgressBar#HudProgress {{
+        background-color: rgba(255, 255, 255, 26);
+        border: none;
+        border-radius: 3px;
+    }}
+
+    QProgressBar#HudProgress::chunk {{
+        background-color: {p.accent};
+        border-radius: 3px;
+    }}
+
+    QProgressBar#HistoryProgress {{
+        background-color: rgba(255, 255, 255, 24);
+        border: none;
+        border-radius: 1px;
+    }}
+
+    QProgressBar#HistoryProgress::chunk {{
+        background-color: {p.accent};
+        border-radius: 1px;
+    }}
+
+    QFrame#ShortcutDialogFrame {{
+        background-color: #1A1E26;
+        border: 1px solid #262B36;
+        border-radius: 12px;
+    }}
+
+    QLabel#ShortcutKey {{
+        background-color: #121418;
+        color: {p.accent};
+        border: 1px solid #3B4252;
+        border-radius: 6px;
+        padding: 3px 9px;
+        font-family: "Consolas", "Segoe UI", monospace;
+        font-size: 12px;
+        font-weight: 700;
+    }}
+
+    QFrame#AudioOnlyBanner {{
+        background-color: {p.surface1};
+        border: 1px solid {p.border};
+        border-radius: 10px;
+    }}
+
+    QComboBox {{
+        background-color: {p.surface2};
+        color: {p.text};
+        border: 1px solid {p.border};
+        border-radius: 6px;
+        padding: 4px 10px;
+        min-height: 22px;
+    }}
+
+    QComboBox:hover {{
+        border-color: {p.border_bright};
+    }}
+
+    QComboBox::drop-down {{
+        border: none;
+        width: 18px;
+    }}
+
+    QComboBox QAbstractItemView {{
+        background-color: {p.surface1};
+        color: {p.text};
+        border: 1px solid {p.border_bright};
+        selection-background-color: {p.accent};
+        selection-color: {p.accent_text};
+    }}
+
+    QCheckBox {{
+        spacing: 8px;
+        color: {p.text};
+        background-color: transparent;
+    }}
+
+    QCheckBox::indicator {{
+        width: 17px;
+        height: 17px;
+        border-radius: 4px;
+        border: 1px solid {p.border_bright};
+        background-color: {p.surface1};
+    }}
+
+    QCheckBox::indicator:hover {{
+        border-color: {p.accent};
+    }}
+
+    QCheckBox::indicator:checked {{
+        background-color: {p.accent};
+        border-color: {p.accent_hover};
+    }}
+
+    QSlider::groove:horizontal {{
+        height: 4px;
+        background: rgba(255, 255, 255, 28);
+        border-radius: 2px;
+    }}
+
+    QSlider::sub-page:horizontal {{
+        background: {p.accent};
+        border-radius: 2px;
+    }}
+
+    QSlider::handle:horizontal {{
+        background: {p.text};
+        border: 2px solid {p.accent};
+        width: 12px;
+        height: 12px;
+        margin: -4px 0;
+        border-radius: 7px;
+    }}
+
+    QSlider::handle:horizontal:hover {{
+        background: #FFFFFF;
+        width: 14px;
+        height: 14px;
+        margin: -5px 0;
+        border-radius: 8px;
+    }}
+
+    QScrollArea {{
+        border: none;
+        background-color: {p.base};
+    }}
+
+    QScrollBar:vertical {{
+        background: transparent;
+        width: 8px;
+        margin: 2px;
+    }}
+
+    QScrollBar::handle:vertical {{
+        background: {p.border};
+        border-radius: 4px;
+        min-height: 30px;
+    }}
+
+    QScrollBar::handle:vertical:hover {{
+        background: {p.text2};
+    }}
+
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+        height: 0px;
+        background: transparent;
+    }}
+
+    QTabWidget::pane {{
+        border: 1px solid {p.border};
+        border-radius: 8px;
+        background-color: {p.base};
+        padding: 8px;
+    }}
+
+    QTabBar::tab {{
+        background-color: {p.surface1};
+        color: {p.text2};
+        border: 1px solid {p.border};
+        border-bottom: none;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        padding: 7px 14px;
+        margin-right: 4px;
+    }}
+
+    QTabBar::tab:selected {{
+        background-color: {p.surface2};
+        color: {p.text};
+        border-top: 2px solid {p.accent};
+        font-weight: 600;
+    }}
+
+    QMenu {{
+        background-color: {p.surface1};
+        color: {p.text};
+        border: 1px solid {p.border_bright};
+        border-radius: 8px;
+        padding: 4px;
+    }}
+
+    QMenu::item {{
+        padding: 6px 18px;
+        border-radius: 5px;
+    }}
+
+    QMenu::item:selected {{
+        background-color: {p.accent};
+        color: {p.accent_text};
+    }}
+
+    QToolTip {{
+        background-color: {p.surface2};
+        color: {p.text};
+        border: 1px solid {p.border_bright};
+        border-radius: 5px;
+        padding: 4px 8px;
+    }}
+
+    QLabel#ToastLabel {{
+        background-color: {p.surface2};
+        color: {p.text};
+        border: 1px solid {p.accent};
+        border-radius: 8px;
+        padding: 8px 14px;
+        font-weight: 500;
+    }}
+    """
+
+
+def _hex_to_colorref(hex_color: str) -> int:
+    c = hex_color.lstrip("#")
+    r = int(c[0:2], 16)
+    g = int(c[2:4], 16)
+    b = int(c[4:6], 16)
+    return (b << 16) | (g << 8) | r
+
+
+def apply_windows_dark_titlebar(hwnd: int, bg_hex: str) -> None:
+    """Aplica modo oscuro y color de barra de título en Windows 10/11."""
+    if sys.platform != "win32" or not hwnd:
+        return
+    try:
+        dwmapi = ctypes.windll.dwmapi
+        dark_mode = ctypes.c_int(1)
+        res = dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd),
+            20,
+            ctypes.byref(dark_mode),
+            ctypes.sizeof(dark_mode),
+        )
+        if res != 0:
+            dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd),
+                19,
+                ctypes.byref(dark_mode),
+                ctypes.sizeof(dark_mode),
+            )
+        colorref = ctypes.c_uint32(_hex_to_colorref(bg_hex))
+        dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd),
+            35,
+            ctypes.byref(colorref),
+            ctypes.sizeof(colorref),
+        )
+    except Exception:
+        pass

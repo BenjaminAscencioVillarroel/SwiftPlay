@@ -1,0 +1,36 @@
+# Entorno virtual y caché de Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Binarios nativos descargados por scripts/setup_binaries.py (libmpv, ffmpeg, ffprobe)
+bin/
+
+# Datos locales, sesiones, cookies y bases de datos (prevención extra)
+data/
+*.dpapi
+*.dpapi.tmp
+*cookies*.txt
+account_profile.json
+config.json
+*.db
+*.db-wal
+*.db-shm
+crash.log
+*.log
+.env
+.env.*
+
+# Archivos del sistema / editores
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
