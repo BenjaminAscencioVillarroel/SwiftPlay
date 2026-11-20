@@ -17,8 +17,8 @@ Cliente nativo ultraliviano para **YouTube** y **YouTube Music** en Windows, con
 
 1. Clona el repositorio y entra en la carpeta:
    ```powershell
-   git clone <URL_DEL_REPOSITORIO>
-   cd Swift
+   git clone https://github.com/BenjaminAscencioVillarroel/SwiftPlay.git
+   cd SwiftPlay
    ```
 2. Haz doble clic en **`Actualizar_Ruta.bat`** (o ejecútalo desde la terminal).
 
