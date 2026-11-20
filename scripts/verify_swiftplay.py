@@ -351,7 +351,7 @@ def test_gui_and_libmpv_smoke(
         win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
         app.processEvents()
 
-        # Verificar switch Tab entre Video y Música
+        # Verificar switch Tab con rotación de 3 modos: Video -> Música -> Twitch -> Video
         assert not hasattr(win, "nav_queue"), "El ítem 'Cola' ya no debe existir en la barra lateral"
         assert hasattr(win, "nav_music_history"), "Falta 'Historial' bajo Música en la barra lateral"
         assert hasattr(win, "music_panel"), "Falta el panel completo de música con cola integrada"
@@ -364,6 +364,9 @@ def test_gui_and_libmpv_smoke(
             MainWindow.PAGE_MUSIC_PLAYER,
             MainWindow.PAGE_MUSIC_HISTORY,
         )
+        win.switch_music_video_tab()
+        app.processEvents()
+        assert win.stack.currentIndex() == MainWindow.PAGE_TWITCH
         win.switch_music_video_tab()
         app.processEvents()
         assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH

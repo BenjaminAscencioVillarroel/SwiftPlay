@@ -944,9 +944,9 @@ class MainWindow(QMainWindow):
         self.bb_switch_btn = QPushButton("Ir a Video")
         self.bb_switch_btn.setObjectName("PillBtn")
         self.bb_switch_btn.setVisible(False)
-        self.bb_switch_btn.setToolTip("Alternar entre Música y Video [Tab]")
+        self.bb_switch_btn.setToolTip("Cambiar al otro reproductor activo")
         self.bb_switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.bb_switch_btn.clicked.connect(self.switch_music_video_tab)
+        self.bb_switch_btn.clicked.connect(self._switch_active_deck_from_bb)
         lay.addWidget(self.bb_switch_btn)
 
         self.bb_fav = QPushButton()
@@ -1367,8 +1367,62 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def switch_music_video_tab(self) -> None:
-        """Alterna instantáneamente entre Video/Twitch y Música manteniendo ambos estados."""
+        """Rota instantáneamente entre YouTube Video, YT Music y Twitch manteniendo estados."""
         cur = self.stack.currentIndex()
+        playing_twitch = (
+            self._video_item is not None and self._video_item.kind == "twitch"
+        )
+        in_twitch = cur == self.PAGE_TWITCH or (
+            cur == self.PAGE_VIDEO_PLAYER and playing_twitch
+        )
+        in_music = cur in (
+            self.PAGE_MUSIC_SEARCH,
+            self.PAGE_MY_MUSIC,
+            self.PAGE_MUSIC_PLAYER,
+            self.PAGE_MUSIC_HISTORY,
+        )
+
+        if not in_music and not in_twitch:
+            self._last_video_page = cur
+            self._active_deck = "music"
+            if (
+                self._music_item is not None
+                and self._last_music_page == self.PAGE_MUSIC_SEARCH
+            ):
+                target = self.PAGE_MUSIC_PLAYER
+            else:
+                target = self._last_music_page
+            self._switch_page(target)
+        elif in_music:
+            self._last_music_page = cur
+            if playing_twitch and self.video_player.has_active_stream:
+                self._active_deck = "video"
+                target = self.PAGE_VIDEO_PLAYER
+            else:
+                target = self.PAGE_TWITCH
+            self._switch_page(target)
+        else:
+            self._active_deck = "video"
+            if (
+                self._video_item is not None
+                and not playing_twitch
+                and self.video_player.has_active_stream
+            ):
+                target = self.PAGE_VIDEO_PLAYER
+            else:
+                target = self._last_video_page
+                if target == self.PAGE_TWITCH or (
+                    target == self.PAGE_VIDEO_PLAYER and playing_twitch
+                ):
+                    target = self.PAGE_VIDEO_SEARCH
+            self._switch_page(target)
+
+    def _switch_active_deck_from_bb(self) -> None:
+        """Salta directamente entre el deck de Música y el deck de Video/Directo cargado."""
+        cur = self.stack.currentIndex()
+        playing_twitch = (
+            self._video_item is not None and self._video_item.kind == "twitch"
+        )
         in_video = cur in (
             self.PAGE_VIDEO_SEARCH,
             self.PAGE_VIDEO_PLAYER,
@@ -1377,18 +1431,25 @@ class MainWindow(QMainWindow):
             self.PAGE_TWITCH,
         )
         if in_video:
-            self._last_video_page = cur
+            if not (
+                cur == self.PAGE_TWITCH
+                or (cur == self.PAGE_VIDEO_PLAYER and playing_twitch)
+            ):
+                self._last_video_page = cur
             self._active_deck = "music"
-            if self._music_item is not None and self._last_music_page == self.PAGE_MUSIC_SEARCH:
-                target = self.PAGE_MUSIC_PLAYER
-            else:
-                target = self._last_music_page
+            target = (
+                self.PAGE_MUSIC_PLAYER
+                if self._music_item is not None
+                else self._last_music_page
+            )
             self._switch_page(target)
         else:
             self._last_music_page = cur
             self._active_deck = "video"
             if self._video_item is not None and self.video_player.has_active_stream:
                 target = self.PAGE_VIDEO_PLAYER
+            elif playing_twitch:
+                target = self.PAGE_TWITCH
             else:
                 target = self._last_video_page
             self._switch_page(target)
@@ -1489,9 +1550,13 @@ class MainWindow(QMainWindow):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
-        if page_idx == self.PAGE_TWITCH:
+        is_twitch_player = (
+            page_idx == self.PAGE_VIDEO_PLAYER
+            and self._video_item is not None
+            and self._video_item.kind == "twitch"
+        )
+        if page_idx == self.PAGE_TWITCH or is_twitch_player:
             self._search_mode = "twitch"
-            self._last_video_page = page_idx
             self.search_input.setPlaceholderText(
                 "Buscar canales en Twitch o pegar enlace... [Ctrl+L]"
             )
@@ -1502,10 +1567,7 @@ class MainWindow(QMainWindow):
             self.PAGE_HISTORY,
         ):
             self._search_mode = "video"
-            if page_idx != self.PAGE_VIDEO_PLAYER or (
-                self._video_item is None or self._video_item.kind != "twitch"
-            ):
-                self._last_video_page = page_idx
+            self._last_video_page = page_idx
             self.search_input.setPlaceholderText("Buscar videos en YouTube... [Ctrl+L]")
         else:
             self._search_mode = "music"

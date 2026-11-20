@@ -21,7 +21,7 @@ _SHORTCUT_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "NAVEGACIÓN Y MODOS",
         (
-            ("Tab", "Cambiar al instante entre Música y Video"),
+            ("Tab", "Rotar al instante entre YouTube, YT Music y Twitch"),
             ("T", "Ocultar / mostrar barra lateral (Modo teatro)"),
             ("Ctrl + L", "Enfocar la barra de búsqueda"),
             ("?", "Mostrar / cerrar esta guía de atajos"),
