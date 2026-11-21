@@ -2,25 +2,20 @@
 
 from __future__ import annotations
 
-import contextlib
-import gc
 import json
 import locale
-import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-import urllib.request
 from collections import OrderedDict
 from hashlib import sha1
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal
+from typing import Any, Callable, Literal
 
 import requests
-from ytmusicapi import YTMusic
+from requests.adapters import HTTPAdapter
 
 from swiftplay.models import (
     AccountProfile,
@@ -30,15 +25,13 @@ from swiftplay.models import (
     format_duration,
     parse_duration_text,
 )
-from swiftplay.paths import BIN_DIR
 from swiftplay.security import (
-    filter_youtube_netscape_cookies,
     load_account_profile,
     load_cookies_decrypted,
     netscape_to_cookie_dict,
-    netscape_to_cookie_header,
     save_account_profile,
 )
+from swiftplay.ytdlp_worker import YtdlpWorkerClient
 
 QUALITY_HEIGHT_MAP: dict[str, int] = {
     "360p": 360,
@@ -371,74 +364,18 @@ def _extract_innertube_videos(
     return results
 
 
-@contextlib.contextmanager
-def _cookiefile_context() -> Iterator[str | None]:
-    """
-    Si hay sesión DPAPI guardada, escribe un archivo temporal efímero con cookies
-    exclusivas de YouTube y lo borra de inmediato al salir del bloque.
-    """
-    decrypted = load_cookies_decrypted()
-    if not decrypted:
-        yield None
-        return
-
-    fd, tmp_path = tempfile.mkstemp(prefix="sp_ck_", suffix=".txt")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(decrypted)
-        yield tmp_path
-    finally:
-        try:
-            p = Path(tmp_path)
-            if p.exists():
-                size = p.stat().st_size
-                if size > 0:
-                    p.write_bytes(b"\x00" * size)
-                p.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-def _base_ydl_opts(cookiefile: str | None = None) -> dict:
-    opts: dict = {
-        "quiet": True,
-        "no_warnings": True,
-        "nocheckcertificate": False,
-        "writesubtitles": False,
-        "writeautomaticsub": False,
-        "js_runtimes": {"node": {}},
-        "ffmpeg_location": str(BIN_DIR),
-    }
-    if cookiefile:
-        opts["cookiefile"] = cookiefile
-    return opts
-
-
-def _make_youtube_ydl(opts: dict[str, Any], load_extractors: bool = True):
-    """Carga YoutubeDL con solo extractores de YouTube para ahorrar ~40 MB de RAM."""
-    from yt_dlp import YoutubeDL
-
-    if not load_extractors:
-        return YoutubeDL(opts, auto_init=False)
-
-    try:
-        from yt_dlp.extractor.youtube import YoutubeIE, YoutubeSearchIE, YoutubeYtBeIE
-
-        ydl = YoutubeDL(opts, auto_init=False)
-        for cls in (YoutubeIE, YoutubeSearchIE, YoutubeYtBeIE):
-            ydl.add_info_extractor(cls(ydl))
-        return ydl
-    except ImportError:
-        return YoutubeDL(opts)
-
-
 class YouTubeService:
     """Capa de acceso ligero a YouTube, YouTube Music, feeds y perfil sin navegador."""
 
     def __init__(self) -> None:
-        self._ytmusic: YTMusic
-        self._ytmusic_search: YTMusic | None = None
+        self._ytm_lock = threading.Lock()
+        self._ytmusic: Any = None
+        self._ytmusic_search: Any = None
         self._ytmusic_authenticated = False
+        self._http_local = threading.local()
+        self._sessions_lock = threading.Lock()
+        self._http_sessions: list[requests.Session] = []
+        self._worker = YtdlpWorkerClient()
         self._stream_lock = threading.Lock()
         self._stream_cache: OrderedDict[tuple[str, bool, str], tuple[float, ResolvedStream]] = OrderedDict()
         self._inflight_streams: dict[
@@ -447,56 +384,120 @@ class YouTubeService:
         ] = {}
         self.reload_auth()
 
-    def reload_auth(self) -> None:
-        """Recarga YTMusic con cookies DPAPI si existen, protegiendo LC_NUMERIC='C'."""
-        self._ytmusic_search = None
+    def _get_session(self) -> requests.Session:
+        sess = getattr(self._http_local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4)
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            self._http_local.session = sess
+            with self._sessions_lock:
+                self._http_sessions.append(sess)
+        return sess
+
+    def close_worker(self) -> None:
+        self._worker.stop_idle()
+
+    def close(self) -> None:
+        self._worker.reset_for_auth()
+        self._worker.close()
+        with self._sessions_lock:
+            sessions = list(self._http_sessions)
+            self._http_sessions.clear()
+        for sess in sessions:
+            try:
+                sess.close()
+            except Exception:
+                pass
         with self._stream_lock:
             self._stream_cache.clear()
+        with self._ytm_lock:
+            self._ytmusic = None
+            self._ytmusic_search = None
+
+    def reload_auth(self) -> None:
+        """Recarga estado de autenticación DPAPI y limpia cachés sin instanciar YTMusic hasta usarse."""
+        with self._ytm_lock:
+            self._ytmusic = None
+            self._ytmusic_search = None
+        with self._stream_lock:
+            self._stream_cache.clear()
+        self._worker.reset_for_auth()
+
         raw = load_cookies_decrypted()
         try:
             if raw:
                 headers = _build_innertube_headers("https://music.youtube.com")
-                if "authorization" in headers and "cookie" in headers:
-                    try:
-                        self._ytmusic = YTMusic(auth=headers, language="es")
-                        self._ytmusic_authenticated = True
-                        return
-                    except Exception:
-                        pass
-            self._ytmusic = YTMusic(language="es")
-            self._ytmusic_authenticated = False
-        except Exception:
-            self._ytmusic = YTMusic()
-            self._ytmusic_authenticated = False
+                self._ytmusic_authenticated = (
+                    "authorization" in headers and "cookie" in headers
+                )
+            else:
+                self._ytmusic_authenticated = False
         finally:
             try:
                 locale.setlocale(locale.LC_NUMERIC, "C")
             except locale.Error:
                 pass
 
-    def _get_search_ytmusic(self) -> YTMusic:
-        """Cliente YTMusic en idioma base para evitar filtros vacíos en ytmusicapi."""
-        if self._ytmusic_search is not None:
-            return self._ytmusic_search
-        raw = load_cookies_decrypted()
-        try:
-            if raw:
-                headers = _build_innertube_headers("https://music.youtube.com")
-                if "authorization" in headers and "cookie" in headers:
-                    try:
-                        self._ytmusic_search = YTMusic(auth=headers)
-                        return self._ytmusic_search
-                    except Exception:
-                        pass
-            self._ytmusic_search = YTMusic()
-        except Exception:
-            self._ytmusic_search = self._ytmusic
-        finally:
+    def _get_ytmusic(self) -> Any:
+        """Inicializa YTMusic bajo demanda para no gastar RAM si solo se usa Video/Twitch."""
+        with self._ytm_lock:
+            if self._ytmusic is not None:
+                return self._ytmusic
+            from ytmusicapi import YTMusic
+
+            raw = load_cookies_decrypted()
             try:
-                locale.setlocale(locale.LC_NUMERIC, "C")
-            except locale.Error:
-                pass
-        return self._ytmusic_search
+                if raw:
+                    headers = _build_innertube_headers("https://music.youtube.com")
+                    if "authorization" in headers and "cookie" in headers:
+                        try:
+                            self._ytmusic = YTMusic(auth=headers, language="es")
+                            self._ytmusic_authenticated = True
+                            return self._ytmusic
+                        except Exception:
+                            pass
+                self._ytmusic = YTMusic(language="es")
+                self._ytmusic_authenticated = False
+            except Exception:
+                self._ytmusic = YTMusic()
+                self._ytmusic_authenticated = False
+            finally:
+                try:
+                    locale.setlocale(locale.LC_NUMERIC, "C")
+                except locale.Error:
+                    pass
+            return self._ytmusic
+
+    def _get_search_ytmusic(self) -> Any:
+        """Cliente YTMusic en idioma base para evitar filtros vacíos en ytmusicapi."""
+        with self._ytm_lock:
+            if self._ytmusic_search is not None:
+                return self._ytmusic_search
+            from ytmusicapi import YTMusic
+
+            raw = load_cookies_decrypted()
+            try:
+                if raw:
+                    headers = _build_innertube_headers("https://music.youtube.com")
+                    if "authorization" in headers and "cookie" in headers:
+                        try:
+                            self._ytmusic_search = YTMusic(auth=headers)
+                            return self._ytmusic_search
+                        except Exception:
+                            pass
+                self._ytmusic_search = YTMusic()
+            except Exception:
+                self._ytmusic_search = None
+            finally:
+                try:
+                    locale.setlocale(locale.LC_NUMERIC, "C")
+                except locale.Error:
+                    pass
+            if self._ytmusic_search is not None:
+                return self._ytmusic_search
+        return self._get_ytmusic()
 
     def is_authenticated(self) -> bool:
         return self._ytmusic_authenticated
@@ -507,7 +508,7 @@ class YouTubeService:
         if "authorization" not in headers:
             return load_account_profile()
 
-        if self._ytmusic_authenticated:
+        if self._ytmusic is not None and self._ytmusic_authenticated:
             try:
                 info = self._ytmusic.get_account_info()
                 name = str(info.get("accountName") or "").strip()
@@ -521,31 +522,31 @@ class YouTubeService:
                 pass
 
         try:
-            resp = requests.post(
+            with self._get_session().post(
                 "https://www.youtube.com/youtubei/v1/account/account_menu?prettyPrint=false",
                 headers=headers,
                 json=_innertube_web_context(),
                 timeout=8,
-            )
-            if resp.ok:
-                data = resp.json()
-                header = (
-                    data.get("actions", [{}])[0]
-                    .get("openPopupAction", {})
-                    .get("popup", {})
-                    .get("multiPageMenuRenderer", {})
-                    .get("header", {})
-                    .get("activeAccountHeaderRenderer", {})
-                )
-                name = _extract_text(header.get("accountName"))
-                handle = _extract_text(header.get("channelHandle"))
-                photo = _pick_best_thumb(
-                    header.get("accountPhoto", {}).get("thumbnails")
-                )
-                if name or photo:
-                    prof = AccountProfile(name=name, handle=handle, avatar_url=photo)
-                    save_account_profile(prof)
-                    return prof
+            ) as resp:
+                if resp.ok:
+                    data = resp.json()
+                    header = (
+                        data.get("actions", [{}])[0]
+                        .get("openPopupAction", {})
+                        .get("popup", {})
+                        .get("multiPageMenuRenderer", {})
+                        .get("header", {})
+                        .get("activeAccountHeaderRenderer", {})
+                    )
+                    name = _extract_text(header.get("accountName"))
+                    handle = _extract_text(header.get("channelHandle"))
+                    photo = _pick_best_thumb(
+                        header.get("accountPhoto", {}).get("thumbnails")
+                    )
+                    if name or photo:
+                        prof = AccountProfile(name=name, handle=handle, avatar_url=photo)
+                        save_account_profile(prof)
+                        return prof
         except Exception:
             pass
         return load_account_profile()
@@ -562,18 +563,18 @@ class YouTubeService:
         payload = _innertube_web_context()
         payload["browseId"] = "FEwhat_to_watch"
         try:
-            resp = requests.post(
+            with self._get_session().post(
                 "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false",
                 headers=headers,
                 json=payload,
                 timeout=10,
-            )
-            if resp.ok:
-                items = _extract_innertube_videos(
-                    resp.json(), limit=limit, block_shorts=True
-                )
-                if items:
-                    return items
+            ) as resp:
+                if resp.ok:
+                    items = _extract_innertube_videos(
+                        resp.json(), limit=limit, block_shorts=True
+                    )
+                    if items:
+                        return items
         except Exception:
             pass
 
@@ -589,37 +590,39 @@ class YouTubeService:
         sections: list[FeedSection] = []
 
         if self._ytmusic_authenticated:
-            try:
-                home = self._ytmusic.get_home(limit=5)
-                for shelf in home or []:
-                    if not isinstance(shelf, dict):
-                        continue
-                    title = str(shelf.get("title") or "").strip()
-                    contents = shelf.get("contents") or []
-                    tracks = self._parse_ytm_items(contents, limit=12)
-                    if title and tracks:
-                        sections.append(FeedSection(title=title, items=tracks))
-                    if len(sections) >= 3:
-                        break
-            except Exception:
-                pass
-
-            # Garantizar sección "Volver a escuchar" si get_home no la incluyó
-            has_listen_again = any(
-                any(k in s.title.lower() for k in ("volver a escuchar", "listen again"))
-                for s in sections
-            )
-            if not has_listen_again:
+            ytm = self._get_ytmusic()
+            if self._ytmusic_authenticated:
                 try:
-                    hist = self._ytmusic.get_history()
-                    hist_tracks = self._parse_ytm_items(hist or [], limit=12)
-                    if hist_tracks:
-                        sections.insert(
-                            0, FeedSection(title="Volver a escuchar", items=hist_tracks)
-                        )
-                        sections = sections[:3]
+                    home = ytm.get_home(limit=5)
+                    for shelf in home or []:
+                        if not isinstance(shelf, dict):
+                            continue
+                        title = str(shelf.get("title") or "").strip()
+                        contents = shelf.get("contents") or []
+                        tracks = self._parse_ytm_items(contents, limit=12)
+                        if title and tracks:
+                            sections.append(FeedSection(title=title, items=tracks))
+                        if len(sections) >= 3:
+                            break
                 except Exception:
                     pass
+
+                # Garantizar sección "Volver a escuchar" si get_home no la incluyó
+                has_listen_again = any(
+                    any(k in s.title.lower() for k in ("volver a escuchar", "listen again"))
+                    for s in sections
+                )
+                if not has_listen_again:
+                    try:
+                        hist = ytm.get_history()
+                        hist_tracks = self._parse_ytm_items(hist or [], limit=12)
+                        if hist_tracks:
+                            sections.insert(
+                                0, FeedSection(title="Volver a escuchar", items=hist_tracks)
+                            )
+                            sections = sections[:3]
+                    except Exception:
+                        pass
 
         if not sections:
             if local_listen_again:
@@ -727,65 +730,32 @@ class YouTubeService:
             headers = _build_innertube_headers("https://www.youtube.com")
             payload = _innertube_web_context()
             payload["query"] = q
-            resp = requests.post(
+            with self._get_session().post(
                 "https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
                 headers=headers,
                 json=payload,
                 timeout=10,
-            )
-            if resp.ok:
-                items = _extract_innertube_videos(
-                    resp.json(), limit=limit, block_shorts=block_shorts
-                )
-                if items:
-                    return items
+            ) as resp:
+                if resp.ok:
+                    items = _extract_innertube_videos(
+                        resp.json(), limit=limit, block_shorts=block_shorts
+                    )
+                    if items:
+                        return items
         except Exception:
             pass
 
-        # Respaldo con yt-dlp (solo extractores YouTube)
-        fetch_n = limit + 8 if block_shorts else limit
-        with _cookiefile_context() as ck:
-            opts = _base_ydl_opts(ck)
-            opts["extract_flat"] = "in_playlist"
-            opts["skip_download"] = True
-            with _make_youtube_ydl(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch{fetch_n}:{q}", download=False)
-
-        entries = info.get("entries") or [] if isinstance(info, dict) else []
-        results: list[MediaItem] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            vid = str(entry.get("id") or "")
-            title = str(entry.get("title") or "").strip()
-            if not vid or not title:
-                continue
-            dur_sec = int(entry.get("duration") or 0)
-            url_str = str(entry.get("url") or entry.get("webpage_url") or "")
-            is_live = bool(entry.get("is_live"))
-            if block_shorts and is_short_video(
-                dur_sec, url=url_str, title=title, is_live=is_live
-            ):
-                continue
-            dur_str = entry.get("duration_string") or format_duration(dur_sec)
-            author = str(
-                entry.get("channel") or entry.get("uploader") or "YouTube"
-            ).strip()
-            thumb = _pick_best_thumb(entry.get("thumbnails"), vid)
-            results.append(
-                MediaItem(
-                    video_id=vid,
-                    title=title,
-                    author=author,
-                    duration=str(dur_str),
-                    duration_sec=dur_sec,
-                    thumb_url=thumb,
-                    kind="video",
-                )
-            )
-            if len(results) >= limit:
-                break
-        return results
+        # Respaldo aislado con yt-dlp en worker
+        data = self._worker.request(
+            {
+                "cmd": "search_youtube",
+                "query": q,
+                "limit": limit,
+                "block_shorts": block_shorts,
+            },
+            timeout=35.0,
+        )
+        return [MediaItem.from_dict(d) for d in (data or [])]
 
     def search_music(
         self, query: str, search_filter: str = "songs", limit: int = 20
@@ -797,7 +767,7 @@ class YouTubeService:
         if search_filter:
             raw = self._get_search_ytmusic().search(q, filter=search_filter, limit=limit)
         if not raw:
-            raw = self._ytmusic.search(q, limit=limit)
+            raw = self._get_ytmusic().search(q, limit=limit)
         return self._parse_ytm_items(raw, limit=limit)
 
     def get_music_radio_queue(
@@ -813,6 +783,7 @@ class YouTubeService:
         if video_id:
             excluded.add(video_id)
         results: list[MediaItem] = []
+        ytm = self._get_ytmusic()
 
         def _collect_from_seed(seed_vid: str) -> None:
             if not seed_vid or len(results) >= limit:
@@ -820,7 +791,7 @@ class YouTubeService:
             data: dict[str, Any] = {}
             for use_radio in (True, False):
                 try:
-                    data = self._ytmusic.get_watch_playlist(
+                    data = ytm.get_watch_playlist(
                         videoId=seed_vid,
                         limit=max(25, limit + 10),
                         radio=use_radio,
@@ -868,16 +839,25 @@ class YouTubeService:
         return results[:limit]
 
     # ------------------------------------------------------------------
-    # Streams y Descargas
+    # Streams y Descargas (aislados en worker yt-dlp)
     # ------------------------------------------------------------------
 
     _STREAM_CACHE_TTL = 1500.0
-    _STREAM_CACHE_MAX = 12
+    _STREAM_CACHE_MAX = 6
 
     def _stream_key(
         self, video_id: str, audio_only: bool, quality: str
     ) -> tuple[str, bool, str]:
         return (video_id, bool(audio_only), "audio" if audio_only else quality)
+
+    def _prune_expired_streams_locked(self, now: float) -> None:
+        expired = [
+            k
+            for k, (ts, _st) in self._stream_cache.items()
+            if (now - ts) >= self._STREAM_CACHE_TTL
+        ]
+        for k in expired:
+            self._stream_cache.pop(k, None)
 
     def has_cached_stream(
         self, video_id: str, audio_only: bool, quality: str = "720p"
@@ -945,68 +925,35 @@ class YouTubeService:
             raise RuntimeError("Tiempo de espera agotado al resolver el stream.")
 
         ev, res_box, err_box = inflight_entry
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        max_h = QUALITY_HEIGHT_MAP.get(quality, 720)
-        if audio_only:
-            fmt = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
-        else:
-            fmt = (
-                f"bestvideo[height<={max_h}][vcodec!*=av01]+bestaudio/"
-                f"bestvideo[height<={max_h}]+bestaudio/"
-                f"best[height<={max_h}]/best"
-            )
-
         try:
-            with _cookiefile_context() as ck:
-                opts = _base_ydl_opts(ck)
-                opts["format"] = fmt
-                opts["noplaylist"] = True
-                opts["skip_download"] = True
-                opts["noprogress"] = True
-                opts["no_color"] = True
-                opts["extractor_args"] = {"youtube": {"player_skip": ["configs"]}}
-                with _make_youtube_ydl(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-
-            if not isinstance(info, dict):
-                raise RuntimeError("No se pudo obtener la información del stream.")
-
-            requested = info.get("requested_formats")
-            primary_url: str = ""
-            audio_url: str | None = None
-            headers: dict[str, str] = {}
-
-            if requested and len(requested) >= 2:
-                v_fmt = requested[0]
-                a_fmt = requested[1]
-                if audio_only:
-                    primary_url = str(a_fmt.get("url") or v_fmt.get("url") or "")
-                    headers = dict(a_fmt.get("http_headers") or {})
-                else:
-                    primary_url = str(v_fmt.get("url") or "")
-                    audio_url = str(a_fmt.get("url") or "") or None
-                    headers = dict(v_fmt.get("http_headers") or {})
-            else:
-                primary_url = str(info.get("url") or "")
-                headers = dict(info.get("http_headers") or {})
-
-            if not primary_url:
+            data = self._worker.request(
+                {
+                    "cmd": "resolve_youtube",
+                    "video_id": video_id,
+                    "audio_only": audio_only,
+                    "quality": quality,
+                },
+                timeout=40.0,
+            )
+            if not isinstance(data, dict) or not data.get("primary_url"):
                 raise RuntimeError("yt-dlp no devolvió una URL reproducible.")
 
             resolved = ResolvedStream(
-                video_id=video_id,
-                primary_url=primary_url,
-                audio_url=audio_url,
-                http_headers=headers,
-                duration=float(info.get("duration") or 0.0),
-                title=str(info.get("title") or ""),
-                author=str(info.get("channel") or info.get("uploader") or ""),
-                thumb_url=_pick_best_thumb(info.get("thumbnails"), video_id),
-                video_enabled=not audio_only,
+                video_id=str(data.get("video_id") or video_id),
+                primary_url=str(data["primary_url"]),
+                audio_url=data.get("audio_url"),
+                http_headers=dict(data.get("http_headers") or {}),
+                duration=float(data.get("duration") or 0.0),
+                title=str(data.get("title") or ""),
+                author=str(data.get("author") or ""),
+                thumb_url=str(data.get("thumb_url") or ""),
+                video_enabled=bool(data.get("video_enabled", not audio_only)),
             )
             res_box[0] = resolved
+            now = time.monotonic()
             with self._stream_lock:
-                self._stream_cache[key] = (time.monotonic(), resolved)
+                self._prune_expired_streams_locked(now)
+                self._stream_cache[key] = (now, resolved)
                 self._stream_cache.move_to_end(key)
                 while len(self._stream_cache) > self._STREAM_CACHE_MAX:
                     self._stream_cache.popitem(last=False)
@@ -1019,8 +966,6 @@ class YouTubeService:
                 if self._inflight_streams.get(key) is inflight_entry:
                     self._inflight_streams.pop(key, None)
             ev.set()
-            if is_owner:
-                gc.collect()
 
     def download_media(
         self,
@@ -1030,99 +975,22 @@ class YouTubeService:
         quality: str = "720p",
         progress_cb: Callable[[float, str], None] | None = None,
     ) -> Path:
-        out_path = Path(output_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        max_h = QUALITY_HEIGHT_MAP.get(quality, 720)
-        downloaded_file: list[Path] = []
-
-        def _hook(d: dict) -> None:
-            status = d.get("status")
-            if status == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                done = d.get("downloaded_bytes") or 0
-                pct = (done / total * 100.0) if total > 0 else 0.0
-                if progress_cb:
-                    progress_cb(pct, "Descargando...")
-            elif status == "finished":
-                fn = d.get("filename")
-                if fn:
-                    downloaded_file.append(Path(fn))
-                if progress_cb:
-                    progress_cb(100.0, "Procesando archivo...")
-
-        try:
-            with _cookiefile_context() as ck:
-                opts = _base_ydl_opts(ck)
-                opts["noplaylist"] = True
-                opts["outtmpl"] = str(out_path / "%(title).120s [%(id)s].%(ext)s")
-                opts["progress_hooks"] = [_hook]
-
-                if mode == "music":
-                    opts["format"] = "bestaudio/best"
-                    opts["postprocessors"] = [
-                        {
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": "m4a",
-                            "preferredquality": "0",
-                        },
-                        {"key": "FFmpegMetadata"},
-                    ]
-                else:
-                    opts["format"] = (
-                        f"bestvideo[height<={max_h}][vcodec!*=av01]+bestaudio/"
-                        f"bestvideo[height<={max_h}]+bestaudio/"
-                        f"best[height<={max_h}]/best"
-                    )
-                    opts["merge_output_format"] = "mp4"
-
-                with _make_youtube_ydl(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    prepared = Path(ydl.prepare_filename(info))
-
-            if mode == "music":
-                final = prepared.with_suffix(".m4a")
-                if final.exists():
-                    return final
-            else:
-                final = prepared.with_suffix(".mp4")
-                if final.exists():
-                    return final
-
-            if downloaded_file and downloaded_file[-1].exists():
-                return downloaded_file[-1]
-            return prepared
-        finally:
-            gc.collect()
+        final_path = self._worker.run_download(
+            {
+                "cmd": "download_media",
+                "video_id": video_id,
+                "mode": mode,
+                "output_dir": output_dir,
+                "quality": quality,
+            },
+            progress_cb=progress_cb,
+        )
+        return Path(final_path)
 
     def try_extract_chrome_cookies(self) -> str:
         """Intenta leer cookies de Chrome localmente y filtra solo dominios YouTube."""
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "cookiesfrombrowser": ("chrome",),
-            "skip_download": True,
-        }
-        with _make_youtube_ydl(opts, load_extractors=False) as ydl:
-            jar = ydl.cookiejar
-            lines = ["# Netscape HTTP Cookie File"]
-            for cookie in jar:
-                domain = (cookie.domain or "").strip().lower()
-                if domain in {
-                    ".youtube.com",
-                    "youtube.com",
-                    "www.youtube.com",
-                    "music.youtube.com",
-                    ".youtu.be",
-                    "youtu.be",
-                }:
-                    flag = "TRUE" if domain.startswith(".") else "FALSE"
-                    secure = "TRUE" if cookie.secure else "FALSE"
-                    expires = str(int(cookie.expires or 0))
-                    lines.append(
-                        f"{cookie.domain}\t{flag}\t{cookie.path or '/'}\t{secure}\t{expires}\t{cookie.name}\t{cookie.value}"
-                    )
-        filtered = filter_youtube_netscape_cookies("\n".join(lines))
+        res = self._worker.request({"cmd": "extract_chrome_cookies"}, timeout=30.0)
+        filtered = str(res or "")
         if not filtered:
             raise RuntimeError(
                 "Chrome bloqueó la lectura directa. Usa el botón 'Iniciar sesión con Google (Navegador)'."

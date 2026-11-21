@@ -9,6 +9,12 @@ dependencies = [
     "yt-dlp[default]>=2025.1.1",
     "ytmusicapi>=1.9.0",
     "Pillow>=10.0.0",
+    "discord.py[voice]>=2.7.1",
+    "davey>=0.1.6,<0.2.0",
+    "sounddevice>=0.5.0",
+    "pywebrtc-audio>=0.2.0",
+    "deepfilternet-slim>=0.1.0",
+    "pysilero-vad>=3.4.1",
 ]
 
 [build-system]

@@ -644,6 +644,9 @@ class ResponsiveGridWidget(QWidget):
 
     def clear_widgets(self) -> None:
         for w in self._widgets:
+            rel = getattr(w, "release_resources", None)
+            if callable(rel):
+                rel()
             w.hide()
             self._grid.removeWidget(w)
             w.deleteLater()
@@ -718,11 +721,15 @@ class VideoGridCard(QFrame):
         super().__init__(parent)
         self.item = item
         self._in_watch_later = in_watch_later
+        self._thumb_cache = thumb_cache
         self._palette = palette
         self._show_remove = show_remove
         self._thumb_url = item.normalized_thumb()
         self._avatar_url = item.channel_avatar_url or ""
         self._has_avatar_pix = False
+        self._thumb_done = False
+        self._avatar_done = not bool(self._avatar_url)
+        self._thumb_connected = False
         self._card_hovered = False
         self._has_resume = item.resume_pos >= 3.0
         self.setObjectName("YtVideoTile")
@@ -798,12 +805,12 @@ class VideoGridCard(QFrame):
         self.update_theme(palette)
         self.set_watch_later(in_watch_later)
 
-        need_signal = False
         cached = thumb_cache.get_or_fetch(self._thumb_url, self.THUMB_FETCH_SIZE)
         if cached is not None:
             self.thumb_widget.set_pixmap(cached)
+            self._thumb_done = True
         else:
-            need_signal = True
+            self._thumb_done = not bool(self._thumb_url)
 
         if self._avatar_url:
             av_cached = thumb_cache.get_or_fetch(
@@ -811,11 +818,24 @@ class VideoGridCard(QFrame):
             )
             if av_cached is not None:
                 self._set_avatar_pixmap(av_cached)
-            else:
-                need_signal = True
+                self._avatar_done = True
 
-        if need_signal:
+        if not (self._thumb_done and self._avatar_done):
             thumb_cache.ready.connect(self._on_thumb_ready)
+            self._thumb_connected = True
+
+    def _disconnect_thumb_cache(self) -> None:
+        if self._thumb_connected:
+            self._thumb_connected = False
+            try:
+                self._thumb_cache.ready.disconnect(self._on_thumb_ready)
+            except (RuntimeError, TypeError):
+                pass
+
+    def release_resources(self) -> None:
+        self._disconnect_thumb_cache()
+        self.thumb_widget.clear()
+        self.avatar_label.clear()
 
     def set_tile_width(self, width: int) -> None:
         w = max(160, int(width))
@@ -825,33 +845,36 @@ class VideoGridCard(QFrame):
 
     def _open_context_menu(self) -> None:
         menu = QMenu(self)
-        if self.item.kind == "twitch":
-            fav_label = (
-                "Quitar de Favoritos"
-                if self._in_watch_later
-                else "Guardar en Favoritos"
-            )
-            act_fav = menu.addAction(fav_label)
-            act_fav.triggered.connect(lambda: self.watch_later_toggled.emit(self.item))
-        else:
-            wl_label = (
-                "Quitar de Ver más tarde"
-                if self._in_watch_later
-                else "Guardar en Ver más tarde"
-            )
-            act_wl = menu.addAction(wl_label)
-            act_wl.triggered.connect(lambda: self.watch_later_toggled.emit(self.item))
+        try:
+            if self.item.kind == "twitch":
+                fav_label = (
+                    "Quitar de Favoritos"
+                    if self._in_watch_later
+                    else "Guardar en Favoritos"
+                )
+                act_fav = menu.addAction(fav_label)
+                act_fav.triggered.connect(lambda: self.watch_later_toggled.emit(self.item))
+            else:
+                wl_label = (
+                    "Quitar de Ver más tarde"
+                    if self._in_watch_later
+                    else "Guardar en Ver más tarde"
+                )
+                act_wl = menu.addAction(wl_label)
+                act_wl.triggered.connect(lambda: self.watch_later_toggled.emit(self.item))
 
-            act_dl = menu.addAction("Descargar video")
-            act_dl.triggered.connect(lambda: self.download_requested.emit(self.item))
+                act_dl = menu.addAction("Descargar video")
+                act_dl.triggered.connect(lambda: self.download_requested.emit(self.item))
 
-        if self._show_remove:
-            menu.addSeparator()
-            act_rm = menu.addAction("Quitar del historial")
-            act_rm.triggered.connect(lambda: self.remove_requested.emit(self.item))
+            if self._show_remove:
+                menu.addSeparator()
+                act_rm = menu.addAction("Quitar del historial")
+                act_rm.triggered.connect(lambda: self.remove_requested.emit(self.item))
 
-        pos = self.more_btn.mapToGlobal(self.more_btn.rect().bottomLeft())
-        menu.exec(pos)
+            pos = self.more_btn.mapToGlobal(self.more_btn.rect().bottomLeft())
+            menu.exec(pos)
+        finally:
+            menu.deleteLater()
 
     def contextMenuEvent(self, _event) -> None:
         self._open_context_menu()
@@ -865,12 +888,16 @@ class VideoGridCard(QFrame):
     def _on_thumb_ready(self, url: str, pix: QPixmap) -> None:
         if url == self._thumb_url and pix.size() == self.THUMB_FETCH_SIZE:
             self.thumb_widget.set_pixmap(pix)
+            self._thumb_done = True
         elif (
             self._avatar_url
             and url == self._avatar_url
             and pix.size() == self.AVATAR_SIZE
         ):
             self._set_avatar_pixmap(pix)
+            self._avatar_done = True
+        if self._thumb_done and self._avatar_done:
+            self._disconnect_thumb_cache()
 
     def set_watch_later(self, active: bool) -> None:
         self._in_watch_later = active
@@ -934,8 +961,10 @@ class MusicTileWidget(QFrame):
         super().__init__(parent)
         self.item = item
         self._in_my_music = in_my_music
+        self._thumb_cache = thumb_cache
         self._palette = palette
         self._thumb_url = upgrade_thumb_url(item.normalized_thumb(), 360)
+        self._thumb_connected = False
         self.setObjectName("YtMusicTile")
         self.setFixedWidth(self.TILE_SIZE)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -988,27 +1017,43 @@ class MusicTileWidget(QFrame):
         cached = thumb_cache.get_or_fetch(self._thumb_url, self.THUMB_FETCH_SIZE)
         if cached is not None:
             self.thumb_widget.set_pixmap(cached)
-        else:
+        elif self._thumb_url:
             thumb_cache.ready.connect(self._on_thumb_ready)
+            self._thumb_connected = True
+
+    def _disconnect_thumb_cache(self) -> None:
+        if self._thumb_connected:
+            self._thumb_connected = False
+            try:
+                self._thumb_cache.ready.disconnect(self._on_thumb_ready)
+            except (RuntimeError, TypeError):
+                pass
+
+    def release_resources(self) -> None:
+        self._disconnect_thumb_cache()
+        self.thumb_widget.clear()
 
     def _open_context_menu(self) -> None:
         menu = QMenu(self)
-        mm_label = (
-            "Quitar de Mi música"
-            if self._in_my_music
-            else "Guardar en Mi música"
-        )
-        act_mm = menu.addAction(mm_label)
-        act_mm.triggered.connect(lambda: self.my_music_toggled.emit(self.item))
+        try:
+            mm_label = (
+                "Quitar de Mi música"
+                if self._in_my_music
+                else "Guardar en Mi música"
+            )
+            act_mm = menu.addAction(mm_label)
+            act_mm.triggered.connect(lambda: self.my_music_toggled.emit(self.item))
 
-        act_q = menu.addAction("Agregar a la cola")
-        act_q.triggered.connect(lambda: self.enqueue_requested.emit(self.item))
+            act_q = menu.addAction("Agregar a la cola")
+            act_q.triggered.connect(lambda: self.enqueue_requested.emit(self.item))
 
-        act_dl = menu.addAction("Descargar canción")
-        act_dl.triggered.connect(lambda: self.download_requested.emit(self.item))
+            act_dl = menu.addAction("Descargar canción")
+            act_dl.triggered.connect(lambda: self.download_requested.emit(self.item))
 
-        pos = self.more_btn.mapToGlobal(self.more_btn.rect().bottomLeft())
-        menu.exec(pos)
+            pos = self.more_btn.mapToGlobal(self.more_btn.rect().bottomLeft())
+            menu.exec(pos)
+        finally:
+            menu.deleteLater()
 
     def contextMenuEvent(self, _event) -> None:
         self._open_context_menu()
@@ -1016,6 +1061,7 @@ class MusicTileWidget(QFrame):
     def _on_thumb_ready(self, url: str, pix: QPixmap) -> None:
         if url == self._thumb_url and pix.size() == self.THUMB_FETCH_SIZE:
             self.thumb_widget.set_pixmap(pix)
+            self._disconnect_thumb_cache()
 
     def set_my_music(self, active: bool) -> None:
         self._in_my_music = active
@@ -1129,6 +1175,12 @@ class MusicShelfWidget(QWidget):
         for tile in self._tiles:
             tile.update_theme(palette)
 
+    def release_resources(self) -> None:
+        if self._scroll_anim is not None:
+            self._scroll_anim.stop()
+        for tile in self._tiles:
+            tile.release_resources()
+
 
 class VideoCardWidget(QFrame):
     """Tarjeta horizontal compacta para un video de YouTube con avatar de canal."""
@@ -1153,10 +1205,14 @@ class VideoCardWidget(QFrame):
         super().__init__(parent)
         self.item = item
         self._in_watch_later = in_watch_later
+        self._thumb_cache = thumb_cache
         self._palette = palette
         self._thumb_url = item.normalized_thumb()
         self._avatar_url = item.channel_avatar_url or ""
         self._has_avatar_pix = False
+        self._thumb_done = False
+        self._avatar_done = not bool(self._avatar_url)
+        self._thumb_connected = False
         self.setObjectName("MediaCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -1257,12 +1313,12 @@ class VideoCardWidget(QFrame):
         self.update_theme(palette)
         self.set_watch_later(in_watch_later)
 
-        need_signal = False
         cached = thumb_cache.get_or_fetch(self._thumb_url, self.THUMB_SIZE)
         if cached is not None:
             self.thumb_label.setPixmap(cached)
+            self._thumb_done = True
         else:
-            need_signal = True
+            self._thumb_done = not bool(self._thumb_url)
 
         if self._avatar_url:
             av_cached = thumb_cache.get_or_fetch(
@@ -1270,11 +1326,24 @@ class VideoCardWidget(QFrame):
             )
             if av_cached is not None:
                 self._set_avatar_pixmap(av_cached)
-            else:
-                need_signal = True
+                self._avatar_done = True
 
-        if need_signal:
+        if not (self._thumb_done and self._avatar_done):
             thumb_cache.ready.connect(self._on_thumb_ready)
+            self._thumb_connected = True
+
+    def _disconnect_thumb_cache(self) -> None:
+        if self._thumb_connected:
+            self._thumb_connected = False
+            try:
+                self._thumb_cache.ready.disconnect(self._on_thumb_ready)
+            except (RuntimeError, TypeError):
+                pass
+
+    def release_resources(self) -> None:
+        self._disconnect_thumb_cache()
+        self.thumb_label.clear()
+        self.avatar_label.clear()
 
     def _set_avatar_pixmap(self, pix: QPixmap) -> None:
         self._has_avatar_pix = True
@@ -1285,12 +1354,16 @@ class VideoCardWidget(QFrame):
     def _on_thumb_ready(self, url: str, pix: QPixmap) -> None:
         if url == self._thumb_url and pix.size() == self.THUMB_SIZE:
             self.thumb_label.setPixmap(pix)
+            self._thumb_done = True
         elif (
             self._avatar_url
             and url == self._avatar_url
             and pix.size() == self.AVATAR_SIZE
         ):
             self._set_avatar_pixmap(pix)
+            self._avatar_done = True
+        if self._thumb_done and self._avatar_done:
+            self._disconnect_thumb_cache()
 
     def set_watch_later(self, active: bool) -> None:
         self._in_watch_later = active
@@ -1352,10 +1425,12 @@ class MusicRowWidget(QFrame):
         super().__init__(parent)
         self.item = item
         self._in_my_music = in_my_music
+        self._thumb_cache = thumb_cache
         self._palette = palette
         self._is_current = is_current
         self._compact = compact
         self._thumb_url = item.normalized_thumb()
+        self._thumb_connected = False
         self._hover_t = 0.0
         self._hover_anim: QVariantAnimation | None = None
         self.setObjectName("MusicRow")
@@ -1452,29 +1527,49 @@ class MusicRowWidget(QFrame):
         cached = thumb_cache.get_or_fetch(self._thumb_url, self.THUMB_SIZE)
         if cached is not None:
             self.thumb_label.set_pixmap(cached)
-        else:
+        elif self._thumb_url:
             thumb_cache.ready.connect(self._on_thumb_ready)
+            self._thumb_connected = True
+
+    def _disconnect_thumb_cache(self) -> None:
+        if self._thumb_connected:
+            self._thumb_connected = False
+            try:
+                self._thumb_cache.ready.disconnect(self._on_thumb_ready)
+            except (RuntimeError, TypeError):
+                pass
+
+    def release_resources(self) -> None:
+        self._disconnect_thumb_cache()
+        if self._hover_anim is not None:
+            self._hover_anim.stop()
+        self.thumb_label.set_playing_bars(False)
+        self.thumb_label.clear()
 
     def _open_compact_menu(self) -> None:
         menu = QMenu(self)
-        mm_label = (
-            "Quitar de Mi música"
-            if self._in_my_music
-            else "Guardar en Mi música"
-        )
-        act_mm = menu.addAction(mm_label)
-        act_mm.triggered.connect(lambda: self.my_music_toggled.emit(self.item))
+        try:
+            mm_label = (
+                "Quitar de Mi música"
+                if self._in_my_music
+                else "Guardar en Mi música"
+            )
+            act_mm = menu.addAction(mm_label)
+            act_mm.triggered.connect(lambda: self.my_music_toggled.emit(self.item))
 
-        act_dl = menu.addAction("Descargar canción")
-        act_dl.triggered.connect(lambda: self.download_requested.emit(self.item))
+            act_dl = menu.addAction("Descargar canción")
+            act_dl.triggered.connect(lambda: self.download_requested.emit(self.item))
 
-        if self.more_btn is not None:
-            pos = self.more_btn.mapToGlobal(self.more_btn.rect().bottomLeft())
-            menu.exec(pos)
+            if self.more_btn is not None:
+                pos = self.more_btn.mapToGlobal(self.more_btn.rect().bottomLeft())
+                menu.exec(pos)
+        finally:
+            menu.deleteLater()
 
     def _on_thumb_ready(self, url: str, pix: QPixmap) -> None:
         if url == self._thumb_url and pix.size() == self.THUMB_SIZE:
             self.thumb_label.set_pixmap(pix)
+            self._disconnect_thumb_cache()
 
     def set_my_music(self, active: bool) -> None:
         self._in_my_music = active

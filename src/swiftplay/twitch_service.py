@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-import gc
 import random
 import re
+import threading
 import urllib.parse
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from swiftplay.models import MediaItem, ResolvedStream
 from swiftplay.youtube_service import QUALITY_HEIGHT_MAP
+from swiftplay.ytdlp_worker import YtdlpWorkerClient
 
 _TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 _TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
@@ -210,23 +212,54 @@ class TwitchService:
     """Cliente público ultraliviano de Twitch (Directos + Favoritos locales, sin chat)."""
 
     def __init__(self) -> None:
-        self._session = requests.Session()
+        self._local = threading.local()
+        self._sessions_lock = threading.Lock()
+        self._sessions: list[requests.Session] = []
+        self._worker_lock = threading.Lock()
+        self._worker: YtdlpWorkerClient | None = None
         self._gql_headers = {
             "Client-ID": _TWITCH_CLIENT_ID,
             "Content-Type": "application/json",
             "User-Agent": _USER_AGENT,
         }
 
+    def _get_session(self) -> requests.Session:
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4)
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            self._local.session = sess
+            with self._sessions_lock:
+                self._sessions.append(sess)
+        return sess
+
+    def close(self) -> None:
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for sess in sessions:
+            try:
+                sess.close()
+            except Exception:
+                pass
+        with self._worker_lock:
+            worker = self._worker
+            self._worker = None
+        if worker is not None:
+            worker.close()
+
     def _post_gql(self, payload: dict[str, Any], timeout: int = 10) -> dict[str, Any]:
-        resp = self._session.post(
+        with self._get_session().post(
             _TWITCH_GQL_URL,
             headers=self._gql_headers,
             json=payload,
             timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, dict) else {}
+        ) as resp:
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else {}
 
     def get_top_streams(self, limit: int = 18, language: str = "ES") -> list[MediaItem]:
         """Obtiene directos populares en vivo filtrados por idioma o global."""
@@ -471,16 +504,19 @@ class TwitchService:
             }
         )
         usher_url = f"https://usher.ttvnw.net/api/channel/hls/{login}.m3u8?{params}"
-        r = self._session.get(
+        with self._get_session().get(
             usher_url,
             headers={"User-Agent": _USER_AGENT, "Referer": "https://www.twitch.tv/"},
             timeout=8,
-        )
-        if r.status_code == 404 or not r.text.strip():
-            raise _ChannelOfflineError(f"El canal '{login}' no está en directo en este momento.")
-        r.raise_for_status()
+        ) as r:
+            if r.status_code == 404 or not r.text.strip():
+                raise _ChannelOfflineError(
+                    f"El canal '{login}' no está en directo en este momento."
+                )
+            r.raise_for_status()
+            m3u8_text = r.text
 
-        variants = _parse_hls_master(r.text)
+        variants = _parse_hls_master(m3u8_text)
         chosen = _pick_hls_variant(variants, audio_only=audio_only, quality=quality)
         target_url = chosen["url"] if chosen else usher_url
         return ResolvedStream(
@@ -495,42 +531,45 @@ class TwitchService:
             video_enabled=not audio_only,
         )
 
+    def _get_worker(self) -> YtdlpWorkerClient:
+        with self._worker_lock:
+            if self._worker is None:
+                self._worker = YtdlpWorkerClient(idle_timeout=30.0)
+            return self._worker
+
     def _resolve_via_ytdlp(
         self, login: str, audio_only: bool, quality: str
     ) -> ResolvedStream:
         try:
-            from yt_dlp import YoutubeDL
-            from yt_dlp.extractor.twitch import TwitchStreamIE
-
-            max_h = QUALITY_HEIGHT_MAP.get(quality, 720)
-            fmt = (
-                "audio_only/bestaudio/worst"
-                if audio_only
-                else f"best[height<={max_h}]/best"
+            data = self._get_worker().request(
+                {
+                    "cmd": "resolve_twitch",
+                    "login": login,
+                    "audio_only": audio_only,
+                    "quality": quality,
+                },
+                timeout=30.0,
             )
-            opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "no_color": True,
-                "skip_download": True,
-                "format": fmt,
-            }
-            ydl = YoutubeDL(opts, auto_init=False)
-            ydl.add_info_extractor(TwitchStreamIE(ydl))
-            with ydl:
-                info = ydl.extract_info(f"https://www.twitch.tv/{login}", download=False)
-            if not isinstance(info, dict) or not info.get("url"):
-                raise _ChannelOfflineError(f"El canal '{login}' no está en directo en este momento.")
-            return ResolvedStream(
-                video_id=login,
-                primary_url=str(info["url"]),
-                audio_url=None,
-                http_headers=dict(info.get("http_headers") or {"User-Agent": _USER_AGENT}),
-                duration=0.0,
-                title=str(info.get("title") or ""),
-                author=str(info.get("uploader") or login),
-                thumb_url=f"https://static-cdn.jtvnw.net/previews-ttv/live_user_{login}-440x248.jpg",
-                video_enabled=not audio_only,
+        except Exception as exc:
+            msg = str(exc)
+            if "no está en directo" in msg.lower():
+                raise _ChannelOfflineError(msg) from exc
+            raise
+        if not isinstance(data, dict) or not data.get("primary_url"):
+            raise _ChannelOfflineError(
+                f"El canal '{login}' no está en directo en este momento."
             )
-        finally:
-            gc.collect()
+        return ResolvedStream(
+            video_id=str(data.get("video_id") or login),
+            primary_url=str(data["primary_url"]),
+            audio_url=data.get("audio_url"),
+            http_headers=dict(data.get("http_headers") or {"User-Agent": _USER_AGENT}),
+            duration=float(data.get("duration") or 0.0),
+            title=str(data.get("title") or ""),
+            author=str(data.get("author") or login),
+            thumb_url=str(
+                data.get("thumb_url")
+                or f"https://static-cdn.jtvnw.net/previews-ttv/live_user_{login}-440x248.jpg"
+            ),
+            video_enabled=bool(data.get("video_enabled", not audio_only)),
+        )

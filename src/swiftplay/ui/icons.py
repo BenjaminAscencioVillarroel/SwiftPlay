@@ -300,5 +300,52 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
         p.setBrush(c)
         p.drawEllipse(QRectF(s * 0.41, s * 0.41, s * 0.18, s * 0.18))
 
+    elif name == "discord":
+        # Auriculares con micrófono integrado (voz en tiempo real)
+        p.drawArc(QRectF(s * 0.18, s * 0.16, s * 0.64, s * 0.60), 0, 180 * 16)
+        p.setBrush(c)
+        p.drawRoundedRect(QRectF(s * 0.15, s * 0.46, s * 0.15, s * 0.24), 4, 4)
+        p.drawRoundedRect(QRectF(s * 0.70, s * 0.46, s * 0.15, s * 0.24), 4, 4)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(s * 0.42, s * 0.56, s * 0.36, s * 0.26), -90 * 16, -90 * 16)
+        p.setBrush(c)
+        p.drawEllipse(QRectF(s * 0.41, s * 0.77, s * 0.12, s * 0.10))
+
+    elif name in ("mic", "mic_off"):
+        p.drawRoundedRect(QRectF(s * 0.38, s * 0.16, s * 0.24, s * 0.38), s * 0.12, s * 0.12)
+        p.drawArc(QRectF(s * 0.26, s * 0.30, s * 0.48, s * 0.38), 180 * 16, 180 * 16)
+        p.drawLine(QPointF(s * 0.50, s * 0.68), QPointF(s * 0.50, s * 0.82))
+        p.drawLine(QPointF(s * 0.35, s * 0.82), QPointF(s * 0.65, s * 0.82))
+        if name == "mic_off":
+            p.drawLine(QPointF(s * 0.20, s * 0.20), QPointF(s * 0.80, s * 0.80))
+
+    elif name in ("headphones", "headphones_off"):
+        p.drawArc(QRectF(s * 0.20, s * 0.20, s * 0.60, s * 0.58), 0, 180 * 16)
+        p.setBrush(c)
+        p.drawRoundedRect(QRectF(s * 0.16, s * 0.50, s * 0.16, s * 0.26), 4, 4)
+        p.drawRoundedRect(QRectF(s * 0.68, s * 0.50, s * 0.16, s * 0.26), 4, 4)
+        if name == "headphones_off":
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawLine(QPointF(s * 0.20, s * 0.20), QPointF(s * 0.80, s * 0.80))
+
+    elif name == "phone_off":
+        p.drawArc(QRectF(s * 0.14, s * 0.40, s * 0.72, s * 0.34), 20 * 16, 140 * 16)
+        p.setBrush(c)
+        p.drawRoundedRect(QRectF(s * 0.15, s * 0.52, s * 0.16, s * 0.15), 3, 3)
+        p.drawRoundedRect(QRectF(s * 0.69, s * 0.52, s * 0.16, s * 0.15), 3, 3)
+
+    elif name == "shield":
+        path = QPainterPath()
+        path.moveTo(s * 0.50, s * 0.15)
+        path.lineTo(s * 0.80, s * 0.26)
+        path.lineTo(s * 0.78, s * 0.54)
+        path.quadTo(s * 0.70, s * 0.76, s * 0.50, s * 0.85)
+        path.quadTo(s * 0.30, s * 0.76, s * 0.22, s * 0.54)
+        path.lineTo(s * 0.20, s * 0.26)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.drawLine(QPointF(s * 0.37, s * 0.50), QPointF(s * 0.47, s * 0.60))
+        p.drawLine(QPointF(s * 0.47, s * 0.60), QPointF(s * 0.65, s * 0.40))
+
     p.end()
     return QIcon(pm)

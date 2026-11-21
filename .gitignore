@@ -25,6 +25,7 @@ config.json
 *.db-shm
 crash.log
 *.log
+logs/
 .env
 .env.*
 

@@ -31,13 +31,13 @@ from PySide6.QtGui import (
     QKeySequence,
     QMouseEvent,
     QPixmap,
+    QPixmapCache,
     QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QCompleter,
     QFrame,
-    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -53,11 +53,13 @@ from PySide6.QtWidgets import (
 )
 
 from swiftplay.config import AppConfig, load_config, save_config
+from swiftplay.discord_service import DiscordService
 from swiftplay.media_keys import GlobalMediaKeyFilter
 from swiftplay.models import FeedSection, MediaItem, ResolvedStream, format_duration
-from swiftplay.paths import APP_NAME, ICON_ICO_PATH, ICON_PNG_PATH, SESSION_STATE_PATH
+from swiftplay.paths import APP_NAME, ICON_ICO_PATH, ICON_PNG_PATH, RAM_LOG_PATH, SESSION_STATE_PATH
 from swiftplay.player import MediaPlayer
-from swiftplay.security import has_saved_session, load_account_profile
+from swiftplay.ram_logger import RamLogger
+from swiftplay.security import has_discord_token, has_saved_session, load_account_profile
 from swiftplay.session_state import SessionState, load_session_state, save_session_state
 from swiftplay.storage import LocalLibrary
 from swiftplay.themes import (
@@ -68,6 +70,7 @@ from swiftplay.themes import (
 )
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.twitch_service import TwitchService, format_viewers
+from swiftplay.ui.discord_panel import DiscordVoicePanel
 from swiftplay.ui.icons import render_icon
 from swiftplay.ui.mini_bar import MiniBarWindow
 from swiftplay.ui.music_player_panel import MusicNowPlayingPanel
@@ -97,6 +100,7 @@ from swiftplay.windows_os import (
     apply_window_taskbar_properties,
     bring_window_to_front,
     clear_window_taskbar_properties,
+    get_process_memory_mb,
     trim_process_memory,
 )
 from swiftplay.youtube_service import YouTubeService
@@ -146,18 +150,29 @@ class MainWindow(QMainWindow):
     PAGE_HISTORY = 6
     PAGE_MUSIC_HISTORY = 7
     PAGE_TWITCH = 8
+    PAGE_DISCORD = 9
 
-    def __init__(self, session_state_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        session_state_path: Path | None = None,
+        ram_log_path: Path | None = None,
+    ) -> None:
         super().__init__()
         self._session_state_path: Path = (
             Path(session_state_path) if session_state_path is not None else SESSION_STATE_PATH
         )
+        self._ram_logger = RamLogger(ram_log_path if ram_log_path is not None else RAM_LOG_PATH)
+        self._discord_ws_mb: float = 0.0
+        self._discord_priv_mb: float = 0.0
+        self._was_discord_connected: bool = False
+        self._was_discord_in_voice: bool = False
         self.cfg: AppConfig = load_config()
         self.palette: ThemePalette = get_theme(self.cfg.theme)
         self.db = LocalLibrary()
         self.yt = YouTubeService()
         self.twitch = TwitchService()
-        self.thumb_cache = ThumbnailCache(max_items=48, parent=self)
+        self.discord_service = DiscordService(self)
+        self.thumb_cache = ThumbnailCache(max_items=32, parent=self)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(4)
 
@@ -194,18 +209,13 @@ class MainWindow(QMainWindow):
         self._video_click_timer.timeout.connect(self._on_video_single_click_commit)
         self._last_video_dbl_ts: float = 0.0
 
-        # Pre-resolución inteligente (hover sobre video + siguiente pista de música)
-        self._hover_prefetch_item: MediaItem | None = None
+        # Pre-resolución de la siguiente pista de música
         self._prefetch_inflight: int = 0
-        self._video_prefetch_timer = QTimer(self)
-        self._video_prefetch_timer.setSingleShot(True)
-        self._video_prefetch_timer.setInterval(550)
-        self._video_prefetch_timer.timeout.connect(self._run_hover_video_prefetch)
 
         # Descarga automática de libmpv en reposo para mantener RAM mínima
         self._video_idle_unload_timer = QTimer(self)
         self._video_idle_unload_timer.setSingleShot(True)
-        self._video_idle_unload_timer.setInterval(30_000)
+        self._video_idle_unload_timer.setInterval(20_000)
         self._video_idle_unload_timer.timeout.connect(self._unload_idle_video_player)
 
         self._music_idle_unload_timer = QTimer(self)
@@ -213,12 +223,8 @@ class MainWindow(QMainWindow):
         self._music_idle_unload_timer.setInterval(45_000)
         self._music_idle_unload_timer.timeout.connect(self._unload_idle_music_player)
 
-        self._sidebar_anim: QPropertyAnimation | None = None
         self._sidebar_hiding = False
-        self._bottom_bar_anim: QPropertyAnimation | None = None
         self._bottom_bar_hiding = False
-        self._page_fade_anim: QPropertyAnimation | None = None
-        self._page_fade_widget: QWidget | None = None
 
         # Estado independiente del Reproductor Dual
         self._search_mode: Literal["video", "music", "twitch"] = "video"
@@ -251,7 +257,9 @@ class MainWindow(QMainWindow):
         self._music_queue: list[MediaItem] = []
         self._queue_index: int = -1
 
+        self._video_feed_items: list[MediaItem] = []
         self._video_results: list[MediaItem] = []
+        self._music_home_sections: list[FeedSection] = []
         self._music_results: list[MediaItem] = []
         self._video_cards: list[VideoGridCard | VideoCardWidget] = []
         self._music_rows: list[MusicRowWidget] = []
@@ -265,6 +273,14 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(ICON_ICO_PATH)))
 
         self._build_ui()
+
+        self._sidebar_anim = QPropertyAnimation(self.sidebar, b"maximumWidth", self)
+        self._sidebar_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._sidebar_anim.finished.connect(self._on_sidebar_anim_finished)
+
+        self._bottom_bar_anim = QPropertyAnimation(self.bottom_bar, b"maximumHeight", self)
+        self._bottom_bar_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._bottom_bar_anim.finished.connect(self._on_bottom_bar_anim_finished)
 
         # Dos instancias ligeras lazy de libmpv en paralelo (Video GPU + Música Solo-Audio)
         self.video_player = MediaPlayer(
@@ -306,6 +322,9 @@ class MainWindow(QMainWindow):
             initial_volume=self.cfg.music_volume,
         )
         self._connect_minibar_signals()
+        self.discord_service.voice_state_updated.connect(self._on_discord_voice_state_changed)
+        self.discord_service.worker_ram_updated.connect(self._on_discord_worker_ram_updated)
+        self.discord_service.state_changed.connect(self._on_discord_state_changed_for_log)
 
         self._setup_tray()
         self._setup_shortcuts()
@@ -321,6 +340,13 @@ class MainWindow(QMainWindow):
         self._refresh_badges()
         self._restore_last_session()
         self._switch_page(self.PAGE_VIDEO_SEARCH)
+
+        self._ram_log_timer = QTimer(self)
+        self._ram_log_timer.setInterval(60_000)
+        self._ram_log_timer.timeout.connect(lambda: self._log_ram_sample("periodic"))
+        self._ram_log_timer.start()
+        self._ram_logger.log_session_start()
+        self._log_ram_sample("startup")
 
         QTimer.singleShot(150, self._load_video_feed)
         QTimer.singleShot(250, self._refresh_account_async_if_needed)
@@ -422,9 +448,20 @@ class MainWindow(QMainWindow):
         self.nav_twitch = self._make_nav_btn(
             "Twitch",
             lambda: self._switch_page(self.PAGE_TWITCH),
-            tooltip="Directos de Twitch (invitado, sin chat)",
+            tooltip="Directos de Twitch (invitado, sin chat) [Tab]",
         )
         sb_lay.addWidget(self.nav_twitch)
+
+        voice_sec = QLabel("VOZ")
+        voice_sec.setObjectName("SectionHeader")
+        sb_lay.addWidget(voice_sec)
+
+        self.nav_discord = self._make_nav_btn(
+            "Discord",
+            lambda: self._switch_page(self.PAGE_DISCORD),
+            tooltip="Canales de voz de Discord (Bot ultraliviano, 0 MB en reposo) [Tab]",
+        )
+        sb_lay.addWidget(self.nav_discord)
 
         sb_lay.addStretch()
 
@@ -699,6 +736,22 @@ class MainWindow(QMainWindow):
             tw_hdr.insertWidget(3, self.twitch_fav_btn)
         self._refresh_twitch_tab_pills()
         self.stack.addWidget(self.twitch_page)
+
+        # Pág 9: Discord Voz (Bot puente aislado, 0 MB en reposo)
+        self.discord_panel = DiscordVoicePanel(
+            config=self.cfg,
+            service=self.discord_service,
+            palette=self.palette,
+            parent=self,
+        )
+        self.discord_panel.open_token_settings_requested.connect(
+            lambda: self.open_settings(discord_tab=True)
+        )
+        self.discord_panel.open_shortcuts_settings_requested.connect(
+            lambda: self.open_settings(discord_shortcuts_tab=True)
+        )
+        self.discord_panel.toast_requested.connect(self.show_toast)
+        self.stack.addWidget(self.discord_panel)
 
         right_col.addWidget(self.stack, 1)
         body_row.addLayout(right_col, 1)
@@ -1134,6 +1187,11 @@ class MainWindow(QMainWindow):
     def _focus_search(self) -> None:
         if self._is_fullscreen:
             self.toggle_fullscreen()
+        if self.stack.currentIndex() == self.PAGE_DISCORD:
+            if self.discord_panel.chat_input.isEnabled():
+                self.discord_panel.chat_input.setFocus()
+                self.discord_panel.chat_input.selectAll()
+            return
         self.search_input.setFocus()
         self.search_input.selectAll()
 
@@ -1184,15 +1242,61 @@ class MainWindow(QMainWindow):
                 self.music_player.seek_relative(delta)
 
     def _setup_media_keys(self) -> None:
+        self._discord_hotkey_statuses: dict[str, str] = {}
         self._media_filter = GlobalMediaKeyFilter(self)
         self._media_filter.play_pause_pressed.connect(self.toggle_play_pause)
         self._media_filter.next_pressed.connect(self.play_next)
         self._media_filter.prev_pressed.connect(self.play_previous)
         self._media_filter.stop_pressed.connect(self._stop_all)
+        self._media_filter.discord_mute_pressed.connect(self._on_global_discord_mute)
+        self._media_filter.discord_deafen_pressed.connect(self._on_global_discord_deafen)
+        self._media_filter.discord_hangup_pressed.connect(self._on_global_discord_hangup)
         app = QApplication.instance()
         if app is not None:
             app.installNativeEventFilter(self._media_filter)
         self._media_filter.register(int(self.winId()))
+        self._apply_discord_hotkeys()
+
+    def _apply_discord_hotkeys(self) -> dict[str, str]:
+        self._discord_hotkey_statuses = self._media_filter.configure_discord_hotkeys(
+            self.cfg.discord_hotkey_mute,
+            self.cfg.discord_hotkey_deafen,
+            self.cfg.discord_hotkey_hangup,
+            mute_force_priority=self.cfg.discord_hotkey_mute_priority,
+        )
+        return dict(self._discord_hotkey_statuses)
+
+    def _play_voice_cue(self, high: bool) -> None:
+        if sys.platform != "win32" or not self.discord_service.is_in_voice:
+            return
+        import threading
+
+        freq = 880 if high else 520
+
+        def _beep() -> None:
+            try:
+                import winsound
+
+                winsound.Beep(freq, 65)
+            except Exception:
+                pass
+
+        threading.Thread(target=_beep, daemon=True, name="discord-cue").start()
+
+    def _on_global_discord_mute(self) -> None:
+        muted = self.discord_panel.toggle_mute_from_hotkey()
+        self.show_toast("Discord: Micrófono silenciado" if muted else "Discord: Micrófono activo")
+        self._play_voice_cue(not muted)
+
+    def _on_global_discord_deafen(self) -> None:
+        deaf = self.discord_panel.toggle_deafen_from_hotkey()
+        self.show_toast("Discord: Audio ensordecido" if deaf else "Discord: Audio activo")
+        self._play_voice_cue(not deaf)
+
+    def _on_global_discord_hangup(self) -> None:
+        if self.discord_panel.hangup_from_hotkey():
+            self.show_toast("Discord: Saliste del canal de voz")
+            self._play_voice_cue(False)
 
     def _stop_all(self) -> None:
         self._save_current_video_progress(force=True)
@@ -1202,8 +1306,15 @@ class MainWindow(QMainWindow):
         trim_process_memory()
 
     def open_shortcuts_dialog(self) -> None:
-        dlg = ShortcutsDialog(self.palette, parent=self)
-        dlg.exec()
+        dlg = ShortcutsDialog(self.palette, config=self.cfg, parent=self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        try:
+            dlg.exec()
+        finally:
+            try:
+                dlg.deleteLater()
+            except RuntimeError:
+                pass
 
     # ------------------------------------------------------------------
     # Tema Unificado (Obsidian Graphite & Matte Silver)
@@ -1231,6 +1342,9 @@ class MainWindow(QMainWindow):
         self.nav_mymusic.setIcon(render_icon("heart", p.text, 17))
         self.nav_music_history.setIcon(render_icon("history", p.text, 17))
         self.nav_twitch.setIcon(render_icon("live", p.text, 17))
+        self.nav_discord.setIcon(
+            render_icon("discord", "#4ADE80" if self.discord_service.is_in_voice else p.text, 17)
+        )
         self.minibar_btn.setIcon(render_icon("mini_bar", p.text2, 16))
         self.shortcuts_btn.setIcon(render_icon("help", p.text2, 16))
         self.settings_btn.setIcon(render_icon("settings", p.text2, 16))
@@ -1250,6 +1364,7 @@ class MainWindow(QMainWindow):
         self.vol_hud.update_theme(p)
         self.action_hud.update_theme(p)
         self.mini_bar.update_theme(p)
+        self.discord_panel.update_theme(p)
         self._refresh_sidebar_toggle_ui()
         if self.video_refresh_btn is not None:
             self.video_refresh_btn.setIcon(render_icon("refresh", p.text, 15))
@@ -1346,15 +1461,20 @@ class MainWindow(QMainWindow):
         self.play_video(item, start_pos=pos)
 
     def _unload_idle_video_player(self) -> None:
+        if not (self.video_player.is_loaded and self._video_paused):
+            return
+        self._save_current_video_progress(force=True)
+        self.persist_session_state(force=True)
+        self.video_player.unload()
         if (
-            self.video_player.is_loaded
-            and self._video_paused
-            and self.stack.currentIndex() != self.PAGE_VIDEO_PLAYER
+            self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER
+            and self._video_item is not None
         ):
-            self._save_current_video_progress(force=True)
-            self.persist_session_state(force=True)
-            self.video_player.unload()
-            trim_process_memory()
+            if self._video_item.kind == "twitch":
+                self.video_panel.set_status("Pausado (en espera)")
+            else:
+                self.video_panel.set_resume_preview(self._video_item, self._video_pos)
+        trim_process_memory()
 
     def _unload_idle_music_player(self) -> None:
         if self.music_player.is_loaded and self._music_paused:
@@ -1362,12 +1482,136 @@ class MainWindow(QMainWindow):
             self.music_player.unload()
             trim_process_memory()
 
+    def free_memory_now(self) -> None:
+        self._save_current_video_progress(force=True)
+        self.persist_session_state(force=True)
+        if self.video_player.is_loaded and (
+            self._video_paused or self.video_player.is_paused
+        ):
+            self._video_paused = True
+            self.video_player.unload()
+            if (
+                self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER
+                and self._video_item is not None
+                and self._video_item.kind != "twitch"
+            ):
+                self.video_panel.set_resume_preview(self._video_item, self._video_pos)
+        if self.music_player.is_loaded and (
+            self._music_paused or self.music_player.is_paused
+        ):
+            self._music_paused = True
+            self.music_player.unload()
+        self.thumb_cache.trim(8)
+        QPixmapCache.clear()
+        self.yt.close_worker()
+        self.discord_service.stop_if_idle()
+        trim_process_memory()
+        self._log_ram_sample("free_memory")
+
+    def _current_page_label(self) -> str:
+        names = {
+            self.PAGE_VIDEO_SEARCH: "video",
+            self.PAGE_VIDEO_PLAYER: "video_player",
+            self.PAGE_WATCH_LATER: "watch_later",
+            self.PAGE_MUSIC_SEARCH: "music",
+            self.PAGE_MY_MUSIC: "my_music",
+            self.PAGE_MUSIC_PLAYER: "music_player",
+            self.PAGE_HISTORY: "video_history",
+            self.PAGE_MUSIC_HISTORY: "music_history",
+            self.PAGE_TWITCH: "twitch",
+            self.PAGE_DISCORD: "discord",
+        }
+        return names.get(self.stack.currentIndex(), str(self.stack.currentIndex()))
+
+    def _log_ram_sample(self, event: str) -> None:
+        try:
+            ws_mb, priv_mb = get_process_memory_mb()
+            v_on = self.video_player.is_loaded
+            m_on = self.music_player.is_loaded
+            if v_on and m_on:
+                mpv_st = "video+music"
+            elif v_on:
+                mpv_st = "video"
+            elif m_on:
+                mpv_st = "music"
+            else:
+                mpv_st = "none"
+
+            if not self.discord_service.is_worker_running:
+                d_st = "off"
+                w_ws = 0.0
+                w_priv = 0.0
+            else:
+                w_ws = self._discord_ws_mb
+                w_priv = self._discord_priv_mb
+                if self.discord_service.is_in_voice:
+                    d_st = f"voice({self.cfg.discord_noise_suppression})"
+                elif self.discord_service.is_connected:
+                    d_st = "connected"
+                else:
+                    d_st = "starting"
+
+            self._ram_logger.log_sample(
+                event,
+                gui_ws_mb=ws_mb,
+                gui_priv_mb=priv_mb,
+                worker_ws_mb=w_ws,
+                worker_priv_mb=w_priv,
+                page=self._current_page_label(),
+                mpv_state=mpv_st,
+                discord_state=d_st,
+            )
+        except Exception:
+            pass
+
+    def _on_discord_worker_ram_updated(self, ws_mb: float, priv_mb: float) -> None:
+        self._discord_ws_mb = float(ws_mb)
+        self._discord_priv_mb = float(priv_mb)
+
+    def _on_discord_state_changed_for_log(self, state: str, _data: dict) -> None:
+        if state == "connected":
+            if not self._was_discord_connected:
+                self._was_discord_connected = True
+                self._log_ram_sample("discord_connected")
+        elif state in ("disconnected", "error"):
+            self._discord_ws_mb = 0.0
+            self._discord_priv_mb = 0.0
+            if self._was_discord_connected:
+                self._was_discord_connected = False
+                self._was_discord_in_voice = False
+                self._log_ram_sample("discord_disconnected")
+
+    def _on_discord_voice_state_changed(self, state: dict) -> None:
+        in_voice = bool(state.get("in_voice", False))
+        ch = str(state.get("channel_name") or "").strip()
+        if in_voice:
+            self.nav_discord.setText("  Discord · Voz")
+            self.nav_discord.setToolTip(f"Conectado en canal de voz: {ch}")
+            self.nav_discord.setIcon(render_icon("discord", "#4ADE80", 17))
+            if not self._was_discord_in_voice:
+                self._was_discord_in_voice = True
+                self._log_ram_sample("discord_voice_join")
+        else:
+            self.nav_discord.setText("  Discord")
+            self.nav_discord.setToolTip(
+                "Canales de voz de Discord (Bot ultraliviano, 0 MB en reposo) [Tab]"
+            )
+            self.nav_discord.setIcon(render_icon("discord", self.palette.text, 17))
+            if self._was_discord_in_voice:
+                self._was_discord_in_voice = False
+                self._log_ram_sample("discord_voice_leave")
+
+    def _on_discord_token_changed(self) -> None:
+        self.discord_panel.refresh_token_state()
+        if not has_discord_token() and self.discord_service.is_worker_running:
+            self.discord_service.disconnect_and_kill()
+
     # ------------------------------------------------------------------
     # Navegación rápida (Tab Switch) y Vistas
     # ------------------------------------------------------------------
 
     def switch_music_video_tab(self) -> None:
-        """Rota instantáneamente entre YouTube Video, YT Music y Twitch manteniendo estados."""
+        """Rota instantáneamente entre YouTube Video, YT Music, Twitch y Discord manteniendo estados."""
         cur = self.stack.currentIndex()
         playing_twitch = (
             self._video_item is not None and self._video_item.kind == "twitch"
@@ -1382,7 +1626,22 @@ class MainWindow(QMainWindow):
             self.PAGE_MUSIC_HISTORY,
         )
 
-        if not in_music and not in_twitch:
+        if cur == self.PAGE_DISCORD:
+            self._active_deck = "video"
+            if (
+                self._video_item is not None
+                and not playing_twitch
+                and self.video_player.has_active_stream
+            ):
+                target = self.PAGE_VIDEO_PLAYER
+            else:
+                target = self._last_video_page
+                if target in (self.PAGE_TWITCH, self.PAGE_DISCORD) or (
+                    target == self.PAGE_VIDEO_PLAYER and playing_twitch
+                ):
+                    target = self.PAGE_VIDEO_SEARCH
+            self._switch_page(target)
+        elif not in_music and not in_twitch:
             self._last_video_page = cur
             self._active_deck = "music"
             if (
@@ -1402,20 +1661,7 @@ class MainWindow(QMainWindow):
                 target = self.PAGE_TWITCH
             self._switch_page(target)
         else:
-            self._active_deck = "video"
-            if (
-                self._video_item is not None
-                and not playing_twitch
-                and self.video_player.has_active_stream
-            ):
-                target = self.PAGE_VIDEO_PLAYER
-            else:
-                target = self._last_video_page
-                if target == self.PAGE_TWITCH or (
-                    target == self.PAGE_VIDEO_PLAYER and playing_twitch
-                ):
-                    target = self.PAGE_VIDEO_SEARCH
-            self._switch_page(target)
+            self._switch_page(self.PAGE_DISCORD)
 
     def _switch_active_deck_from_bb(self) -> None:
         """Salta directamente entre el deck de Música y el deck de Video/Directo cargado."""
@@ -1423,6 +1669,14 @@ class MainWindow(QMainWindow):
         playing_twitch = (
             self._video_item is not None and self._video_item.kind == "twitch"
         )
+        if cur == self.PAGE_DISCORD:
+            if self._active_deck == "music" and self._music_item is not None:
+                self._switch_page(self.PAGE_MUSIC_PLAYER)
+            elif self._video_item is not None and self.video_player.has_active_stream:
+                self._switch_page(self.PAGE_VIDEO_PLAYER)
+            else:
+                self._switch_page(self._last_video_page)
+            return
         in_video = cur in (
             self.PAGE_VIDEO_SEARCH,
             self.PAGE_VIDEO_PLAYER,
@@ -1454,46 +1708,30 @@ class MainWindow(QMainWindow):
                 target = self._last_video_page
             self._switch_page(target)
 
-    def _clear_page_fade(self) -> None:
-        if self._page_fade_anim is not None:
-            self._page_fade_anim.stop()
-            self._page_fade_anim = None
-        if self._page_fade_widget is not None:
-            try:
-                self._page_fade_widget.setGraphicsEffect(None)
-            except RuntimeError:
-                pass
-            self._page_fade_widget = None
-
-    def _animate_page_fade(self, widget: QWidget | None) -> None:
-        self._clear_page_fade()
-        if widget is None or widget is self.video_panel:
-            return
-        eff = QGraphicsOpacityEffect(widget)
-        eff.setOpacity(0.90)
-        widget.setGraphicsEffect(eff)
-        self._page_fade_widget = widget
-        anim = QPropertyAnimation(eff, b"opacity", self)
-        anim.setDuration(130)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.setStartValue(0.90)
-        anim.setEndValue(1.0)
-        anim.finished.connect(self._clear_page_fade)
-        self._page_fade_anim = anim
-        anim.start()
-
     def _switch_page(self, page_idx: int) -> None:
         if self._is_fullscreen and page_idx != self.PAGE_VIDEO_PLAYER:
             self.toggle_fullscreen()
 
         prev_idx = self.stack.currentIndex()
         if prev_idx != page_idx:
-            if prev_idx == self.PAGE_WATCH_LATER:
+            if prev_idx == self.PAGE_VIDEO_SEARCH:
+                self.video_grid.clear_widgets()
+                self._video_cards.clear()
+            elif prev_idx == self.PAGE_WATCH_LATER:
                 self.wl_grid.clear_widgets()
             elif prev_idx == self.PAGE_HISTORY:
                 self.history_grid.clear_widgets()
+            elif prev_idx == self.PAGE_MUSIC_SEARCH:
+                self._clear_layout_widgets(
+                    self.music_results_lay, keep_widget=self.music_empty_lbl
+                )
+                self._music_rows.clear()
+                self._music_tiles.clear()
+                self._music_shelves.clear()
             elif prev_idx == self.PAGE_MY_MUSIC:
                 self._clear_layout_widgets(self.my_music_lay, keep_widget=self.my_music_empty_lbl)
+            elif prev_idx == self.PAGE_MUSIC_PLAYER:
+                self.music_panel.clear_queue_widgets()
             elif prev_idx == self.PAGE_MUSIC_HISTORY:
                 self._clear_layout_widgets(
                     self.music_history_lay, keep_widget=self.music_history_empty_lbl
@@ -1503,14 +1741,17 @@ class MainWindow(QMainWindow):
                 self._twitch_cards.clear()
 
         if page_idx == self.PAGE_VIDEO_PLAYER:
-            self._video_idle_unload_timer.stop()
+            self.thumb_cache.trim(12)
+            QPixmapCache.clear()
+            if self._video_paused and self.video_player.is_loaded:
+                self._video_idle_unload_timer.start(90_000)
+            else:
+                self._video_idle_unload_timer.stop()
         elif self._video_paused and self.video_player.is_loaded:
-            if not self._video_idle_unload_timer.isActive():
-                self._video_idle_unload_timer.start()
+            self._video_idle_unload_timer.start(20_000)
 
         self.stack.setCurrentIndex(page_idx)
-        if page_idx != self.PAGE_VIDEO_PLAYER and prev_idx != page_idx:
-            self._animate_page_fade(self.stack.currentWidget())
+        self.top_bar.setVisible(not self._is_fullscreen and page_idx != self.PAGE_DISCORD)
         if page_idx == self.PAGE_MUSIC_PLAYER and prev_idx != self.PAGE_MUSIC_PLAYER:
             self.music_panel.play_entrance_animation()
 
@@ -1535,6 +1776,7 @@ class MainWindow(QMainWindow):
             self.PAGE_MUSIC_PLAYER: music_return_nav,
             self.PAGE_MUSIC_HISTORY: self.nav_music_history,
             self.PAGE_TWITCH: self.nav_twitch,
+            self.PAGE_DISCORD: self.nav_discord,
         }
         active_btn = nav_map.get(page_idx)
         for btn in (
@@ -1545,6 +1787,7 @@ class MainWindow(QMainWindow):
             self.nav_mymusic,
             self.nav_music_history,
             self.nav_twitch,
+            self.nav_discord,
         ):
             btn.setProperty("active", "true" if btn is active_btn else "false")
             btn.style().unpolish(btn)
@@ -1555,7 +1798,11 @@ class MainWindow(QMainWindow):
             and self._video_item is not None
             and self._video_item.kind == "twitch"
         )
-        if page_idx == self.PAGE_TWITCH or is_twitch_player:
+        if page_idx == self.PAGE_DISCORD:
+            self._search_mode = "video"
+            self.search_input.setPlaceholderText("Buscar videos en YouTube... [Ctrl+L]")
+            self.discord_panel.refresh_token_state()
+        elif page_idx == self.PAGE_TWITCH or is_twitch_player:
             self._search_mode = "twitch"
             self.search_input.setPlaceholderText(
                 "Buscar canales en Twitch o pegar enlace... [Ctrl+L]"
@@ -1585,7 +1832,13 @@ class MainWindow(QMainWindow):
         self._update_music_filter_visibility()
         self._refresh_search_completer()
 
-        if page_idx == self.PAGE_WATCH_LATER:
+        if page_idx == self.PAGE_VIDEO_SEARCH:
+            if self._video_showing_search:
+                if self._video_results:
+                    self._render_video_cards(self._video_results)
+            elif self._video_feed_items:
+                self._render_video_cards(self._video_feed_items)
+        elif page_idx == self.PAGE_WATCH_LATER:
             self._render_watch_later()
         elif page_idx == self.PAGE_HISTORY:
             self._render_history()
@@ -1595,12 +1848,14 @@ class MainWindow(QMainWindow):
             self._render_queue()
         elif page_idx == self.PAGE_MUSIC_HISTORY:
             self._render_music_history()
-        elif (
-            page_idx == self.PAGE_MUSIC_SEARCH
-            and not self._music_home_loaded
-            and not self._music_showing_search
-        ):
-            self._load_music_home()
+        elif page_idx == self.PAGE_MUSIC_SEARCH:
+            if self._music_showing_search:
+                if self._music_results:
+                    self._render_music_search_rows(self._music_results)
+            elif self._music_home_loaded and self._music_home_sections:
+                self._render_music_home_sections(self._music_home_sections)
+            elif not self._music_home_loaded:
+                self._load_music_home()
         elif page_idx == self.PAGE_TWITCH:
             if self._twitch_showing_search and self._twitch_results:
                 self._render_twitch_cards(self._twitch_results)
@@ -1649,6 +1904,7 @@ class MainWindow(QMainWindow):
 
         if self._search_mode == "video":
             self._video_showing_search = True
+            self._video_results = []
             self.video_view_title.setText(f"«{query}»")
             if self.video_back_feed_btn is not None:
                 self.video_back_feed_btn.setVisible(True)
@@ -1680,6 +1936,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self._music_showing_search = True
+            self._music_results = []
             self.music_view_title.setText(f"«{query}»")
             if self.music_back_home_btn is not None:
                 self.music_back_home_btn.setVisible(True)
@@ -1697,6 +1954,65 @@ class MainWindow(QMainWindow):
                 on_error=lambda err: self._on_search_error(gen, "music", err),
             )
 
+    def _render_video_cards(
+        self, items: list[MediaItem], empty_text: str = ""
+    ) -> None:
+        self.video_grid.clear_widgets()
+        self._video_cards.clear()
+        if not items:
+            if empty_text:
+                self.video_empty_lbl.setText(empty_text)
+            self.video_empty_lbl.setVisible(True)
+            return
+        self.video_empty_lbl.setVisible(False)
+        cards: list[QWidget] = []
+        for item in items:
+            card = self._create_video_card(item)
+            self._video_cards.append(card)
+            cards.append(card)
+        self.video_grid.set_items_widgets(cards)
+
+    def _render_music_home_sections(
+        self, sections: list[FeedSection], empty_text: str = ""
+    ) -> None:
+        self._clear_layout_widgets(self.music_results_lay, keep_widget=self.music_empty_lbl)
+        self._music_rows.clear()
+        self._music_tiles.clear()
+        self._music_shelves.clear()
+        if not sections:
+            if empty_text:
+                self.music_empty_lbl.setText(empty_text)
+            self.music_empty_lbl.setVisible(True)
+            return
+        self.music_empty_lbl.setVisible(False)
+        for sec in sections:
+            tiles: list[MusicTileWidget] = []
+            for item in sec.items:
+                tile = self._create_music_tile(item)
+                self._music_tiles.append(tile)
+                tiles.append(tile)
+            shelf = MusicShelfWidget(sec.title, tiles, self.palette)
+            self._music_shelves.append(shelf)
+            self.music_results_lay.insertWidget(self.music_results_lay.count() - 1, shelf)
+
+    def _render_music_search_rows(
+        self, items: list[MediaItem], empty_text: str = ""
+    ) -> None:
+        self._clear_layout_widgets(self.music_results_lay, keep_widget=self.music_empty_lbl)
+        self._music_rows.clear()
+        self._music_tiles.clear()
+        self._music_shelves.clear()
+        if not items:
+            if empty_text:
+                self.music_empty_lbl.setText(empty_text)
+            self.music_empty_lbl.setVisible(True)
+            return
+        self.music_empty_lbl.setVisible(False)
+        for item in items:
+            row = self._create_music_row(item, show_enqueue=True, show_remove=False)
+            self._music_rows.append(row)
+            self.music_results_lay.insertWidget(self.music_results_lay.count() - 1, row)
+
     def _show_video_feed_view(self) -> None:
         self._video_showing_search = False
         self.video_view_title.setText("Inicio")
@@ -1706,6 +2022,7 @@ class MainWindow(QMainWindow):
 
     def _load_video_feed(self) -> None:
         self._video_showing_search = False
+        self._video_feed_items = []
         self.video_view_title.setText("Inicio")
         if self.video_back_feed_btn is not None:
             self.video_back_feed_btn.setVisible(False)
@@ -1730,23 +2047,13 @@ class MainWindow(QMainWindow):
             return
         if self.video_refresh_btn is not None:
             self.video_refresh_btn.setEnabled(True)
-        if self._video_showing_search:
+        self._video_feed_items = list(items)
+        if self._video_showing_search or self.stack.currentIndex() != self.PAGE_VIDEO_SEARCH:
             return
-        self.video_grid.clear_widgets()
-        self._video_cards.clear()
-        if not items:
-            self.video_empty_lbl.setText(
-                "No se pudo cargar el feed ahora. Prueba buscar arriba o inicia sesión en Ajustes."
-            )
-            self.video_empty_lbl.setVisible(True)
-            return
-        self.video_empty_lbl.setVisible(False)
-        cards: list[QWidget] = []
-        for item in items:
-            card = self._create_video_card(item)
-            self._video_cards.append(card)
-            cards.append(card)
-        self.video_grid.set_items_widgets(cards)
+        self._render_video_cards(
+            self._video_feed_items,
+            empty_text="No se pudo cargar el feed ahora. Prueba buscar arriba o inicia sesión en Ajustes.",
+        )
         QTimer.singleShot(800, trim_process_memory)
 
     def _on_video_feed_error(self, gen: int, err: str) -> None:
@@ -1767,6 +2074,7 @@ class MainWindow(QMainWindow):
 
     def _load_music_home(self) -> None:
         self._music_showing_search = False
+        self._music_home_sections = []
         self.music_view_title.setText("Música")
         if self.music_back_home_btn is not None:
             self.music_back_home_btn.setVisible(False)
@@ -1794,28 +2102,13 @@ class MainWindow(QMainWindow):
         if self.music_refresh_btn is not None:
             self.music_refresh_btn.setEnabled(True)
         self._music_home_loaded = True
-        if self._music_showing_search:
+        self._music_home_sections = list(sections)
+        if self._music_showing_search or self.stack.currentIndex() != self.PAGE_MUSIC_SEARCH:
             return
-        self._clear_layout_widgets(self.music_results_lay, keep_widget=self.music_empty_lbl)
-        self._music_rows.clear()
-        self._music_tiles.clear()
-        self._music_shelves.clear()
-        if not sections:
-            self.music_empty_lbl.setText(
-                "Escucha una canción o inicia sesión con Google para ver tus recomendaciones aquí."
-            )
-            self.music_empty_lbl.setVisible(True)
-            return
-        self.music_empty_lbl.setVisible(False)
-        for sec in sections:
-            tiles: list[MusicTileWidget] = []
-            for item in sec.items:
-                tile = self._create_music_tile(item)
-                self._music_tiles.append(tile)
-                tiles.append(tile)
-            shelf = MusicShelfWidget(sec.title, tiles, self.palette)
-            self._music_shelves.append(shelf)
-            self.music_results_lay.insertWidget(self.music_results_lay.count() - 1, shelf)
+        self._render_music_home_sections(
+            self._music_home_sections,
+            empty_text="Escucha una canción o inicia sesión con Google para ver tus recomendaciones aquí.",
+        )
         QTimer.singleShot(800, trim_process_memory)
 
     def _on_music_home_error(self, gen: int, err: str) -> None:
@@ -1888,38 +2181,24 @@ class MainWindow(QMainWindow):
     def _on_video_search_done(self, gen: int, query: str, items: list[MediaItem]) -> None:
         if gen != self._search_gen:
             return
-        self._video_results = items
-        self.video_grid.clear_widgets()
-        self._video_cards.clear()
-        if not items:
-            self.video_empty_lbl.setText(f"No se encontraron videos para '{query}'.")
-            self.video_empty_lbl.setVisible(True)
+        self._video_results = list(items)
+        if not self._video_showing_search or self.stack.currentIndex() != self.PAGE_VIDEO_SEARCH:
             return
-        self.video_empty_lbl.setVisible(False)
-        cards: list[QWidget] = []
-        for item in items:
-            card = self._create_video_card(item)
-            self._video_cards.append(card)
-            cards.append(card)
-        self.video_grid.set_items_widgets(cards)
+        self._render_video_cards(
+            self._video_results,
+            empty_text=f"No se encontraron videos para '{query}'.",
+        )
 
     def _on_music_search_done(self, gen: int, query: str, items: list[MediaItem]) -> None:
         if gen != self._search_gen:
             return
-        self._music_results = items
-        self._clear_layout_widgets(self.music_results_lay, keep_widget=self.music_empty_lbl)
-        self._music_rows.clear()
-        self._music_tiles.clear()
-        self._music_shelves.clear()
-        if not items:
-            self.music_empty_lbl.setText(f"No se encontraron canciones para '{query}'.")
-            self.music_empty_lbl.setVisible(True)
+        self._music_results = list(items)
+        if not self._music_showing_search or self.stack.currentIndex() != self.PAGE_MUSIC_SEARCH:
             return
-        self.music_empty_lbl.setVisible(False)
-        for item in items:
-            row = self._create_music_row(item, show_enqueue=True, show_remove=False)
-            self._music_rows.append(row)
-            self.music_results_lay.insertWidget(self.music_results_lay.count() - 1, row)
+        self._render_music_search_rows(
+            self._music_results,
+            empty_text=f"No se encontraron canciones para '{query}'.",
+        )
 
     def _on_search_error(self, gen: int, mode: str, err: str) -> None:
         if gen != self._search_gen:
@@ -2125,39 +2404,9 @@ class MainWindow(QMainWindow):
         card.play_requested.connect(self.play_video)
         card.watch_later_toggled.connect(self._toggle_watch_later_item)
         card.download_requested.connect(lambda it: self._download_item(it, "video"))
-        card.hover_entered.connect(self._on_video_card_hover_enter)
-        card.hover_left.connect(self._on_video_card_hover_leave)
         if show_remove:
             card.remove_requested.connect(self._remove_history_item)
         return card
-
-    def _on_video_card_hover_enter(self, item: MediaItem) -> None:
-        if not item.video_id:
-            return
-        self._hover_prefetch_item = item
-        self._video_prefetch_timer.start()
-
-    def _on_video_card_hover_leave(self, item: MediaItem) -> None:
-        if self._hover_prefetch_item is item:
-            self._hover_prefetch_item = None
-            self._video_prefetch_timer.stop()
-
-    def _run_hover_video_prefetch(self) -> None:
-        item = self._hover_prefetch_item
-        if item is None or not item.video_id or self._prefetch_inflight >= 1:
-            return
-        audio_only = self.cfg.video_audio_only
-        quality = self.cfg.video_quality
-        if self.yt.has_cached_stream(item.video_id, audio_only=audio_only, quality=quality):
-            return
-        self._prefetch_inflight += 1
-        self._run_async(
-            lambda: self.yt.prefetch_stream(
-                item.video_id, audio_only=audio_only, quality=quality
-            ),
-            on_done=lambda _res: self._finish_prefetch(),
-            on_error=lambda _err: self._finish_prefetch(),
-        )
 
     def _finish_prefetch(self) -> None:
         self._prefetch_inflight = max(0, self._prefetch_inflight - 1)
@@ -2206,6 +2455,9 @@ class MainWindow(QMainWindow):
             item = lay.itemAt(i)
             w = item.widget() if item else None
             if w is not None and w is not keep_widget:
+                rel = getattr(w, "release_resources", None)
+                if callable(rel):
+                    rel()
                 w.hide()
                 lay.removeWidget(w)
                 w.deleteLater()
@@ -2309,8 +2561,8 @@ class MainWindow(QMainWindow):
             self._toggle_twitch_favorite(item)
             if self._video_item is not None and self._video_item.video_id == item.video_id:
                 fav = self.db.is_twitch_favorite(item.video_id)
-                self.video_panel.set_watch_later(fav, is_twitch=True)
-                self.fs_overlay.set_watch_later(fav, is_twitch=True)
+                self.video_panel.set_watch_later(fav)
+                self.fs_overlay.set_watch_later(fav)
             self._refresh_bb_fav_icon()
             return
         if self.db.is_in_watch_later(item.video_id):
@@ -2391,7 +2643,6 @@ class MainWindow(QMainWindow):
 
     def play_video(self, item: MediaItem, start_pos: float | None = None) -> None:
         self._video_click_timer.stop()
-        self._video_prefetch_timer.stop()
         self._video_idle_unload_timer.stop()
         self.continue_banner.setVisible(False)
         self._save_current_video_progress(force=True)
@@ -2497,7 +2748,6 @@ class MainWindow(QMainWindow):
 
     def play_twitch_stream(self, item: MediaItem) -> None:
         self._video_click_timer.stop()
-        self._video_prefetch_timer.stop()
         self._video_idle_unload_timer.stop()
         self.continue_banner.setVisible(False)
         self._save_current_video_progress(force=True)
@@ -2771,10 +3021,11 @@ class MainWindow(QMainWindow):
         self._pause_other_if_auto("music")
         self._active_deck = "music"
         eff_start = max(0.0, float(start_pos))
+        same_item = self._music_item is item
         self._music_item = item
         self._music_pos = eff_start
         self._music_dur = max(
-            self._music_dur if item is self._music_item else 0.0,
+            self._music_dur if same_item else 0.0,
             float(item.duration_sec or 0),
         )
         self.db.record_play(item)
@@ -2916,6 +3167,8 @@ class MainWindow(QMainWindow):
             self.persist_session_state(force=True)
         else:
             self.video_panel.set_status("Directo finalizado o desconectado")
+        if self.video_player.is_loaded:
+            self._video_idle_unload_timer.start(20_000)
         self.video_panel.set_paused(True)
         self.fs_overlay.set_paused(True)
         self._sync_bottom_bar()
@@ -2940,11 +3193,13 @@ class MainWindow(QMainWindow):
         self._video_pos = pos
         if self._video_item is not None and self._video_item.kind == "twitch":
             return
-        self.video_panel.set_position(pos)
-        self.fs_overlay.set_position(pos)
-        if self._get_bottom_bar_deck() == "video":
+        if self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER and not self._is_fullscreen:
+            self.video_panel.set_position(pos)
+        if self._is_fullscreen and self.fs_overlay.isVisible():
+            self.fs_overlay.set_position(pos)
+        if self.bottom_bar.isVisible() and self._get_bottom_bar_deck() == "video":
             self._update_bb_position(pos, self._video_dur)
-        if self._get_minibar_deck() == "video":
+        if self.mini_bar.isVisible() and self._get_minibar_deck() == "video":
             self.mini_bar.set_position(pos)
         self._save_current_video_progress(force=False)
         self.persist_session_state(force=False)
@@ -2984,8 +3239,12 @@ class MainWindow(QMainWindow):
             if self._video_item is not None and self._video_item.kind != "twitch":
                 self._save_current_video_progress(force=True)
                 self.persist_session_state(force=True)
-            if self.stack.currentIndex() != self.PAGE_VIDEO_PLAYER and self.video_player.is_loaded:
-                self._video_idle_unload_timer.start()
+            if self.video_player.is_loaded:
+                self._video_idle_unload_timer.start(
+                    90_000
+                    if self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER
+                    else 20_000
+                )
         self._sync_bottom_bar()
         self._sync_mini_bar()
 
@@ -2994,9 +3253,9 @@ class MainWindow(QMainWindow):
 
     def _on_music_pos_changed(self, pos: float) -> None:
         self._music_pos = pos
-        if self._get_bottom_bar_deck() == "music":
+        if self.bottom_bar.isVisible() and self._get_bottom_bar_deck() == "music":
             self._update_bb_position(pos, self._music_dur)
-        if self._get_minibar_deck() == "music":
+        if self.mini_bar.isVisible() and self._get_minibar_deck() == "music":
             self.mini_bar.set_position(pos)
         self.persist_session_state(force=False)
 
@@ -3136,6 +3395,8 @@ class MainWindow(QMainWindow):
 
     def _on_video_mouse_moved(self) -> None:
         if self._is_fullscreen:
+            if self._video_item is not None and self._video_item.kind != "twitch":
+                self.fs_overlay.set_position(self._video_pos)
             scr = self.screen() or QApplication.primaryScreen()
             rect = scr.geometry() if scr else self.geometry()
             self.fs_overlay.reveal(rect)
@@ -3448,8 +3709,7 @@ class MainWindow(QMainWindow):
     def _update_bottom_bar_visibility(self) -> None:
         # Fija siempre mientras haya reproducción/contenido, excepto en video fullscreen o dentro del reproductor de video
         if self._is_fullscreen:
-            if self._bottom_bar_anim is not None:
-                self._bottom_bar_anim.stop()
+            self._bottom_bar_anim.stop()
             self._bottom_bar_hiding = False
             self.bottom_bar.setFixedHeight(74)
             self.bottom_bar.setVisible(False)
@@ -3459,35 +3719,25 @@ class MainWindow(QMainWindow):
         should_show = has_any and not on_video_player
         was_visible = self.bottom_bar.isVisible()
         if should_show and (not was_visible or self._bottom_bar_hiding):
-            if self._bottom_bar_anim is not None:
-                self._bottom_bar_anim.stop()
+            self._bottom_bar_anim.stop()
             self._bottom_bar_hiding = False
             cur_h = self.bottom_bar.height() if was_visible else 0
             self.bottom_bar.setMinimumHeight(0)
             self.bottom_bar.setMaximumHeight(cur_h)
             self.bottom_bar.setVisible(True)
-            anim = QPropertyAnimation(self.bottom_bar, b"maximumHeight", self)
-            anim.setDuration(max(70, int(180 * (1.0 - cur_h / 74.0))))
-            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.setStartValue(cur_h)
-            anim.setEndValue(74)
-            anim.finished.connect(self._on_bottom_bar_anim_finished)
-            self._bottom_bar_anim = anim
-            anim.start()
+            self._bottom_bar_anim.setDuration(max(70, int(180 * (1.0 - cur_h / 74.0))))
+            self._bottom_bar_anim.setStartValue(cur_h)
+            self._bottom_bar_anim.setEndValue(74)
+            self._bottom_bar_anim.start()
         elif not should_show and was_visible and not self._bottom_bar_hiding:
-            if self._bottom_bar_anim is not None:
-                self._bottom_bar_anim.stop()
+            self._bottom_bar_anim.stop()
             self._bottom_bar_hiding = True
             cur_h = max(0, min(74, self.bottom_bar.height()))
             self.bottom_bar.setMinimumHeight(0)
-            anim = QPropertyAnimation(self.bottom_bar, b"maximumHeight", self)
-            anim.setDuration(max(60, int(160 * (cur_h / 74.0))))
-            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.setStartValue(cur_h)
-            anim.setEndValue(0)
-            anim.finished.connect(self._on_bottom_bar_anim_finished)
-            self._bottom_bar_anim = anim
-            anim.start()
+            self._bottom_bar_anim.setDuration(max(60, int(160 * (cur_h / 74.0))))
+            self._bottom_bar_anim.setStartValue(cur_h)
+            self._bottom_bar_anim.setEndValue(0)
+            self._bottom_bar_anim.start()
 
     def _on_bottom_bar_anim_finished(self) -> None:
         if self._bottom_bar_hiding:
@@ -3509,35 +3759,26 @@ class MainWindow(QMainWindow):
             self._refresh_sidebar_toggle_ui()
             return
         self._sidebar_hidden = not self._sidebar_hidden
-        if self._sidebar_anim is not None:
-            self._sidebar_anim.stop()
+        self._sidebar_anim.stop()
         if self._sidebar_hidden:
             self._sidebar_hiding = True
             cur_w = self.sidebar.width() if self.sidebar.isVisible() else 220
             self.sidebar.setMinimumWidth(0)
             self.sidebar.setMaximumWidth(cur_w)
-            anim = QPropertyAnimation(self.sidebar, b"maximumWidth", self)
-            anim.setDuration(160)
-            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.setStartValue(cur_w)
-            anim.setEndValue(0)
-            anim.finished.connect(self._on_sidebar_anim_finished)
-            self._sidebar_anim = anim
-            anim.start()
+            self._sidebar_anim.setDuration(160)
+            self._sidebar_anim.setStartValue(cur_w)
+            self._sidebar_anim.setEndValue(0)
+            self._sidebar_anim.start()
         else:
             self._sidebar_hiding = False
             cur_w = self.sidebar.width() if self.sidebar.isVisible() else 0
             self.sidebar.setMinimumWidth(0)
             self.sidebar.setMaximumWidth(cur_w)
             self.sidebar.setVisible(True)
-            anim = QPropertyAnimation(self.sidebar, b"maximumWidth", self)
-            anim.setDuration(170)
-            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.setStartValue(cur_w)
-            anim.setEndValue(220)
-            anim.finished.connect(self._on_sidebar_anim_finished)
-            self._sidebar_anim = anim
-            anim.start()
+            self._sidebar_anim.setDuration(170)
+            self._sidebar_anim.setStartValue(cur_w)
+            self._sidebar_anim.setEndValue(220)
+            self._sidebar_anim.start()
         self._refresh_sidebar_toggle_ui()
 
     def _on_sidebar_anim_finished(self) -> None:
@@ -3577,19 +3818,20 @@ class MainWindow(QMainWindow):
                 self.normalGeometry() if self._pre_fs_was_maximized else self.geometry()
             )
             self._is_fullscreen = True
-            if self._sidebar_anim is not None:
-                self._sidebar_anim.stop()
+            self._sidebar_anim.stop()
             self.sidebar.setVisible(False)
             self.top_bar.setVisible(False)
             self.video_panel.set_fullscreen_state(True)
             self._update_bottom_bar_visibility()
             self.showFullScreen()
+            self.video_player.set_mouse_tracking(True)
             self.video_player.set_cursor_autohide(500)
             self._show_action_hud("fullscreen")
             QTimer.singleShot(50, self._on_video_mouse_moved)
         else:
             self._is_fullscreen = False
             self.fs_overlay.hide_immediately()
+            self.video_player.set_mouse_tracking(False)
             self.video_player.set_cursor_autohide("no")
             if self._pre_fs_was_maximized:
                 self.showMaximized()
@@ -3597,11 +3839,10 @@ class MainWindow(QMainWindow):
                 self.showNormal()
                 if self._pre_fs_geometry is not None and self._pre_fs_geometry.isValid():
                     self.setGeometry(self._pre_fs_geometry)
-            if self._sidebar_anim is not None:
-                self._sidebar_anim.stop()
+            self._sidebar_anim.stop()
             self.sidebar.setFixedWidth(220)
             self.sidebar.setVisible(not self._sidebar_hidden)
-            self.top_bar.setVisible(True)
+            self.top_bar.setVisible(self.stack.currentIndex() != self.PAGE_DISCORD)
             self.video_panel.set_fullscreen_state(False)
             self._update_bottom_bar_visibility()
             self._refresh_sidebar_toggle_ui()
@@ -3615,11 +3856,20 @@ class MainWindow(QMainWindow):
             if self._is_fullscreen:
                 self.toggle_fullscreen()
             self.hide()
-            if self._video_paused and self.video_player.is_loaded:
+            if self.video_player.is_loaded and (
+                self._video_paused or self.video_player.is_paused
+            ):
+                self._video_paused = True
                 self.video_player.unload()
-            if self._music_paused and self.music_player.is_loaded:
+            if self.music_player.is_loaded and (
+                self._music_paused or self.music_player.is_paused
+            ):
+                self._music_paused = True
                 self.music_player.unload()
             self.thumb_cache.trim(12)
+            QPixmapCache.clear()
+            self.yt.close_worker()
+            self.discord_service.stop_if_idle()
             trim_process_memory()
             self._sync_mini_bar()
             screen = QApplication.primaryScreen()
@@ -3645,13 +3895,37 @@ class MainWindow(QMainWindow):
         self.video_player.set_normalization(enabled)
         self.music_player.set_normalization(enabled)
 
-    def open_settings(self, account_tab: bool = False) -> None:
+    def open_settings(
+        self,
+        account_tab: bool = False,
+        discord_tab: bool = False,
+        discord_shortcuts_tab: bool = False,
+    ) -> None:
         dlg = SettingsDialog(self.cfg, self.yt, thumb_cache=self.thumb_cache, parent=self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         if account_tab:
             dlg.select_account_tab()
+        elif discord_shortcuts_tab:
+            dlg.select_discord_shortcuts_tab()
+        elif discord_tab:
+            dlg.select_discord_tab()
         dlg.normalization_changed.connect(self._on_normalization_changed)
         dlg.account_changed.connect(self._on_account_changed)
-        dlg.exec()
+        dlg.discord_token_changed.connect(self._on_discord_token_changed)
+        dlg.hotkey_recording_changed.connect(self._media_filter.set_suspended)
+        dlg.discord_hotkeys_changed.connect(
+            lambda d=dlg: d.update_discord_hotkey_statuses(self._apply_discord_hotkeys())
+        )
+        dlg.update_discord_hotkey_statuses(self._apply_discord_hotkeys())
+        dlg.trim_memory_requested.connect(self.free_memory_now)
+        try:
+            dlg.exec()
+        finally:
+            self._media_filter.set_suspended(False)
+            try:
+                dlg.deleteLater()
+            except RuntimeError:
+                pass
         trim_process_memory()
 
     # ------------------------------------------------------------------
@@ -3692,19 +3966,32 @@ class MainWindow(QMainWindow):
         self._task_seq += 1
         tid = self._task_seq
         task = _AsyncTask(tid, fn)
-        self._inflight[tid] = task.signals
+        sig = task.signals
+        self._inflight[tid] = sig
 
-        def _cleanup_done(task_id: int, result: object) -> None:
+        def _cleanup_done(task_id: int, result: object, s: _TaskSignals = sig) -> None:
             self._inflight.pop(task_id, None)
-            on_done(result)
+            try:
+                on_done(result)
+            finally:
+                try:
+                    s.deleteLater()
+                except RuntimeError:
+                    pass
 
-        def _cleanup_err(task_id: int, msg: str) -> None:
+        def _cleanup_err(task_id: int, msg: str, s: _TaskSignals = sig) -> None:
             self._inflight.pop(task_id, None)
-            if on_error:
-                on_error(msg)
+            try:
+                if on_error:
+                    on_error(msg)
+            finally:
+                try:
+                    s.deleteLater()
+                except RuntimeError:
+                    pass
 
-        task.signals.done.connect(_cleanup_done)
-        task.signals.error.connect(_cleanup_err)
+        sig.done.connect(_cleanup_done)
+        sig.error.connect(_cleanup_err)
         self.pool.start(task)
 
     def show_toast(self, message: str, duration_ms: int = 3500) -> None:
@@ -3736,12 +4023,22 @@ class MainWindow(QMainWindow):
             if self._is_fullscreen:
                 self.toggle_fullscreen()
             self.hide()
-            if self._video_paused and self.video_player.is_loaded:
+            if self.video_player.is_loaded and (
+                self._video_paused or self.video_player.is_paused
+            ):
+                self._video_paused = True
                 self.video_player.unload()
-            if self._music_paused and self.music_player.is_loaded:
+            if self.music_player.is_loaded and (
+                self._music_paused or self.music_player.is_paused
+            ):
+                self._music_paused = True
                 self.music_player.unload()
             self.thumb_cache.trim(12)
+            QPixmapCache.clear()
+            self.yt.close_worker()
+            self.discord_service.stop_if_idle()
             trim_process_memory()
+            self._log_ram_sample("minimize_to_tray")
             if not self._tray_notified:
                 self._tray_notified = True
                 self.tray_icon.showMessage(
@@ -3765,6 +4062,10 @@ class MainWindow(QMainWindow):
         if self._cleaned_up:
             return
         self._cleaned_up = True
+        try:
+            self._ram_log_timer.stop()
+        except Exception:
+            pass
         try:
             self._save_current_video_progress(force=True)
         except Exception:
@@ -3808,6 +4109,30 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
+            self.pool.clear()
+        except Exception:
+            pass
+        try:
+            self.thumb_cache.shutdown()
+        except Exception:
+            pass
+        try:
+            self.yt.close()
+        except Exception:
+            pass
+        try:
+            self.twitch.close()
+        except Exception:
+            pass
+        try:
+            self.discord_service.close()
+        except Exception:
+            pass
+        try:
+            QPixmapCache.clear()
+        except Exception:
+            pass
+        try:
             self.video_player.shutdown()
         except Exception:
             pass
@@ -3819,3 +4144,4 @@ class MainWindow(QMainWindow):
             self.db.close()
         except Exception:
             pass
+        self._log_ram_sample("shutdown")

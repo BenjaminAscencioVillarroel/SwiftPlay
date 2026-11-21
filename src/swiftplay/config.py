@@ -11,6 +11,13 @@ from swiftplay.paths import CONFIG_PATH
 VALID_SPEEDS: tuple[float, ...] = (1.0, 1.5, 2.0, 2.5)
 VALID_QUALITIES: tuple[str, ...] = ("360p", "480p", "720p", "1080p")
 VALID_THEMES: tuple[str, ...] = ("matte_silver",)
+VALID_DISCORD_NS: tuple[str, ...] = ("off", "webrtc", "ai", "ai_max")
+LEGACY_DISCORD_NS_MAP: dict[str, str] = {
+    "low": "webrtc",
+    "moderate": "webrtc",
+    "high": "ai",
+    "max": "ai_max",
+}
 
 
 def _default_music_dir() -> str:
@@ -56,6 +63,17 @@ class AppConfig:
     music_download_dir: str = ""
     video_download_dir: str = ""
     mini_bar_always_on_top: bool = True
+    discord_input_device: str = ""
+    discord_output_device: str = ""
+    discord_output_volume: int = 100
+    discord_mic_gain: int = 100
+    discord_vad_threshold: int = 18
+    discord_mic_agc: bool = True
+    discord_noise_suppression: str = "ai"
+    discord_hotkey_mute: str = "Ctrl+Shift+M"
+    discord_hotkey_deafen: str = "Ctrl+Shift+D"
+    discord_hotkey_hangup: str = "Ctrl+Shift+H"
+    discord_hotkey_mute_priority: bool = True
 
     def __post_init__(self) -> None:
         self.theme = validate_theme(self.theme)
@@ -75,6 +93,19 @@ class AppConfig:
         if not self.video_download_dir:
             self.video_download_dir = _default_video_dir()
         self.mini_bar_always_on_top = bool(self.mini_bar_always_on_top)
+        self.discord_input_device = str(self.discord_input_device or "").strip()
+        self.discord_output_device = str(self.discord_output_device or "").strip()
+        self.discord_output_volume = max(0, min(200, int(self.discord_output_volume)))
+        self.discord_mic_gain = max(0, min(400, int(self.discord_mic_gain)))
+        self.discord_vad_threshold = max(0, min(100, int(self.discord_vad_threshold)))
+        self.discord_mic_agc = bool(self.discord_mic_agc)
+        ns = str(self.discord_noise_suppression or "ai").strip().lower()
+        ns = LEGACY_DISCORD_NS_MAP.get(ns, ns)
+        self.discord_noise_suppression = ns if ns in VALID_DISCORD_NS else "ai"
+        self.discord_hotkey_mute = str(self.discord_hotkey_mute or "").strip()
+        self.discord_hotkey_deafen = str(self.discord_hotkey_deafen or "").strip()
+        self.discord_hotkey_hangup = str(self.discord_hotkey_hangup or "").strip()
+        self.discord_hotkey_mute_priority = bool(self.discord_hotkey_mute_priority)
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QPixmap
+from PySide6.QtGui import QCloseEvent, QFocusEvent, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -26,17 +28,23 @@ from PySide6.QtWidgets import (
 
 from swiftplay.browser_auth import login_with_browser
 from swiftplay.config import AppConfig, save_config
+from swiftplay.media_keys import parse_hotkey_string
+from swiftplay.paths import RAM_LOG_PATH
+from swiftplay.ram_logger import RamLogger
 from swiftplay.security import (
     clear_credentials,
+    clear_discord_token,
+    has_discord_token,
     has_saved_session,
     load_account_profile,
     save_cookies_encrypted,
+    save_discord_token_encrypted,
 )
 from swiftplay.themes import apply_windows_dark_titlebar, get_theme
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
 from swiftplay.windows_os import (
-    get_process_ram_mb,
+    get_process_memory_mb,
     is_startup_enabled,
     open_folder_in_explorer,
     set_startup_enabled,
@@ -88,12 +96,141 @@ class _BrowserLoginTask(QRunnable):
             self.signals.finished.emit(False, str(exc))
 
 
+_QT_SPECIAL_KEY_MAP: dict[int, str] = {
+    int(Qt.Key.Key_Space): "Space",
+    int(Qt.Key.Key_Pause): "Pause",
+    int(Qt.Key.Key_Insert): "Insert",
+    int(Qt.Key.Key_Delete): "Delete",
+    int(Qt.Key.Key_Home): "Home",
+    int(Qt.Key.Key_End): "End",
+    int(Qt.Key.Key_PageUp): "PageUp",
+    int(Qt.Key.Key_PageDown): "PageDown",
+    int(Qt.Key.Key_ScrollLock): "ScrollLock",
+    int(Qt.Key.Key_Print): "PrintScreen",
+    int(Qt.Key.Key_Up): "Up",
+    int(Qt.Key.Key_Down): "Down",
+    int(Qt.Key.Key_Left): "Left",
+    int(Qt.Key.Key_Right): "Right",
+    int(Qt.Key.Key_Minus): "-",
+    int(Qt.Key.Key_Equal): "=",
+    int(Qt.Key.Key_BracketLeft): "[",
+    int(Qt.Key.Key_BracketRight): "]",
+    int(Qt.Key.Key_Semicolon): ";",
+    int(Qt.Key.Key_Apostrophe): "'",
+    int(Qt.Key.Key_Comma): ",",
+    int(Qt.Key.Key_Period): ".",
+    int(Qt.Key.Key_Slash): "/",
+    int(Qt.Key.Key_QuoteLeft): "`",
+    int(Qt.Key.Key_Backslash): "\\",
+    int(Qt.Key.Key_Asterisk): "Numpad*",
+    int(Qt.Key.Key_Plus): "Numpad+",
+}
+
+
+def _qt_key_to_token(key: int, modifiers: Qt.KeyboardModifier) -> str:
+    if int(Qt.Key.Key_A) <= key <= int(Qt.Key.Key_Z):
+        return chr(key)
+    if int(Qt.Key.Key_0) <= key <= int(Qt.Key.Key_9):
+        if modifiers & Qt.KeyboardModifier.KeypadModifier:
+            return f"Numpad{chr(key)}"
+        return chr(key)
+    if int(Qt.Key.Key_F1) <= key <= int(Qt.Key.Key_F24):
+        return f"F{key - int(Qt.Key.Key_F1) + 1}"
+    return _QT_SPECIAL_KEY_MAP.get(key, "")
+
+
+class _HotkeyCaptureEdit(QLineEdit):
+    """Campo de captura interactiva para grabar atajos globales sin interferencia."""
+
+    hotkey_changed = Signal(str)
+    recording_changed = Signal(bool)
+    invalid_hotkey = Signal(str)
+
+    def __init__(self, initial: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(initial, parent)
+        self.setReadOnly(True)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setPlaceholderText("Sin asignar (haz clic y pulsa teclas)")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def focusInEvent(self, event: QFocusEvent) -> None:
+        self.recording_changed.emit(True)
+        self.setPlaceholderText("Pulsa la combinación ahora... (Esc cancela)")
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event: QFocusEvent) -> None:
+        self.recording_changed.emit(False)
+        self.setPlaceholderText("Sin asignar (haz clic y pulsa teclas)")
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        key = int(event.key())
+        if key in (
+            int(Qt.Key.Key_Control),
+            int(Qt.Key.Key_Shift),
+            int(Qt.Key.Key_Alt),
+            int(Qt.Key.Key_AltGr),
+            int(Qt.Key.Key_Meta),
+            int(Qt.Key.Key_Super_L),
+            int(Qt.Key.Key_Super_R),
+            int(Qt.Key.Key_unknown),
+        ):
+            event.accept()
+            return
+
+        mods = event.modifiers()
+        clean_mods = mods & (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.ShiftModifier
+            | Qt.KeyboardModifier.MetaModifier
+        )
+        if key == int(Qt.Key.Key_Escape) and clean_mods == Qt.KeyboardModifier.NoModifier:
+            self.clearFocus()
+            event.accept()
+            return
+
+        token = _qt_key_to_token(key, mods)
+        if not token:
+            self.invalid_hotkey.emit("Tecla no soportada para atajo global.")
+            event.accept()
+            return
+
+        parts: list[str] = []
+        if clean_mods & Qt.KeyboardModifier.ControlModifier:
+            parts.append("Ctrl")
+        if clean_mods & Qt.KeyboardModifier.AltModifier:
+            parts.append("Alt")
+        if clean_mods & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("Shift")
+        if clean_mods & Qt.KeyboardModifier.MetaModifier:
+            parts.append("Win")
+        parts.append(token)
+        combo = "+".join(parts)
+
+        if parse_hotkey_string(combo) is None:
+            self.invalid_hotkey.emit(
+                "Usa Ctrl/Alt/Shift + tecla, o una tecla especial (F1–F24, Pause, etc.)."
+            )
+            event.accept()
+            return
+
+        self.setText(combo)
+        self.hotkey_changed.emit(combo)
+        self.clearFocus()
+        event.accept()
+
+
 class SettingsDialog(QDialog):
     """Ventana de configuración de SwiftPlay."""
 
     normalization_changed = Signal(bool)
     config_updated = Signal()
     account_changed = Signal()
+    discord_token_changed = Signal()
+    discord_hotkeys_changed = Signal()
+    hotkey_recording_changed = Signal(bool)
+    trim_memory_requested = Signal()
 
     def __init__(
         self,
@@ -123,6 +260,8 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._build_playback_downloads_tab(), "Reproducción y Descargas")
         self.tabs.addTab(self._build_account_tab(), "Cuenta (DPAPI)")
         self.tabs.addTab(self._build_system_tab(), "Sistema")
+        self.tabs.addTab(self._build_discord_tab(), "Discord (DPAPI)")
+        self.tabs.addTab(self._build_discord_shortcuts_tab(), "Atajos Discord")
         root.addWidget(self.tabs, 1)
 
         bottom = QHBoxLayout()
@@ -146,6 +285,12 @@ class SettingsDialog(QDialog):
 
     def select_account_tab(self) -> None:
         self.tabs.setCurrentIndex(1)
+
+    def select_discord_tab(self) -> None:
+        self.tabs.setCurrentIndex(3)
+
+    def select_discord_shortcuts_tab(self) -> None:
+        self.tabs.setCurrentIndex(4)
 
     # --- Tab 1: Reproducción y Descargas ---
 
@@ -502,11 +647,25 @@ class SettingsDialog(QDialog):
         ram_box.setObjectName("MediaCard")
         ram_lay = QHBoxLayout(ram_box)
         ram_lay.setContentsMargins(12, 10, 12, 10)
-        self.ram_lbl = QLabel("Uso de RAM actual: -- MB")
+        self.ram_lbl = QLabel("RAM activa: -- MB  ·  Privada: -- MB")
         self.ram_lbl.setStyleSheet("font-size: 14px; font-weight: 600;")
         ram_lay.addWidget(self.ram_lbl)
         ram_lay.addStretch()
+        self.open_ram_log_btn = QPushButton("Abrir log de RAM")
+        self.open_ram_log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.open_ram_log_btn.setToolTip(f"Abrir {RAM_LOG_PATH}")
+        self.open_ram_log_btn.clicked.connect(self._on_open_ram_log_clicked)
+        ram_lay.addWidget(self.open_ram_log_btn)
+        self.trim_ram_btn = QPushButton("Liberar memoria")
+        self.trim_ram_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.trim_ram_btn.clicked.connect(self._on_trim_memory_clicked)
+        ram_lay.addWidget(self.trim_ram_btn)
         lay.addWidget(ram_box)
+
+        ram_path_lbl = QLabel(f"Registro histórico de RAM: {RAM_LOG_PATH}")
+        ram_path_lbl.setObjectName("MutedLabel")
+        ram_path_lbl.setWordWrap(True)
+        lay.addWidget(ram_path_lbl)
 
         motor_row = QHBoxLayout()
         try:
@@ -531,6 +690,266 @@ class SettingsDialog(QDialog):
         lay.addStretch()
         return w
 
+    # --- Tab 4: Discord (DPAPI) ---
+
+    def _build_discord_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+
+        card = QFrame()
+        card.setObjectName("MediaCard")
+        c_lay = QVBoxLayout(card)
+        c_lay.setContentsMargins(14, 12, 14, 12)
+        c_lay.setSpacing(4)
+        title = QLabel("Bot Token oficial de Discord (Cifrado Windows DPAPI)")
+        title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        c_lay.addWidget(title)
+        self.discord_status_lbl = QLabel("")
+        self.discord_status_lbl.setObjectName("MutedLabel")
+        self.discord_status_lbl.setWordWrap(True)
+        c_lay.addWidget(self.discord_status_lbl)
+        lay.addWidget(card)
+
+        tok_row = QHBoxLayout()
+        tok_row.setSpacing(8)
+        self.discord_token_edit = QLineEdit()
+        self.discord_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.discord_token_edit.setPlaceholderText("Pega aquí tu Discord Bot Token...")
+        tok_row.addWidget(self.discord_token_edit, 1)
+
+        self.discord_show_btn = QPushButton("Mostrar")
+        self.discord_show_btn.setCheckable(True)
+        self.discord_show_btn.toggled.connect(
+            lambda checked: self.discord_token_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        tok_row.addWidget(self.discord_show_btn)
+        lay.addLayout(tok_row)
+
+        act_row = QHBoxLayout()
+        act_row.setSpacing(8)
+        save_btn = QPushButton("Cifrar y guardar token")
+        save_btn.setObjectName("AccentBtn")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.clicked.connect(self._on_save_discord_token)
+        act_row.addWidget(save_btn)
+
+        self.discord_clear_btn = QPushButton("Borrar token")
+        self.discord_clear_btn.setObjectName("DangerBtn")
+        self.discord_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_clear_btn.clicked.connect(self._on_clear_discord_token)
+        act_row.addWidget(self.discord_clear_btn)
+        act_row.addStretch()
+        lay.addLayout(act_row)
+
+        guide = QLabel(
+            "Guía rápida de creación e invitación:\n"
+            "• Ve a https://discord.com/developers/applications → New Application → Bot → Reset Token.\n"
+            "• Para voz básica no necesitas Intents; si quieres estados en vivo y leer chat/DMs, activa "
+            "Presence Intent, Server Members Intent y Message Content Intent en la pestaña Bot.\n"
+            "• En OAuth2 → URL Generator selecciona scope 'bot' y permisos: View Channels, Connect, Speak "
+            "(y Read Message History + Send Messages para canales de texto).\n"
+            "• Abre la URL generada e invita el bot a tu servidor. El token se guarda cifrado con DPAPI ligado a tu usuario de Windows."
+        )
+        guide.setObjectName("MutedLabel")
+        guide.setWordWrap(True)
+        lay.addWidget(guide)
+
+        self.discord_feedback_lbl = QLabel("")
+        self.discord_feedback_lbl.setObjectName("MutedLabel")
+        self.discord_feedback_lbl.setWordWrap(True)
+        lay.addWidget(self.discord_feedback_lbl)
+
+        lay.addStretch()
+        self._refresh_discord_status()
+        return w
+
+    # --- Tab 5: Atajos Discord ---
+
+    def _build_discord_shortcuts_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+
+        card = QFrame()
+        card.setObjectName("MediaCard")
+        c_lay = QVBoxLayout(card)
+        c_lay.setContentsMargins(14, 12, 14, 12)
+        c_lay.setSpacing(6)
+        title = QLabel("Atajos globales de Discord (funcionan en cualquier ventana o juego)")
+        title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        c_lay.addWidget(title)
+        desc = QLabel(
+            "Haz clic en un campo y pulsa la combinación deseada (ej. Ctrl+Shift+M, Alt+M o F9). "
+            "La opción prioritaria intercepta el atajo a nivel de teclado en Windows para no fallar al cambiar de pestaña o ventana."
+        )
+        desc.setObjectName("MutedLabel")
+        desc.setWordWrap(True)
+        c_lay.addWidget(desc)
+
+        self.hotkey_mute_prio_check = QCheckBox(
+            "Prioridad máxima global para silenciar micrófono (siempre activo sobre otras apps y pestañas)"
+        )
+        self.hotkey_mute_prio_check.setChecked(self.cfg.discord_hotkey_mute_priority)
+        self.hotkey_mute_prio_check.toggled.connect(self._on_mute_priority_toggled)
+        c_lay.addWidget(self.hotkey_mute_prio_check)
+        lay.addWidget(card)
+
+        self._hk_edits: dict[str, _HotkeyCaptureEdit] = {}
+        self._hk_status_labels: dict[str, QLabel] = {}
+
+        rows_spec = (
+            ("mute", "Silenciar / Activar micrófono (Prioritario)", "discord_hotkey_mute"),
+            ("deafen", "Ensordecer / Activar audio Discord", "discord_hotkey_deafen"),
+            ("hangup", "Colgar / Salir del canal de voz", "discord_hotkey_hangup"),
+        )
+        form_card = QFrame()
+        form_card.setObjectName("MediaCard")
+        form_lay = QVBoxLayout(form_card)
+        form_lay.setContentsMargins(14, 12, 14, 12)
+        form_lay.setSpacing(10)
+
+        for key, label_txt, attr in rows_spec:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            lbl = QLabel(label_txt)
+            lbl.setMinimumWidth(235)
+            row.addWidget(lbl)
+
+            edit = _HotkeyCaptureEdit(getattr(self.cfg, attr, ""))
+            edit.setFixedWidth(165)
+            edit.recording_changed.connect(self.hotkey_recording_changed.emit)
+            edit.hotkey_changed.connect(lambda val, k=key, a=attr: self._on_hotkey_edited(k, a, val))
+            edit.invalid_hotkey.connect(self._on_hotkey_invalid)
+            row.addWidget(edit)
+
+            clr_btn = QPushButton("Limpiar")
+            clr_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            clr_btn.clicked.connect(lambda _c=False, k=key, a=attr, e=edit: self._clear_hotkey(k, a, e))
+            row.addWidget(clr_btn)
+
+            st_lbl = QLabel("")
+            st_lbl.setObjectName("MutedLabel")
+            st_lbl.setMinimumWidth(120)
+            row.addWidget(st_lbl, 1)
+
+            self._hk_edits[key] = edit
+            self._hk_status_labels[key] = st_lbl
+            form_lay.addLayout(row)
+
+        lay.addWidget(form_card)
+
+        bottom_row = QHBoxLayout()
+        reset_btn = QPushButton("Restablecer predeterminados")
+        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_btn.clicked.connect(self._on_reset_hotkeys)
+        bottom_row.addWidget(reset_btn)
+        bottom_row.addStretch()
+        lay.addLayout(bottom_row)
+
+        self.hotkey_feedback_lbl = QLabel("")
+        self.hotkey_feedback_lbl.setObjectName("MutedLabel")
+        self.hotkey_feedback_lbl.setWordWrap(True)
+        lay.addWidget(self.hotkey_feedback_lbl)
+        lay.addStretch()
+        return w
+
+    def _on_mute_priority_toggled(self, checked: bool) -> None:
+        self.cfg.discord_hotkey_mute_priority = bool(checked)
+        save_config(self.cfg)
+        self.discord_hotkeys_changed.emit()
+
+    def _on_hotkey_edited(self, _key: str, attr: str, value: str) -> None:
+        setattr(self.cfg, attr, str(value or "").strip())
+        save_config(self.cfg)
+        self.hotkey_feedback_lbl.setText(f"Atajo actualizado: {value}")
+        self.hotkey_feedback_lbl.setStyleSheet("")
+        self.discord_hotkeys_changed.emit()
+
+    def _clear_hotkey(self, _key: str, attr: str, edit: _HotkeyCaptureEdit) -> None:
+        edit.setText("")
+        setattr(self.cfg, attr, "")
+        save_config(self.cfg)
+        self.hotkey_feedback_lbl.setText("Atajo desactivado.")
+        self.hotkey_feedback_lbl.setStyleSheet("")
+        self.discord_hotkeys_changed.emit()
+
+    def _on_hotkey_invalid(self, msg: str) -> None:
+        self.hotkey_feedback_lbl.setText(msg)
+        self.hotkey_feedback_lbl.setStyleSheet("color: #FBBF24;")
+
+    def _on_reset_hotkeys(self) -> None:
+        defaults = {
+            "mute": ("discord_hotkey_mute", "Ctrl+Shift+M"),
+            "deafen": ("discord_hotkey_deafen", "Ctrl+Shift+D"),
+            "hangup": ("discord_hotkey_hangup", "Ctrl+Shift+H"),
+        }
+        for key, (attr, val) in defaults.items():
+            setattr(self.cfg, attr, val)
+            if key in self._hk_edits:
+                self._hk_edits[key].setText(val)
+        self.cfg.discord_hotkey_mute_priority = True
+        self.hotkey_mute_prio_check.blockSignals(True)
+        self.hotkey_mute_prio_check.setChecked(True)
+        self.hotkey_mute_prio_check.blockSignals(False)
+        save_config(self.cfg)
+        self.hotkey_feedback_lbl.setText("Atajos restablecidos a los valores predeterminados.")
+        self.hotkey_feedback_lbl.setStyleSheet("")
+        self.discord_hotkeys_changed.emit()
+
+    def update_discord_hotkey_statuses(self, statuses: dict[str, str]) -> None:
+        labels = {
+            "global_hook": ("Activo · Prioridad máxima", "color: #4ADE80; font-weight: 600;"),
+            "global_os": ("Activo · Global", "color: #93C5FD; font-weight: 600;"),
+            "disabled": ("Desactivado", ""),
+            "conflict": ("Conflicto con otra app", "color: #F87171;"),
+            "invalid": ("Tecla inválida", "color: #FBBF24;"),
+        }
+        for key, st_lbl in self._hk_status_labels.items():
+            raw_st = str(statuses.get(key) or "disabled")
+            txt, css = labels.get(raw_st, (raw_st, ""))
+            st_lbl.setText(txt)
+            st_lbl.setStyleSheet(css)
+
+    def _refresh_discord_status(self) -> None:
+        has_tok = has_discord_token()
+        self.discord_clear_btn.setEnabled(has_tok)
+        if has_tok:
+            self.discord_status_lbl.setText(
+                "Token guardado y cifrado localmente con Windows DPAPI (discord_token.dpapi)."
+            )
+        else:
+            self.discord_status_lbl.setText(
+                "No hay Bot Token configurado. Pega uno abajo para habilitar Discord Voz."
+            )
+
+    def _on_save_discord_token(self) -> None:
+        raw = self.discord_token_edit.text()
+        try:
+            save_discord_token_encrypted(raw)
+        except Exception as exc:
+            QMessageBox.warning(self, "Token inválido", str(exc))
+            return
+        self.discord_token_edit.clear()
+        self._refresh_discord_status()
+        self.discord_feedback_lbl.setText(
+            "Bot Token cifrado y guardado con Windows DPAPI correctamente."
+        )
+        self.discord_token_changed.emit()
+
+    def _on_clear_discord_token(self) -> None:
+        clear_discord_token()
+        self.discord_token_edit.clear()
+        self._refresh_discord_status()
+        self.discord_feedback_lbl.setText(
+            "Bot Token sobrescrito y eliminado por completo de tu PC."
+        )
+        self.discord_token_changed.emit()
+
     def _on_startup_toggled(self, checked: bool) -> None:
         try:
             set_startup_enabled(checked)
@@ -543,9 +962,27 @@ class SettingsDialog(QDialog):
         self.cfg.minimize_to_tray = checked
         save_config(self.cfg)
 
+    def _on_trim_memory_clicked(self) -> None:
+        self.trim_memory_requested.emit()
+        QTimer.singleShot(150, self._refresh_ram_label)
+
+    def _on_open_ram_log_clicked(self) -> None:
+        try:
+            if not RAM_LOG_PATH.exists():
+                ws, priv = get_process_memory_mb()
+                RamLogger(RAM_LOG_PATH).log_sample(
+                    "manual_open",
+                    gui_ws_mb=ws,
+                    gui_priv_mb=priv,
+                )
+            if sys.platform == "win32":
+                os.startfile(str(RAM_LOG_PATH))  # noqa: S606
+        except Exception as exc:
+            QMessageBox.warning(self, "Log de RAM", str(exc))
+
     def _refresh_ram_label(self) -> None:
-        mb = get_process_ram_mb()
-        self.ram_lbl.setText(f"Uso de RAM actual: {mb:.1f} MB")
+        ws, priv = get_process_memory_mb()
+        self.ram_lbl.setText(f"RAM activa: {ws:.1f} MB  ·  Privada: {priv:.1f} MB")
 
     def _on_update_motor(self) -> None:
         self.update_motor_btn.setEnabled(False)
@@ -567,9 +1004,11 @@ class SettingsDialog(QDialog):
             )
 
     def _cleanup_dialog(self) -> None:
+        self.hotkey_recording_changed.emit(False)
         self._ram_timer.stop()
         if self._login_cancel is not None:
             self._login_cancel.set()
+        self._pool.clear()
         if self._thumb_cache is not None:
             try:
                 self._thumb_cache.ready.disconnect(self._on_avatar_ready)

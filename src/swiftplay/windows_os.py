@@ -392,10 +392,10 @@ class _PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
     ]
 
 
-def get_process_ram_mb() -> float:
-    """Devuelve el WorkingSetSize actual del proceso en MB."""
+def get_process_memory_mb() -> tuple[float, float]:
+    """Devuelve (WorkingSetSize_MB, PrivateUsage_MB) del proceso actual en Windows."""
     if sys.platform != "win32":
-        return 0.0
+        return 0.0, 0.0
     try:
         kernel32 = ctypes.windll.kernel32
         kernel32.GetCurrentProcess.restype = wintypes.HANDLE
@@ -413,10 +413,18 @@ def get_process_ram_mb() -> float:
         counters.cb = ctypes.sizeof(counters)
         h_proc = kernel32.GetCurrentProcess()
         if fn(h_proc, ctypes.byref(counters), counters.cb):
-            return counters.WorkingSetSize / (1024 * 1024)
+            return (
+                counters.WorkingSetSize / (1024 * 1024),
+                counters.PrivateUsage / (1024 * 1024),
+            )
     except Exception:
         pass
-    return 0.0
+    return 0.0, 0.0
+
+
+def get_process_ram_mb() -> float:
+    """Devuelve el WorkingSetSize actual del proceso en MB."""
+    return get_process_memory_mb()[0]
 
 
 def trim_process_memory() -> None:

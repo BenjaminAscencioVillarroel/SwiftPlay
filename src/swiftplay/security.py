@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from swiftplay.models import AccountProfile
-from swiftplay.paths import ACCOUNT_PROFILE_PATH, SESSION_PATH
+from swiftplay.paths import ACCOUNT_PROFILE_PATH, DISCORD_TOKEN_PATH, SESSION_PATH
 
 ALLOWED_COOKIE_DOMAINS: frozenset[str] = frozenset(
     {
@@ -258,3 +258,56 @@ def clear_account_profile(profile_path: Path = ACCOUNT_PROFILE_PATH) -> None:
         profile_path.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def normalize_discord_token(raw_token: str) -> str:
+    """Limpia espacios y prefijo 'Bot ' del token de bot oficial de Discord."""
+    token = (raw_token or "").strip()
+    if token[:4].lower() == "bot ":
+        token = token[4:].strip()
+    if not token or len(token) < 20 or any(ch.isspace() for ch in token):
+        raise ValueError(
+            "El token del bot no es válido. Pega el Bot Token completo del Discord Developer Portal."
+        )
+    return token
+
+
+def save_discord_token_encrypted(
+    raw_token: str, token_path: Path = DISCORD_TOKEN_PATH
+) -> None:
+    """Cifra el Discord Bot Token con Windows DPAPI y lo guarda atómicamente."""
+    token = normalize_discord_token(raw_token)
+    encrypted = _dpapi_protect(token.encode("utf-8"))
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = token_path.with_suffix(".dpapi.tmp")
+    tmp_path.write_bytes(encrypted)
+    tmp_path.replace(token_path)
+
+
+def load_discord_token_decrypted(token_path: Path = DISCORD_TOKEN_PATH) -> str | None:
+    """Descifra el Discord Bot Token almacenado con Windows DPAPI."""
+    if not token_path.exists():
+        return None
+    try:
+        blob = token_path.read_bytes()
+        if not blob:
+            return None
+        decrypted = _dpapi_unprotect(blob).decode("utf-8")
+        return normalize_discord_token(decrypted)
+    except Exception:
+        return None
+
+
+def has_discord_token(token_path: Path = DISCORD_TOKEN_PATH) -> bool:
+    return token_path.exists() and token_path.stat().st_size > 0
+
+
+def clear_discord_token(token_path: Path = DISCORD_TOKEN_PATH) -> None:
+    """Sobrescribe con ceros y elimina el Discord Bot Token cifrado."""
+    if token_path.exists():
+        try:
+            size = token_path.stat().st_size
+            if size > 0:
+                token_path.write_bytes(b"\x00" * size)
+        finally:
+            token_path.unlink(missing_ok=True)

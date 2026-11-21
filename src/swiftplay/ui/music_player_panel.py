@@ -308,20 +308,26 @@ class MusicNowPlayingPanel(QWidget):
         for row in self._queue_rows:
             row.set_playing_indicator(self._is_playing)
 
+    def clear_queue_widgets(self) -> None:
+        for i in reversed(range(self.queue_lay.count())):
+            item = self.queue_lay.itemAt(i)
+            w = item.widget() if item else None
+            if w is not None and w is not self.empty_lbl:
+                rel = getattr(w, "release_resources", None)
+                if callable(rel):
+                    rel()
+                w.hide()
+                self.queue_lay.removeWidget(w)
+                w.deleteLater()
+        self._queue_rows.clear()
+
     def render_queue(
         self,
         queue: list[MediaItem],
         current_index: int,
         is_saved_fn: Callable[[str], bool],
     ) -> None:
-        for i in reversed(range(self.queue_lay.count())):
-            item = self.queue_lay.itemAt(i)
-            w = item.widget() if item else None
-            if w is not None and w is not self.empty_lbl:
-                w.hide()
-                self.queue_lay.removeWidget(w)
-                w.deleteLater()
-        self._queue_rows.clear()
+        self.clear_queue_widgets()
 
         n = len(queue)
         self.empty_lbl.setVisible(n == 0)

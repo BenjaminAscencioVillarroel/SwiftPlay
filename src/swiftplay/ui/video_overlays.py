@@ -224,10 +224,12 @@ class PlaybackFeedbackHud(QWidget):
             painter.drawText(circle, Qt.AlignmentFlag.AlignCenter, self._text)
         else:
             ico_px = max(20, int(28 * scale))
-            pm = render_icon(self._icon_name, self._palette.text, ico_px).pixmap(
-                QSize(ico_px, ico_px)
+            pm = render_icon(self._icon_name, self._palette.text, 28).pixmap(QSize(56, 56))
+            painter.drawPixmap(
+                QRectF(cx - ico_px / 2.0, cy - ico_px / 2.0, float(ico_px), float(ico_px)),
+                pm,
+                QRectF(pm.rect()),
             )
-            painter.drawPixmap(int(cx - ico_px / 2.0), int(cy - ico_px / 2.0), pm)
 
         painter.end()
 

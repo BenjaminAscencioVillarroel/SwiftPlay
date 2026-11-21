@@ -1,4 +1,4 @@
-"""Wrapper sobre libmpv (python-mpv) dual (Video GPU o Solo-Audio ligero)."""
+"""Wrapper sobre libmpv (python-mpv) dual (Video GPU o Solo-Audio ligero) con import lazy y reciclaje."""
 
 from __future__ import annotations
 
@@ -7,19 +7,39 @@ import locale
 import os
 import sys
 import threading
+import time
+from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
 from swiftplay.config import VALID_SPEEDS, clamp_speed
 from swiftplay.paths import BIN_DIR
 
-if hasattr(os, "add_dll_directory") and BIN_DIR.exists():
-    os.add_dll_directory(str(BIN_DIR))
-os.environ["PATH"] = f"{BIN_DIR}{os.pathsep}{os.environ.get('PATH', '')}"
-
-import mpv  # noqa: E402
-
 NORMALIZATION_FILTER = "lavfi=[dynaudnorm=f=150:g=15:p=0.9]"
+
+_mpv_module: Any = None
+_mpv_import_lock = threading.Lock()
+
+
+def _get_mpv_module() -> Any:
+    global _mpv_module
+    if _mpv_module is not None:
+        return _mpv_module
+    with _mpv_import_lock:
+        if _mpv_module is not None:
+            return _mpv_module
+        if hasattr(os, "add_dll_directory") and BIN_DIR.exists():
+            os.add_dll_directory(str(BIN_DIR))
+        bin_str = str(BIN_DIR)
+        path_val = os.environ.get("PATH", "")
+        if bin_str not in path_val.split(os.pathsep):
+            os.environ["PATH"] = f"{bin_str}{os.pathsep}{path_val}"
+        # CRÍTICO en Windows en español: libmpv requiere LC_NUMERIC = "C"
+        locale.setlocale(locale.LC_NUMERIC, "C")
+        import mpv  # noqa: E402
+
+        _mpv_module = mpv
+        return _mpv_module
 
 
 def _is_shift_pressed() -> bool:
@@ -57,17 +77,26 @@ class MediaPlayer(QObject):
         super().__init__(parent)
         self._lock = threading.RLock()
         self._shutdown = False
+        self._unloading = False
         self._user_stopped = False
         self._has_media = False
+        self._is_live = False
+        self._last_was_live: bool | None = None
+        self._streams_played = 0
         self._loading_generation = 0
         self._wid = wid
         self._is_audio_only_instance = wid is None
+        self._recycle_after = 8 if self._is_audio_only_instance else 4
         self._volume = max(0, min(100, int(initial_volume)))
         self._speed = clamp_speed(initial_speed)
         self._normalization = bool(normalization)
+        self._track_mouse = False
         self._last_mouse_xy: tuple[int | None, int | None] | None = None
+        self._last_mouse_emit_ts = 0.0
+        self._last_pos_emit_ts = 0.0
+        self._last_pos_emit_val = -10.0
         self._applied_af: str | None = None
-        self._mpv: mpv.MPV | None = None
+        self._mpv: Any = None
 
         if not lazy:
             self._ensure_mpv()
@@ -82,18 +111,29 @@ class MediaPlayer(QObject):
         with self._lock:
             return self._mpv is not None and self._has_media
 
-    def _ensure_mpv(self) -> mpv.MPV | None:
+    @property
+    def is_paused(self) -> bool:
+        with self._lock:
+            if self._mpv is None:
+                return True
+            try:
+                return bool(self._mpv.pause)
+            except Exception:
+                return True
+
+    def _ensure_mpv(self) -> Any:
         with self._lock:
             if self._shutdown:
                 return None
             if self._mpv is not None:
                 return self._mpv
 
+            mpv_mod = _get_mpv_module()
             # CRÍTICO en Windows en español: libmpv requiere LC_NUMERIC = "C"
             locale.setlocale(locale.LC_NUMERIC, "C")
 
             target_af = NORMALIZATION_FILTER if self._normalization else ""
-            kwargs: dict = dict(
+            kwargs: dict[str, Any] = dict(
                 idle="yes",
                 keep_open="no",
                 osc=False,
@@ -105,30 +145,51 @@ class MediaPlayer(QObject):
                 audio_pitch_correction=True,
                 ytdl=False,
                 cache="yes",
-                cache_secs=6,
+                cache_secs=4,
                 cache_pause_initial="no",
-                vd_lavc_threads=4,
+                vd_lavc_threads=2,
                 demuxer_lavf_probesize=1048576,
                 demuxer_lavf_analyzeduration=0.5,
+                demuxer_donate_buffer="no",
+                demuxer_hysteresis_secs=0,
+                stream_buffer_size="128KiB",
+                audio_buffer=0.1,
+                demuxer_lavf_o=(
+                    "http_persistent=0,reconnect=1,reconnect_streamed=1,reconnect_delay_max=3"
+                ),
                 volume=self._volume,
                 speed=self._speed,
                 af=target_af,
             )
             if self._wid is not None:
                 kwargs["wid"] = str(int(self._wid))
-                kwargs["hwdec"] = "auto-safe"
                 kwargs["vo"] = "gpu"
+                kwargs["gpu_api"] = "d3d11"
                 kwargs["gpu_dumb_mode"] = "yes"
-                kwargs["demuxer_max_bytes"] = "8MiB"
-                kwargs["demuxer_max_back_bytes"] = "2MiB"
+                kwargs["hwdec"] = "d3d11va"
+                kwargs["swapchain_depth"] = 2
+                kwargs["gpu_shader_cache"] = "no"
+                kwargs["icc_cache"] = "no"
+                kwargs["demuxer_max_bytes"] = "6MiB"
+                kwargs["demuxer_max_back_bytes"] = "1MiB"
                 kwargs["cursor_autohide"] = "no"
             else:
                 kwargs["vo"] = "null"
                 kwargs["vid"] = "no"
                 kwargs["demuxer_max_bytes"] = "3MiB"
-                kwargs["demuxer_max_back_bytes"] = "1MiB"
+                kwargs["demuxer_max_back_bytes"] = "512KiB"
 
-            self._mpv = mpv.MPV(**kwargs)
+            try:
+                self._mpv = mpv_mod.MPV(**kwargs)
+            except Exception:
+                if self._wid is not None:
+                    fallback_kwargs = dict(kwargs)
+                    fallback_kwargs.pop("gpu_api", None)
+                    fallback_kwargs["hwdec"] = "auto-safe"
+                    self._mpv = mpv_mod.MPV(**fallback_kwargs)
+                else:
+                    raise
+
             self._applied_af = target_af
             self._register_observers()
             return self._mpv
@@ -140,27 +201,35 @@ class MediaPlayer(QObject):
 
         @player.property_observer("time-pos")
         def _on_time_pos(_name, value):
-            if not self._shutdown and value is not None:
-                self.position_changed.emit(float(value))
+            if self._shutdown or self._unloading or value is None or self._is_live:
+                return
+            pos = float(value)
+            now = time.monotonic()
+            if (now - self._last_pos_emit_ts) >= 0.25 or abs(
+                pos - self._last_pos_emit_val
+            ) >= 0.45:
+                self._last_pos_emit_ts = now
+                self._last_pos_emit_val = pos
+                self.position_changed.emit(pos)
 
         @player.property_observer("duration")
         def _on_duration(_name, value):
-            if not self._shutdown and value is not None:
+            if not self._shutdown and not self._unloading and value is not None:
                 self.duration_changed.emit(float(value))
 
         @player.property_observer("pause")
         def _on_pause(_name, value):
-            if not self._shutdown and value is not None:
+            if not self._shutdown and not self._unloading and value is not None:
                 self.paused_changed.emit(bool(value))
 
         @player.property_observer("paused-for-cache")
         def _on_buffering(_name, value):
-            if not self._shutdown and value is not None:
+            if not self._shutdown and not self._unloading and value is not None:
                 self.buffering_changed.emit(bool(value))
 
         @player.event_callback("end-file")
         def _on_end_file(event):
-            if self._shutdown:
+            if self._shutdown or self._unloading:
                 return
             reason = None
             error_code = 0
@@ -191,45 +260,59 @@ class MediaPlayer(QObject):
             try:
                 @player.on_key_press("WHEEL_UP")
                 def _on_wheel_up():
-                    if not self._shutdown:
+                    if not self._shutdown and not self._unloading:
                         self.wheel_scrolled.emit(1 if _is_shift_pressed() else 5)
 
                 @player.on_key_press("WHEEL_DOWN")
                 def _on_wheel_down():
-                    if not self._shutdown:
+                    if not self._shutdown and not self._unloading:
                         self.wheel_scrolled.emit(-1 if _is_shift_pressed() else -5)
 
                 @player.on_key_press("Shift+WHEEL_UP")
                 def _on_shift_wheel_up():
-                    if not self._shutdown:
+                    if not self._shutdown and not self._unloading:
                         self.wheel_scrolled.emit(1)
 
                 @player.on_key_press("Shift+WHEEL_DOWN")
                 def _on_shift_wheel_down():
-                    if not self._shutdown:
+                    if not self._shutdown and not self._unloading:
                         self.wheel_scrolled.emit(-1)
 
                 @player.on_key_press("MBTN_LEFT")
                 def _on_left_click():
-                    if not self._shutdown:
+                    if not self._shutdown and not self._unloading:
                         self.clicked.emit()
 
                 @player.on_key_press("MBTN_LEFT_DBL")
                 def _on_dbl_click():
-                    if not self._shutdown:
+                    if not self._shutdown and not self._unloading:
                         self.double_clicked.emit()
 
                 @player.property_observer("mouse-pos")
                 def _on_mouse_pos(_name, value):
-                    if self._shutdown or not isinstance(value, dict):
+                    if (
+                        self._shutdown
+                        or self._unloading
+                        or not self._track_mouse
+                        or not isinstance(value, dict)
+                    ):
+                        return
+                    now = time.monotonic()
+                    if (now - self._last_mouse_emit_ts) < 0.08:
                         return
                     xy = (value.get("x"), value.get("y"))
                     if xy != self._last_mouse_xy:
                         self._last_mouse_xy = xy
                         if value.get("hover", True):
+                            self._last_mouse_emit_ts = now
                             self.mouse_moved.emit()
             except Exception:
                 pass
+
+    def set_mouse_tracking(self, enabled: bool) -> None:
+        self._track_mouse = bool(enabled)
+        if not self._track_mouse:
+            self._last_mouse_xy = None
 
     def get_property(self, name: str):
         with self._lock:
@@ -248,31 +331,42 @@ class MediaPlayer(QObject):
         is_live: bool = False,
     ) -> None:
         with self._lock:
+            live_flag = bool(is_live)
+            if self._mpv is not None and (
+                self._streams_played >= self._recycle_after
+                or (self._last_was_live is not None and self._last_was_live != live_flag)
+            ):
+                self.unload()
+
             player = self._ensure_mpv()
             if player is None:
                 return
+
             self._loading_generation += 1
             self._user_stopped = False
             self._has_media = True
+            self._is_live = live_flag
+            self._last_pos_emit_ts = 0.0
+            self._last_pos_emit_val = -10.0
 
             if self._is_audio_only_instance:
                 player.vid = "no"
             else:
                 player.vid = "auto" if video_enabled else "no"
 
-            if is_live:
+            if live_flag:
                 player["cache-secs"] = 2
-                player["demuxer-max-bytes"] = "4MiB"
-                player["demuxer-max-back-bytes"] = "512KiB"
+                player["demuxer-max-bytes"] = "3MiB"
+                player["demuxer-max-back-bytes"] = "256KiB"
                 player.start = "none"
                 player.speed = 1.0
             else:
-                player["cache-secs"] = 6
+                player["cache-secs"] = 4
                 player["demuxer-max-bytes"] = (
-                    "3MiB" if self._is_audio_only_instance else "8MiB"
+                    "3MiB" if self._is_audio_only_instance else "6MiB"
                 )
                 player["demuxer-max-back-bytes"] = (
-                    "1MiB" if self._is_audio_only_instance else "2MiB"
+                    "512KiB" if self._is_audio_only_instance else "1MiB"
                 )
                 player.start = f"+{start_pos:.1f}" if start_pos > 0.5 else "none"
                 player.speed = self._speed
@@ -296,6 +390,8 @@ class MediaPlayer(QObject):
             player["audio-files"] = [audio_url] if audio_url else []
             player.pause = False
             player.loadfile(primary_url, "replace")
+            self._streams_played += 1
+            self._last_was_live = live_flag
 
     def set_pause(self, paused: bool) -> None:
         with self._lock:
@@ -311,25 +407,37 @@ class MediaPlayer(QObject):
         with self._lock:
             self._user_stopped = True
             self._has_media = False
+            self._is_live = False
             if not self._shutdown and self._mpv is not None:
                 try:
                     self._mpv["audio-files"] = []
                 except Exception:
                     pass
-                self._mpv.command("stop")
+                for cmd in ("stop", "playlist-clear", "drop-buffers"):
+                    try:
+                        self._mpv.command(cmd)
+                    except Exception:
+                        pass
 
     def unload(self) -> None:
         """Libera la instancia de libmpv manteniendo el objeto reutilizable al dar Play."""
         with self._lock:
             self._user_stopped = True
             self._has_media = False
+            self._is_live = False
+            self._last_was_live = None
+            self._streams_played = 0
             self._applied_af = None
+            self._last_mouse_xy = None
             if self._mpv is not None:
+                self._unloading = True
                 try:
                     self._mpv.terminate()
                 except Exception:
                     pass
-                self._mpv = None
+                finally:
+                    self._unloading = False
+                    self._mpv = None
 
     def seek(self, seconds: float) -> None:
         with self._lock:
@@ -391,9 +499,16 @@ class MediaPlayer(QObject):
             self._shutdown = True
             self._user_stopped = True
             self._has_media = False
+            self._is_live = False
+            self._last_was_live = None
+            self._streams_played = 0
+            self._applied_af = None
             if self._mpv is not None:
+                self._unloading = True
                 try:
                     self._mpv.terminate()
                 except Exception:
                     pass
-                self._mpv = None
+                finally:
+                    self._unloading = False
+                    self._mpv = None

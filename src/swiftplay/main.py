@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtCore import QCoreApplication, Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QPixmapCache
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
@@ -46,6 +46,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
+    QPixmapCache.setCacheLimit(4096)
     if ICON_ICO_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_ICO_PATH)))
 
