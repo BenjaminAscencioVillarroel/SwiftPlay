@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from swiftplay.paths import CONFIG_PATH
@@ -74,6 +74,13 @@ class AppConfig:
     discord_hotkey_deafen: str = "Ctrl+Shift+D"
     discord_hotkey_hangup: str = "Ctrl+Shift+H"
     discord_hotkey_mute_priority: bool = True
+    discord_show_locked_channels: bool = False
+    discord_overlay_enabled: bool = True
+    discord_overlay_opacity: int = 25
+    discord_notify_chat_enabled: bool = True
+    discord_notify_channels: list[str] = field(default_factory=list)
+    discord_hidden_channels: list[str] = field(default_factory=list)
+    discord_hidden_channel_names: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.theme = validate_theme(self.theme)
@@ -106,6 +113,31 @@ class AppConfig:
         self.discord_hotkey_deafen = str(self.discord_hotkey_deafen or "").strip()
         self.discord_hotkey_hangup = str(self.discord_hotkey_hangup or "").strip()
         self.discord_hotkey_mute_priority = bool(self.discord_hotkey_mute_priority)
+        self.discord_show_locked_channels = bool(self.discord_show_locked_channels)
+        self.discord_overlay_enabled = bool(self.discord_overlay_enabled)
+        self.discord_overlay_opacity = max(10, min(100, int(self.discord_overlay_opacity)))
+        self.discord_notify_chat_enabled = bool(self.discord_notify_chat_enabled)
+        seen_chs: list[str] = []
+        for raw_cid in (self.discord_notify_channels or []):
+            cid = str(raw_cid or "").strip()
+            if cid and cid not in seen_chs:
+                seen_chs.append(cid)
+        self.discord_notify_channels = seen_chs
+        hidden_chs: list[str] = []
+        for raw_cid in (self.discord_hidden_channels or []):
+            cid = str(raw_cid or "").strip()
+            if cid and cid not in hidden_chs:
+                hidden_chs.append(cid)
+        self.discord_hidden_channels = hidden_chs
+        raw_hidden_names = self.discord_hidden_channel_names or {}
+        clean_hidden_names: dict[str, str] = {}
+        if isinstance(raw_hidden_names, dict):
+            for k, v in raw_hidden_names.items():
+                cid = str(k or "").strip()
+                label = str(v or "").strip()
+                if cid and label and cid in hidden_chs:
+                    clean_hidden_names[cid] = label
+        self.discord_hidden_channel_names = clean_hidden_names
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:

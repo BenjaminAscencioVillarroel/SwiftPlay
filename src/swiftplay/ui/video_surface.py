@@ -371,6 +371,7 @@ class VideoPlayerPanel(QWidget):
         btn_row.addWidget(self.quality_combo)
 
         self.audio_only_btn = QPushButton(" Solo Audio")
+        self.audio_only_btn.setObjectName("PillBtn")
         self.audio_only_btn.setCheckable(True)
         self.audio_only_btn.setChecked(initial_audio_only)
         self.audio_only_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -471,17 +472,9 @@ class VideoPlayerPanel(QWidget):
         self.audio_only_btn.blockSignals(True)
         self.audio_only_btn.setChecked(audio_only)
         self.audio_only_btn.blockSignals(False)
+        self.audio_only_btn.setObjectName("PillBtn")
         self.audio_only_btn.setProperty("active", "true" if audio_only else "false")
-        self.audio_only_btn.style().unpolish(self.audio_only_btn)
-        self.audio_only_btn.style().polish(self.audio_only_btn)
-        if audio_only:
-            self.audio_only_btn.setObjectName("PillBtn")
-            self.audio_only_btn.setIcon(
-                render_icon("audio_only", self._palette.accent_text, 15)
-            )
-        else:
-            self.audio_only_btn.setObjectName("")
-            self.audio_only_btn.setIcon(render_icon("audio_only", self._palette.text, 15))
+        self.audio_only_btn.setIcon(render_icon("audio_only", self._palette.text, 15))
         self.audio_only_btn.style().unpolish(self.audio_only_btn)
         self.audio_only_btn.style().polish(self.audio_only_btn)
         if self.media_stack.currentIndex() != 2 or audio_only:
@@ -711,8 +704,7 @@ class VideoPlayerPanel(QWidget):
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self.back_btn.setIcon(render_icon("back", palette.text, 15))
-        ao_color = palette.accent_text if self.audio_only_btn.isChecked() else palette.text
-        self.audio_only_btn.setIcon(render_icon("audio_only", ao_color, 15))
+        self.audio_only_btn.setIcon(render_icon("audio_only", palette.text, 15))
         self.dl_btn.setIcon(render_icon("download", palette.text2, 17))
         self.reload_live_btn.setIcon(render_icon("refresh", palette.text, 16))
         self.audio_thumb.setStyleSheet(

@@ -555,7 +555,7 @@ class RoundedThumbWidget(QWidget):
                 painter.drawPath(play_path)
 
         if self._duration_text:
-            is_live_badge = self._duration_text.upper() == "EN VIVO"
+            is_live_badge = self._duration_text.upper() in ("EN VIVO", "EN DIRECTO", "LIVE")
             is_off_badge = self._duration_text.upper() == "OFFLINE"
             font = QFont(self.font())
             font.setPixelSize(11)
@@ -575,18 +575,24 @@ class RoundedThumbWidget(QWidget):
             by = max(4.0, float(h - bh - margin - y_extra))
             badge_rect = QRectF(bx, by, float(bw), float(bh))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(11, 12, 14, 218))
+            painter.setBrush(
+                QColor(200, 24, 24, 232) if is_live_badge else QColor(11, 12, 14, 218)
+            )
             painter.drawRoundedRect(badge_rect, 4.0, 4.0)
             if is_live_badge:
                 dot_r = 3.0
                 cx = bx + pad_x + dot_r
                 cy = by + bh / 2.0
-                painter.setBrush(QColor("#EF4444"))
+                painter.setBrush(QColor("#FFFFFF"))
                 painter.drawEllipse(QRectF(cx - dot_r, cy - dot_r, dot_r * 2.0, dot_r * 2.0))
                 txt_rect = QRectF(bx + dot_extra, by, float(bw - dot_extra), float(bh))
             else:
                 txt_rect = badge_rect
-            painter.setPen(QColor("#9299A8" if is_off_badge else "#F1F3F6"))
+            painter.setPen(
+                QColor("#FFFFFF")
+                if is_live_badge
+                else QColor("#9299A8" if is_off_badge else "#F1F3F6")
+            )
             painter.drawText(txt_rect, Qt.AlignmentFlag.AlignCenter, self._duration_text)
 
         if self._progress_ratio > 0.0:
@@ -745,7 +751,7 @@ class VideoGridCard(QFrame):
 
         self.thumb_widget = RoundedThumbWidget(
             radius=12,
-            duration_text=item.duration,
+            duration_text=("EN VIVO" if item.is_live else (item.duration or "")),
             progress_ratio=ratio,
             bg_color=palette.surface1,
             enable_hover_zoom=True,
@@ -1787,7 +1793,7 @@ class ContinueWatchingBanner(QFrame):
             f"font-size: 9.5px; font-weight: 700; letter-spacing: 1px; color: {palette.accent};"
         )
         self.thumb_widget.set_bg_color(palette.surface1)
-        self.resume_btn.setIcon(render_icon("play", palette.accent_text, 14))
+        self.resume_btn.setIcon(render_icon("play", palette.text, 14))
         self.close_btn.setIcon(render_icon("close", palette.text2, 14))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:

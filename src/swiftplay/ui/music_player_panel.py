@@ -279,7 +279,7 @@ class MusicNowPlayingPanel(QWidget):
         self.fav_btn.style().polish(self.fav_btn)
         if self._in_my_music:
             self.fav_btn.setText(" En Mi música")
-            self.fav_btn.setIcon(render_icon("heart_filled", self._palette.accent_text, 15))
+            self.fav_btn.setIcon(render_icon("heart_filled", self._palette.text, 15))
         else:
             self.fav_btn.setText(" Mi música")
             self.fav_btn.setIcon(render_icon("heart", self._palette.text, 15))

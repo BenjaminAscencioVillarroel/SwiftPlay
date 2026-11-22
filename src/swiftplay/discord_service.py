@@ -60,6 +60,7 @@ class DiscordService(QObject):
     guild_members_updated = Signal(dict)
     chat_history_loaded = Signal(dict)
     chat_message_received = Signal(dict)
+    channel_message_incoming = Signal(dict)
     dm_incoming = Signal(dict)
     error_occurred = Signal(str)
     warning_occurred = Signal(str)
@@ -75,6 +76,7 @@ class DiscordService(QObject):
 
         self._state = "disconnected"
         self._bot_name = ""
+        self._bot_avatar_url = ""
         self._in_voice = False
         self._active_channel_name = ""
         _ACTIVE_SERVICES.add(self)
@@ -99,6 +101,10 @@ class DiscordService(QObject):
     @property
     def bot_name(self) -> str:
         return self._bot_name
+
+    @property
+    def bot_avatar_url(self) -> str:
+        return self._bot_avatar_url
 
     def _build_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -180,6 +186,7 @@ class DiscordService(QObject):
             if reset_needed and not self._closed:
                 self._state = "disconnected"
                 self._bot_name = ""
+                self._bot_avatar_url = ""
                 self._in_voice = False
                 self._active_channel_name = ""
                 try:
@@ -205,8 +212,10 @@ class DiscordService(QObject):
                 self._state = st
                 if st == "connected":
                     self._bot_name = str(data.get("bot_name") or "Bot")
+                    self._bot_avatar_url = str(data.get("bot_avatar_url") or "")
                 elif st in ("disconnected", "error"):
                     self._bot_name = ""
+                    self._bot_avatar_url = ""
                     self._in_voice = False
                     self._active_channel_name = ""
                 self.state_changed.emit(st, data)
@@ -238,6 +247,8 @@ class DiscordService(QObject):
                 self.chat_history_loaded.emit(data)
             elif event == "chat_message" and isinstance(data, dict):
                 self.chat_message_received.emit(data)
+            elif event == "channel_message_incoming" and isinstance(data, dict):
+                self.channel_message_incoming.emit(data)
             elif event == "dm_incoming" and isinstance(data, dict):
                 self.dm_incoming.emit(data)
             elif event == "error" and isinstance(data, dict):
@@ -324,7 +335,12 @@ class DiscordService(QObject):
         self._ensure_worker()
         self._send_command("list_devices")
         self.sync_audio_config(cfg)
+        self.set_notify_channels(cfg.discord_notify_channels)
         self._send_command("connect_bot")
+
+    def set_notify_channels(self, channel_ids: list[str]) -> None:
+        clean = [str(cid).strip() for cid in (channel_ids or []) if str(cid or "").strip()]
+        self._send_command("set_notify_channels", {"channel_ids": clean}, spawn=False)
 
     def refresh_devices(self, *, spawn: bool = False) -> None:
         self._send_command("list_devices", spawn=spawn)
@@ -436,6 +452,7 @@ class DiscordService(QObject):
         self._fail_pending("Worker Discord desconectado.")
         self._state = "disconnected"
         self._bot_name = ""
+        self._bot_avatar_url = ""
         self._in_voice = False
         self._active_channel_name = ""
         if not self._closed:

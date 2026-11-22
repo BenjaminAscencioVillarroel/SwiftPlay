@@ -11,6 +11,7 @@ from __future__ import annotations
 import array
 import asyncio
 from collections import deque
+from datetime import datetime, timedelta
 import json
 import math
 import os
@@ -2185,13 +2186,35 @@ def _format_member_activity(member: Any) -> str:
     return ""
 
 
+def _member_avatar_url(obj: Any) -> str:
+    """Obtiene la URL del avatar del usuario/miembro en 128px si está disponible."""
+    av = getattr(obj, "display_avatar", None) or getattr(obj, "avatar", None)
+    if av is None:
+        return ""
+    try:
+        sized = av.with_size(128) if hasattr(av, "with_size") else av
+        return str(getattr(sized, "url", "") or getattr(av, "url", "") or "")
+    except Exception:
+        try:
+            return str(getattr(av, "url", "") or "")
+        except Exception:
+            return ""
+
+
 def _serialize_guild_members(
-    guild: Any, limit: int = 200
+    guild: Any, limit: int = 200, channel: Any = None
 ) -> tuple[int, list[dict[str, Any]]]:
-    """Serializa miembros de un servidor ordenados por presencia (online/dnd/idle/offline)."""
+    """Serializa miembros de un servidor ordenados por presencia (y filtrados por canal opcional)."""
     items: list[dict[str, Any]] = []
     online_count = 0
     for m in list(getattr(guild, "members", None) or ()):
+        if channel is not None:
+            try:
+                perms = channel.permissions_for(m)
+                if not bool(getattr(perms, "view_channel", True)):
+                    continue
+            except Exception:
+                pass
         raw_st = getattr(m, "status", "offline")
         st = str(getattr(raw_st, "value", raw_st) or "offline").strip().lower()
         if st not in _STATUS_ORDER:
@@ -2206,6 +2229,7 @@ def _serialize_guild_members(
                 "id": str(uid),
                 "name": name,
                 "is_bot": is_bot,
+                "avatar_url": _member_avatar_url(m),
                 "status": st,
                 "activity": _format_member_activity(m),
             }
@@ -2246,23 +2270,35 @@ def _serialize_chat_message(msg: Any, bot_id: int = 0) -> dict[str, Any]:
         )
 
     ts_str = ""
+    date_label = ""
     created = getattr(msg, "created_at", None)
     if created is not None:
         try:
             local_dt = created.astimezone() if getattr(created, "tzinfo", None) is not None else created
             ts_str = local_dt.strftime("%H:%M")
+            msg_date = local_dt.date()
+            today = datetime.now().date()
+            if msg_date == today:
+                date_label = "Hoy"
+            elif msg_date == today - timedelta(days=1):
+                date_label = "Ayer"
+            else:
+                date_label = local_dt.strftime("%d/%m/%Y")
         except Exception:
             ts_str = ""
+            date_label = ""
 
     return {
         "id": str(getattr(msg, "id", "") or ""),
         "author_id": str(author_id),
         "author_name": author_name,
+        "author_avatar_url": _member_avatar_url(author),
         "is_self": is_self,
         "is_bot": is_bot,
         "content": content,
         "attachments": attachments,
         "timestamp": ts_str,
+        "date_label": date_label,
     }
 
 
@@ -2290,8 +2326,9 @@ class DiscordWorkerApp:
         self._deafened = False
         self._speaking_timestamps: dict[int, float] = {}
         self._speaking_lock = threading.Lock()
-        self._member_name_cache: dict[int, tuple[str, bool]] = {}
+        self._member_name_cache: dict[int, tuple[str, bool, str]] = {}
         self._member_fetch_inflight: set[tuple[int, int]] = set()
+        self._notify_channel_ids: set[int] = set()
         self._state = "disconnected"
         self._dave_active = False
         self._dave_was_active = False
@@ -2437,9 +2474,10 @@ class DiscordWorkerApp:
                 if member is not None:
                     name = str(getattr(member, "display_name", "") or getattr(member, "name", "") or uid)
                     is_bot = bool(getattr(member, "bot", False))
+                    av_url = _member_avatar_url(member)
                     if len(self._member_name_cache) >= 96:
                         self._member_name_cache.clear()
-                    self._member_name_cache[uid] = (name, is_bot)
+                    self._member_name_cache[uid] = (name, is_bot, av_url)
                     self._emit_snapshots()
             except Exception:
                 pass
@@ -2448,7 +2486,9 @@ class DiscordWorkerApp:
 
         self._loop.create_task(_fetch())
 
-    def _resolve_member_name(self, guild: Any, member_or_id: Any) -> tuple[int, str, bool]:
+    def _resolve_member_name(
+        self, guild: Any, member_or_id: Any
+    ) -> tuple[int, str, bool, str]:
         if isinstance(member_or_id, int):
             uid = member_or_id
             m = guild.get_member(uid) if guild is not None else None
@@ -2457,13 +2497,14 @@ class DiscordWorkerApp:
             if m is not None:
                 name = str(getattr(m, "display_name", "") or getattr(m, "name", "") or uid)
                 is_bot = bool(getattr(m, "bot", False))
-                self._member_name_cache[uid] = (name, is_bot)
-                return uid, name, is_bot
+                av_url = _member_avatar_url(m)
+                self._member_name_cache[uid] = (name, is_bot, av_url)
+                return uid, name, is_bot, av_url
             cached = self._member_name_cache.get(uid)
             if cached is not None:
-                return uid, cached[0], cached[1]
+                return uid, cached[0], cached[1], cached[2]
             self._schedule_member_fetch(guild, uid)
-            return uid, f"Usuario {uid}", False
+            return uid, f"Usuario {uid}", False, ""
 
         uid = int(getattr(member_or_id, "id", 0) or 0)
         name = str(
@@ -2472,11 +2513,12 @@ class DiscordWorkerApp:
             or uid
         )
         is_bot = bool(getattr(member_or_id, "bot", False))
+        av_url = _member_avatar_url(member_or_id)
         if uid:
             if len(self._member_name_cache) >= 96:
                 self._member_name_cache.clear()
-            self._member_name_cache[uid] = (name, is_bot)
-        return uid, name, is_bot
+            self._member_name_cache[uid] = (name, is_bot, av_url)
+        return uid, name, is_bot, av_url
 
     def _build_guilds_snapshot(self) -> list[dict[str, Any]]:
         client = self._client
@@ -2488,12 +2530,13 @@ class DiscordWorkerApp:
             for ch in sorted(g.voice_channels, key=lambda c: (c.position, str(c.name).lower())):
                 members_list: list[dict[str, Any]] = []
                 for uid_key, vs in ch.voice_states.items():
-                    uid, name, is_bot = self._resolve_member_name(g, int(uid_key))
+                    uid, name, is_bot, av_url = self._resolve_member_name(g, int(uid_key))
                     members_list.append(
                         {
                             "id": str(uid),
                             "name": name,
                             "is_bot": is_bot,
+                            "avatar_url": av_url,
                             "muted": bool(getattr(vs, "self_mute", False) or getattr(vs, "mute", False)),
                             "deafened": bool(getattr(vs, "self_deaf", False) or getattr(vs, "deaf", False)),
                         }
@@ -2559,12 +2602,13 @@ class DiscordWorkerApp:
         g = ch.guild
         participants: list[dict[str, Any]] = []
         for uid_key, vs in ch.voice_states.items():
-            uid, name, is_bot = self._resolve_member_name(g, int(uid_key))
+            uid, name, is_bot, av_url = self._resolve_member_name(g, int(uid_key))
             participants.append(
                 {
                     "id": str(uid),
                     "name": name,
                     "is_bot": is_bot,
+                    "avatar_url": av_url,
                     "is_self": bool(self._client and self._client.user and uid == self._client.user.id),
                     "muted": bool(getattr(vs, "self_mute", False) or getattr(vs, "mute", False)),
                     "deafened": bool(getattr(vs, "self_deaf", False) or getattr(vs, "deaf", False)),
@@ -2639,6 +2683,7 @@ class DiscordWorkerApp:
                     "state": "connected",
                     "bot_id": str(user.id) if user else "",
                     "bot_name": str(user.display_name or user.name) if user else "Bot",
+                    "bot_avatar_url": _member_avatar_url(user) if user else "",
                     "privileged_intents_ok": bool(self._privileged_intents_ok),
                 },
             )
@@ -2722,6 +2767,21 @@ class DiscordWorkerApp:
                             "message": payload,
                         },
                     )
+                if not payload["is_self"] and ch_id in self._notify_channel_ids:
+                    preview = payload["content"] or (
+                        "[adjunto]" if payload["attachments"] else ""
+                    )
+                    self.emit_event(
+                        "channel_message_incoming",
+                        {
+                            "guild_id": str(guild.id),
+                            "guild_name": str(getattr(guild, "name", "") or ""),
+                            "channel_id": str(ch_id),
+                            "channel_name": str(getattr(ch, "name", "") or "canal"),
+                            "author_name": payload["author_name"],
+                            "preview": preview[:80],
+                        },
+                    )
                 return
 
             peer_id = 0
@@ -2738,12 +2798,21 @@ class DiscordWorkerApp:
             if not peer_id:
                 return
             self._dm_channels[peer_id] = ch_id
+            peer_name = str(
+                getattr(recip, "display_name", "")
+                or getattr(recip, "name", "")
+                or payload["author_name"]
+                or peer_id
+            )
+            peer_avatar = _member_avatar_url(recip) if recip is not None else ""
             if self._active_chat_kind == "dm" and peer_id == self._active_chat_id:
                 self.emit_event(
                     "chat_message",
                     {
                         "kind": "dm",
                         "target_id": str(peer_id),
+                        "peer_name": peer_name,
+                        "peer_avatar_url": peer_avatar,
                         "message": payload,
                     },
                 )
@@ -2756,7 +2825,10 @@ class DiscordWorkerApp:
                     {
                         "user_id": str(peer_id),
                         "author_name": payload["author_name"],
+                        "peer_name": peer_name,
+                        "peer_avatar_url": peer_avatar,
                         "preview": preview[:80],
+                        "message": payload,
                     },
                 )
 
@@ -2938,6 +3010,7 @@ class DiscordWorkerApp:
                 msgs.reverse()
             except Exception:
                 pass
+        ch_online, ch_members = _serialize_guild_members(guild, limit=200, channel=ch)
         self.emit_event(
             "chat_history",
             {
@@ -2948,6 +3021,8 @@ class DiscordWorkerApp:
                 "can_read": can_read,
                 "can_send": can_send,
                 "messages": msgs,
+                "channel_members": ch_members,
+                "channel_online_count": ch_online,
             },
         )
 
@@ -2997,6 +3072,8 @@ class DiscordWorkerApp:
                 "kind": "dm",
                 "target_id": str(uid),
                 "title": f"DM · {display}",
+                "peer_name": display,
+                "peer_avatar_url": _member_avatar_url(user),
                 "can_read": True,
                 "can_send": True,
                 "messages": msgs,
@@ -3241,6 +3318,11 @@ class DiscordWorkerApp:
                 await self._disconnect_bot()
             elif cmd == "refresh_guilds":
                 self._emit_snapshots()
+            elif cmd == "set_notify_channels":
+                raw_ids = req.get("channel_ids") or []
+                self._notify_channel_ids = {
+                    _safe_int(x) for x in raw_ids if _safe_int(x) > 0
+                }
             elif cmd == "select_guild":
                 await self._select_guild(_safe_int(req.get("guild_id")))
             elif cmd == "open_text_channel":

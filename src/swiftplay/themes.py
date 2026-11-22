@@ -53,8 +53,8 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         color: {p.text};
         font-family: "Segoe UI", "Inter", sans-serif;
         font-size: 13px;
-        selection-background-color: {p.accent};
-        selection-color: {p.accent_text};
+        selection-background-color: #2D3647;
+        selection-color: {p.text};
     }}
 
     QLabel {{
@@ -105,7 +105,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: rgba(255, 255, 255, 14);
         color: {p.accent};
         border: none;
-        border-radius: 4px;
+        border-radius: 6px;
         padding: 2px 6px;
         font-size: 9px;
         font-weight: 700;
@@ -116,7 +116,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: transparent;
         color: {p.text2};
         border: 1px solid transparent;
-        border-radius: 9px;
+        border-radius: 10px;
         text-align: left;
         padding: 8px 12px;
         font-size: 13px;
@@ -130,11 +130,17 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     }}
 
     QPushButton#NavBtn[active="true"] {{
-        background-color: rgba(255, 255, 255, 15);
+        background-color: #1F2532;
         color: {p.text};
-        border: 1px solid transparent;
-        border-left: 3px solid {p.accent};
+        border: 1px solid rgba(207, 213, 223, 140);
+        border-radius: 10px;
         font-weight: 600;
+    }}
+
+    QFrame#ResourceMonitorCard {{
+        background-color: rgba(255, 255, 255, 8);
+        border: 1px solid rgba(255, 255, 255, 20);
+        border-radius: 10px;
     }}
 
     QFrame#TopBar {{
@@ -146,7 +152,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: {p.surface1};
         color: {p.text};
         border: 1px solid {p.border};
-        border-radius: 8px;
+        border-radius: 10px;
         padding: 7px 12px;
     }}
 
@@ -158,7 +164,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QLineEdit#SearchInput {{
         background-color: {p.surface1};
         border: 1px solid rgba(255, 255, 255, 18);
-        border-radius: 19px;
+        border-radius: 15px;
         padding: 7px 16px;
         min-height: 22px;
         font-size: 13px;
@@ -173,7 +179,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: rgba(255, 255, 255, 14);
         color: {p.text};
         border: 1px solid rgba(255, 255, 255, 20);
-        border-radius: 18px;
+        border-radius: 16px;
         padding: 0px;
     }}
 
@@ -190,7 +196,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: {p.surface2};
         color: {p.text};
         border: 1px solid {p.border};
-        border-radius: 8px;
+        border-radius: 10px;
         padding: 6px 12px;
         font-weight: 500;
     }}
@@ -204,33 +210,41 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: {p.surface1};
     }}
 
+    QPushButton:checked {{
+        background-color: #2D3647;
+        color: {p.text};
+        border: 1px solid {p.accent};
+    }}
+
     QPushButton:disabled {{
         color: {p.text2};
         opacity: 0.55;
     }}
 
     QPushButton#AccentBtn {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #E4E8EE, stop:1 #BDC4D0);
-        color: {p.accent_text};
-        border: 1px solid #EDF0F5;
-        border-radius: 8px;
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #323B4D, stop:1 #252C3A);
+        color: {p.text};
+        border: 1px solid {p.accent};
+        border-radius: 10px;
         padding: 7px 16px;
         font-weight: 700;
     }}
 
     QPushButton#AccentBtn:hover {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #F2F4F8, stop:1 #CFD5DF);
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3E4A60, stop:1 #2E3749);
+        border-color: {p.accent_hover};
     }}
 
     QPushButton#AccentBtn:pressed {{
-        background-color: #B4BCC9;
+        background-color: #1F2531;
+        border-color: {p.accent};
     }}
 
     QPushButton#PlayAccentBtn {{
         background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #EAEEF4, stop:1 #C2C9D4);
         color: {p.accent_text};
         border: 1px solid #F2F4F8;
-        border-radius: 17px;
+        border-radius: 16px;
         padding: 0px;
         font-weight: 700;
     }}
@@ -249,7 +263,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: transparent;
         color: #F87171;
         border: 1px solid #7F1D1D;
-        border-radius: 8px;
+        border-radius: 10px;
         padding: 7px 14px;
         font-weight: 600;
     }}
@@ -262,7 +276,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QPushButton#IconBtn {{
         background-color: transparent;
         border: 1px solid transparent;
-        border-radius: 8px;
+        border-radius: 10px;
         padding: 5px;
     }}
 
@@ -281,7 +295,8 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: {p.surface1};
         color: {p.text2};
         border: 1px solid {p.border};
-        border-radius: 14px;
+        border-radius: 10px;
+        min-height: 18px;
         padding: 4px 12px;
         font-size: 12px;
         font-weight: 500;
@@ -294,10 +309,15 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     }}
 
     QPushButton#PillBtn[active="true"] {{
-        background-color: {p.accent};
-        color: {p.accent_text};
-        border-color: {p.accent_hover};
+        background-color: #2D3647;
+        color: {p.text};
+        border: 1px solid {p.accent};
         font-weight: 700;
+    }}
+
+    QPushButton#PillBtn[active="true"]:hover {{
+        background-color: #384358;
+        border-color: {p.accent_hover};
     }}
 
     QFrame#YtVideoTile, QFrame#YtMusicTile {{
@@ -325,7 +345,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QPushButton#TileMoreBtn {{
         background-color: transparent;
         border: none;
-        border-radius: 14px;
+        border-radius: 11px;
         padding: 2px;
     }}
 
@@ -336,7 +356,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QPushButton#ShelfNavBtn {{
         background-color: rgba(255, 255, 255, 10);
         border: 1px solid {p.border};
-        border-radius: 15px;
+        border-radius: 14px;
         padding: 0px;
     }}
 
@@ -449,7 +469,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: {p.surface2};
         color: {p.text};
         border: 1px solid rgba(255, 255, 255, 18);
-        border-radius: 14px;
+        border-radius: 10px;
         padding: 3px 10px;
         min-height: 22px;
     }}
@@ -467,8 +487,11 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: {p.surface1};
         color: {p.text};
         border: 1px solid {p.border_bright};
-        selection-background-color: {p.accent};
-        selection-color: {p.accent_text};
+        border-radius: 10px;
+        padding: 4px;
+        selection-background-color: #2D3647;
+        selection-color: {p.text};
+        outline: none;
     }}
 
     QCheckBox {{
@@ -480,7 +503,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QCheckBox::indicator {{
         width: 17px;
         height: 17px;
-        border-radius: 4px;
+        border-radius: 5px;
         border: 1px solid {p.border_bright};
         background-color: {p.surface1};
     }}
@@ -552,7 +575,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
 
     QTabWidget::pane {{
         border: 1px solid {p.border};
-        border-radius: 8px;
+        border-radius: 12px;
         background-color: {p.base};
         padding: 8px;
     }}
@@ -561,17 +584,21 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: {p.surface1};
         color: {p.text2};
         border: 1px solid {p.border};
-        border-bottom: none;
-        border-top-left-radius: 8px;
-        border-top-right-radius: 8px;
+        border-radius: 10px;
         padding: 7px 14px;
-        margin-right: 4px;
+        margin-right: 6px;
+        margin-bottom: 4px;
+    }}
+
+    QTabBar::tab:hover {{
+        color: {p.text};
+        border-color: {p.border_bright};
     }}
 
     QTabBar::tab:selected {{
-        background-color: {p.surface2};
+        background-color: #2A3242;
         color: {p.text};
-        border-top: 2px solid {p.accent};
+        border: 1px solid {p.accent};
         font-weight: 600;
     }}
 
@@ -579,25 +606,25 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: {p.surface1};
         color: {p.text};
         border: 1px solid {p.border_bright};
-        border-radius: 8px;
-        padding: 4px;
+        border-radius: 10px;
+        padding: 5px;
     }}
 
     QMenu::item {{
         padding: 6px 18px;
-        border-radius: 5px;
+        border-radius: 7px;
     }}
 
     QMenu::item:selected {{
-        background-color: {p.accent};
-        color: {p.accent_text};
+        background-color: #2D3647;
+        color: {p.text};
     }}
 
     QToolTip {{
         background-color: {p.surface2};
         color: {p.text};
         border: 1px solid {p.border_bright};
-        border-radius: 5px;
+        border-radius: 8px;
         padding: 4px 8px;
     }}
 
@@ -605,7 +632,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: {p.surface2};
         color: {p.text};
         border: 1px solid {p.accent};
-        border-radius: 8px;
+        border-radius: 10px;
         padding: 8px 14px;
         font-weight: 500;
     }}
@@ -616,9 +643,91 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         border: 1px solid rgba(239, 68, 68, 72);
         border-radius: 10px;
         padding: 2px 9px;
-        font-size: 11px;
+        font-size: 10px;
         font-weight: 700;
-        letter-spacing: 0.4px;
+    }}
+
+    QFrame#DiscordVoiceHeader {{
+        background-color: #171C28;
+        border: 1px solid #2B3446;
+        border-radius: 10px;
+    }}
+
+    QFrame#DiscordSidebarCard {{
+        background-color: #12161E;
+        border: 1px solid #283040;
+        border-radius: 12px;
+    }}
+
+    QFrame#DiscordHeaderBar {{
+        background-color: #151A24;
+        border: 1px solid #293244;
+        border-radius: 10px;
+    }}
+
+    QFrame#DiscordVoiceArea {{
+        background-color: #10141C;
+        border: 1px solid #252E3E;
+        border-radius: 12px;
+    }}
+
+    QFrame#DiscordParticipantCard {{
+        background-color: #1C212B;
+        border: 1px solid #2E3646;
+        border-radius: 12px;
+    }}
+
+    QFrame#DiscordChatCard {{
+        background-color: #171C27;
+        border: 1px solid #2E374A;
+        border-radius: 12px;
+    }}
+
+    QFrame#DiscordChatHeader {{
+        background-color: #1E2534;
+        border: none;
+        border-bottom: 1px solid #303A4E;
+        border-top-left-radius: 11px;
+        border-top-right-radius: 11px;
+    }}
+
+    QLineEdit#DiscordChatInput {{
+        background-color: #0F1218;
+        color: {p.text};
+        border: 1px solid #283040;
+        border-radius: 9px;
+        padding: 7px 12px;
+    }}
+
+    QLineEdit#DiscordChatInput:focus {{
+        border-color: {p.accent};
+    }}
+
+    QFrame#DiscordDeckCard {{
+        background-color: #1A202D;
+        border: 1px solid #313B50;
+        border-radius: 14px;
+    }}
+
+    QFrame#DiscordSidebarMiniCard {{
+        background-color: #161B25;
+        border: 1px solid #2B3446;
+        border-radius: 10px;
+    }}
+
+    QFrame#DiscordChannelRow {{
+        background-color: #171B24;
+        border: 1px solid #252C3A;
+        border-radius: 9px;
+    }}
+
+    QFrame#DiscordChannelRow:hover {{
+        border-color: {p.border_bright};
+    }}
+
+    QFrame#DiscordChannelRow[active="true"] {{
+        background-color: #182422;
+        border: 1px solid #2F6F52;
     }}
     """
 

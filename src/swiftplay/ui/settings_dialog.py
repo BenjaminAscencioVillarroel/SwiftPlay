@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, S
 from PySide6.QtGui import QCloseEvent, QFocusEvent, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -21,6 +22,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSlider,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -43,6 +46,7 @@ from swiftplay.security import (
 from swiftplay.themes import apply_windows_dark_titlebar, get_theme
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
+from swiftplay.ui.shortcuts_dialog import OutsideClickDismissFilter
 from swiftplay.windows_os import (
     get_process_memory_mb,
     is_startup_enabled,
@@ -229,6 +233,9 @@ class SettingsDialog(QDialog):
     account_changed = Signal()
     discord_token_changed = Signal()
     discord_hotkeys_changed = Signal()
+    discord_ui_settings_changed = Signal()
+    discord_overlay_settings_changed = Signal()
+    discord_overlay_preview_requested = Signal(int)
     hotkey_recording_changed = Signal(bool)
     trim_memory_requested = Signal()
 
@@ -237,12 +244,14 @@ class SettingsDialog(QDialog):
         config: AppConfig,
         yt_service: YouTubeService,
         thumb_cache: ThumbnailCache | None = None,
+        discord_channels: list[tuple[str, str]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.cfg = config
         self.yt = yt_service
         self._thumb_cache = thumb_cache
+        self._discord_channels: list[tuple[str, str]] = list(discord_channels or [])
         self._pool = QThreadPool(self)
         self._active_tasks: set[_WorkerSignals] = set()
         self._login_cancel: threading.Event | None = None
@@ -282,6 +291,12 @@ class SettingsDialog(QDialog):
         self._refresh_ram_label()
         self._refresh_session_status()
         apply_windows_dark_titlebar(int(self.winId()), get_theme(self.cfg.theme).base)
+        self._outside_filter = OutsideClickDismissFilter(
+            self,
+            should_ignore_deactivate=lambda: (
+                self._login_cancel is not None and not self._login_cancel.is_set()
+            ),
+        )
 
     def select_account_tab(self) -> None:
         self.tabs.setCurrentIndex(1)
@@ -693,15 +708,20 @@ class SettingsDialog(QDialog):
     # --- Tab 4: Discord (DPAPI) ---
 
     def _build_discord_tab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(12)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
 
         card = QFrame()
         card.setObjectName("MediaCard")
         c_lay = QVBoxLayout(card)
-        c_lay.setContentsMargins(14, 12, 14, 12)
+        c_lay.setContentsMargins(14, 10, 14, 10)
         c_lay.setSpacing(4)
         title = QLabel("Bot Token oficial de Discord (Cifrado Windows DPAPI)")
         title.setStyleSheet("font-size: 14px; font-weight: 700;")
@@ -745,14 +765,129 @@ class SettingsDialog(QDialog):
         act_row.addStretch()
         lay.addLayout(act_row)
 
+        # Preferencias visuales y Overlay de silencio/ensordecido
+        ui_card = QFrame()
+        ui_card.setObjectName("MediaCard")
+        ui_lay = QVBoxLayout(ui_card)
+        ui_lay.setContentsMargins(14, 10, 14, 10)
+        ui_lay.setSpacing(8)
+
+        ui_title = QLabel("Interfaz y Overlay de Discord")
+        ui_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        ui_lay.addWidget(ui_title)
+
+        self.discord_show_locked_check = QCheckBox("Mostrar canales de voz sin permiso")
+        self.discord_show_locked_check.setChecked(self.cfg.discord_show_locked_channels)
+        self.discord_show_locked_check.toggled.connect(self._on_show_locked_channels_toggled)
+        ui_lay.addWidget(self.discord_show_locked_check)
+
+        self.discord_overlay_check = QCheckBox(
+            "Mostrar overlay flotante de silencio/ensordecido (arriba a la izquierda)"
+        )
+        self.discord_overlay_check.setChecked(self.cfg.discord_overlay_enabled)
+        self.discord_overlay_check.toggled.connect(self._on_discord_overlay_toggled)
+        ui_lay.addWidget(self.discord_overlay_check)
+
+        op_row = QHBoxLayout()
+        op_row.setSpacing(10)
+        op_lbl = QLabel("Opacidad del overlay:")
+        op_lbl.setObjectName("MutedLabel")
+        op_row.addWidget(op_lbl)
+
+        self.discord_overlay_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.discord_overlay_opacity_slider.setRange(10, 100)
+        self.discord_overlay_opacity_slider.setSingleStep(5)
+        self.discord_overlay_opacity_slider.setPageStep(10)
+        self.discord_overlay_opacity_slider.setValue(self.cfg.discord_overlay_opacity)
+        self.discord_overlay_opacity_slider.setEnabled(self.cfg.discord_overlay_enabled)
+        self.discord_overlay_opacity_slider.valueChanged.connect(
+            self._on_discord_overlay_opacity_changed
+        )
+        op_row.addWidget(self.discord_overlay_opacity_slider, 1)
+
+        self.discord_overlay_opacity_lbl = QLabel(f"{self.cfg.discord_overlay_opacity}%")
+        self.discord_overlay_opacity_lbl.setFixedWidth(40)
+        self.discord_overlay_opacity_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        op_row.addWidget(self.discord_overlay_opacity_lbl)
+        ui_lay.addLayout(op_row)
+
+        self.discord_notify_chat_check = QCheckBox(
+            "Avisar en la barra de tareas solo para los canales marcados con campana"
+        )
+        self.discord_notify_chat_check.setChecked(self.cfg.discord_notify_chat_enabled)
+        self.discord_notify_chat_check.toggled.connect(self._on_notify_chat_toggled)
+        ui_lay.addWidget(self.discord_notify_chat_check)
+
+        notify_row = QHBoxLayout()
+        notify_row.setSpacing(8)
+        self.discord_notify_summary_lbl = QLabel()
+        self.discord_notify_summary_lbl.setObjectName("MutedLabel")
+        self._refresh_notify_summary()
+        notify_row.addWidget(self.discord_notify_summary_lbl, 1)
+
+        self.discord_mute_all_ch_btn = QPushButton("Silenciar todos")
+        self.discord_mute_all_ch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_mute_all_ch_btn.setEnabled(bool(self.cfg.discord_notify_channels))
+        self.discord_mute_all_ch_btn.clicked.connect(self._on_clear_notify_channels)
+        notify_row.addWidget(self.discord_mute_all_ch_btn)
+        ui_lay.addLayout(notify_row)
+        lay.addWidget(ui_card)
+
+        # Canales ocultos permanentemente (voz y texto)
+        hidden_card = QFrame()
+        hidden_card.setObjectName("MediaCard")
+        hc_lay = QVBoxLayout(hidden_card)
+        hc_lay.setContentsMargins(14, 10, 14, 10)
+        hc_lay.setSpacing(8)
+
+        hc_hdr = QHBoxLayout()
+        hc_hdr.setSpacing(8)
+        hc_title = QLabel("Canales ocultos de Discord (voz y texto)")
+        hc_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        hc_hdr.addWidget(hc_title, 1)
+
+        self.discord_unhide_all_btn = QPushButton("Mostrar todos")
+        self.discord_unhide_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_unhide_all_btn.clicked.connect(self._on_unhide_all_channels)
+        hc_hdr.addWidget(self.discord_unhide_all_btn)
+        hc_lay.addLayout(hc_hdr)
+
+        hc_desc = QLabel(
+            "Los canales ocultos no se mostrarán hasta que los reactives aquí. "
+            "También puedes hacer clic derecho en cualquier canal de Discord → 'Ocultar este canal siempre'."
+        )
+        hc_desc.setObjectName("MutedLabel")
+        hc_desc.setWordWrap(True)
+        hc_lay.addWidget(hc_desc)
+
+        add_hide_row = QHBoxLayout()
+        add_hide_row.setSpacing(8)
+        self.discord_hide_combo = QComboBox()
+        self.discord_hide_combo.setToolTip("Elige un canal de voz o texto para ocultarlo siempre")
+        add_hide_row.addWidget(self.discord_hide_combo, 1)
+
+        self.discord_hide_btn = QPushButton("Ocultar canal")
+        self.discord_hide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_hide_btn.clicked.connect(self._on_hide_channel_from_combo)
+        add_hide_row.addWidget(self.discord_hide_btn)
+        hc_lay.addLayout(add_hide_row)
+
+        hidden_box = QWidget()
+        self.discord_hidden_list_lay = QVBoxLayout(hidden_box)
+        self.discord_hidden_list_lay.setContentsMargins(0, 2, 0, 0)
+        self.discord_hidden_list_lay.setSpacing(5)
+        hc_lay.addWidget(hidden_box)
+
+        lay.addWidget(hidden_card)
+        self._refresh_hidden_channels_ui()
+
         guide = QLabel(
-            "Guía rápida de creación e invitación:\n"
-            "• Ve a https://discord.com/developers/applications → New Application → Bot → Reset Token.\n"
-            "• Para voz básica no necesitas Intents; si quieres estados en vivo y leer chat/DMs, activa "
-            "Presence Intent, Server Members Intent y Message Content Intent en la pestaña Bot.\n"
-            "• En OAuth2 → URL Generator selecciona scope 'bot' y permisos: View Channels, Connect, Speak "
-            "(y Read Message History + Send Messages para canales de texto).\n"
-            "• Abre la URL generada e invita el bot a tu servidor. El token se guarda cifrado con DPAPI ligado a tu usuario de Windows."
+            "Guía rápida:\n"
+            "• Ve a https://discord.com/developers/applications → Bot → Reset Token.\n"
+            "• Activa Presence, Server Members y Message Content Intents si quieres ver miembros y leer todo el chat.\n"
+            "• En OAuth2 → URL Generator marca 'bot' + View Channels, Connect, Speak, Read Message History y Send Messages."
         )
         guide.setObjectName("MutedLabel")
         guide.setWordWrap(True)
@@ -765,7 +900,8 @@ class SettingsDialog(QDialog):
 
         lay.addStretch()
         self._refresh_discord_status()
-        return w
+        scroll.setWidget(w)
+        return scroll
 
     # --- Tab 5: Atajos Discord ---
 
@@ -950,6 +1086,132 @@ class SettingsDialog(QDialog):
         )
         self.discord_token_changed.emit()
 
+    def _on_show_locked_channels_toggled(self, checked: bool) -> None:
+        self.cfg.discord_show_locked_channels = bool(checked)
+        save_config(self.cfg)
+        self.discord_ui_settings_changed.emit()
+
+    def _on_discord_overlay_toggled(self, checked: bool) -> None:
+        self.cfg.discord_overlay_enabled = bool(checked)
+        self.discord_overlay_opacity_slider.setEnabled(bool(checked))
+        save_config(self.cfg)
+        self.discord_overlay_settings_changed.emit()
+
+    def _on_discord_overlay_opacity_changed(self, value: int) -> None:
+        val = max(10, min(100, int(value)))
+        self.discord_overlay_opacity_lbl.setText(f"{val}%")
+        self.cfg.discord_overlay_opacity = val
+        save_config(self.cfg)
+        self.discord_overlay_settings_changed.emit()
+        self.discord_overlay_preview_requested.emit(val)
+
+    def _refresh_notify_summary(self) -> None:
+        cnt = len(self.cfg.discord_notify_channels)
+        self.discord_notify_summary_lbl.setText(f"Canales con aviso activo: {cnt}")
+        if hasattr(self, "discord_mute_all_ch_btn"):
+            self.discord_mute_all_ch_btn.setEnabled(cnt > 0)
+
+    def _on_notify_chat_toggled(self, checked: bool) -> None:
+        self.cfg.discord_notify_chat_enabled = bool(checked)
+        save_config(self.cfg)
+        self.discord_ui_settings_changed.emit()
+
+    def _on_clear_notify_channels(self) -> None:
+        self.cfg.discord_notify_channels = []
+        save_config(self.cfg)
+        self._refresh_notify_summary()
+        self.discord_ui_settings_changed.emit()
+
+    def _refresh_hidden_channels_ui(self) -> None:
+        if not hasattr(self, "discord_hidden_list_lay"):
+            return
+        while self.discord_hidden_list_lay.count() > 0:
+            item = self.discord_hidden_list_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        hidden_ids = list(self.cfg.discord_hidden_channels)
+        hidden_set = set(hidden_ids)
+        label_by_id: dict[str, str] = dict(self.cfg.discord_hidden_channel_names)
+        for cid, lbl in self._discord_channels:
+            if cid and lbl:
+                label_by_id.setdefault(cid, lbl)
+
+        self.discord_hide_combo.clear()
+        for cid, lbl in self._discord_channels:
+            if cid and cid not in hidden_set:
+                self.discord_hide_combo.addItem(lbl, cid)
+        if self.discord_hide_combo.count() == 0:
+            self.discord_hide_combo.addItem("Conecta Discord para listar más canales", "")
+            self.discord_hide_btn.setEnabled(False)
+        else:
+            self.discord_hide_btn.setEnabled(True)
+
+        self.discord_unhide_all_btn.setEnabled(len(hidden_ids) > 0)
+        if not hidden_ids:
+            empty_lbl = QLabel("No tienes canales ocultos actualmente.")
+            empty_lbl.setObjectName("MutedLabel")
+            self.discord_hidden_list_lay.addWidget(empty_lbl)
+            return
+
+        for cid in hidden_ids:
+            row = QFrame()
+            row.setObjectName("DiscordChannelRow")
+            r_lay = QHBoxLayout(row)
+            r_lay.setContentsMargins(10, 5, 8, 5)
+            r_lay.setSpacing(8)
+            disp = label_by_id.get(cid) or f"Canal {cid}"
+            lbl = QLabel(disp)
+            lbl.setWordWrap(False)
+            r_lay.addWidget(lbl, 1)
+
+            show_btn = QPushButton("Mostrar")
+            show_btn.setObjectName("PillBtn")
+            show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            show_btn.clicked.connect(lambda _c=False, ch_id=cid: self._on_unhide_channel(ch_id))
+            r_lay.addWidget(show_btn)
+            self.discord_hidden_list_lay.addWidget(row)
+
+    def _on_hide_channel_from_combo(self) -> None:
+        cid = str(self.discord_hide_combo.currentData() or "").strip()
+        if not cid:
+            return
+        label = str(self.discord_hide_combo.currentText() or "").strip()
+        if cid not in self.cfg.discord_hidden_channels:
+            self.cfg.discord_hidden_channels = list(self.cfg.discord_hidden_channels) + [cid]
+        if label:
+            names = dict(self.cfg.discord_hidden_channel_names)
+            names[cid] = label
+            self.cfg.discord_hidden_channel_names = names
+        save_config(self.cfg)
+        self._refresh_hidden_channels_ui()
+        self.discord_ui_settings_changed.emit()
+
+    def _on_unhide_channel(self, channel_id: str) -> None:
+        cid = str(channel_id or "").strip()
+        if not cid:
+            return
+        self.cfg.discord_hidden_channels = [
+            x for x in self.cfg.discord_hidden_channels if x != cid
+        ]
+        names = dict(self.cfg.discord_hidden_channel_names)
+        names.pop(cid, None)
+        self.cfg.discord_hidden_channel_names = names
+        save_config(self.cfg)
+        self._refresh_hidden_channels_ui()
+        self.discord_ui_settings_changed.emit()
+
+    def _on_unhide_all_channels(self) -> None:
+        if not self.cfg.discord_hidden_channels and not self.cfg.discord_hidden_channel_names:
+            return
+        self.cfg.discord_hidden_channels = []
+        self.cfg.discord_hidden_channel_names = {}
+        save_config(self.cfg)
+        self._refresh_hidden_channels_ui()
+        self.discord_ui_settings_changed.emit()
+
     def _on_startup_toggled(self, checked: bool) -> None:
         try:
             set_startup_enabled(checked)
@@ -1004,6 +1266,8 @@ class SettingsDialog(QDialog):
             )
 
     def _cleanup_dialog(self) -> None:
+        if hasattr(self, "_outside_filter"):
+            self._outside_filter.uninstall()
         self.hotkey_recording_changed.emit(False)
         self._ram_timer.stop()
         if self._login_cancel is not None:

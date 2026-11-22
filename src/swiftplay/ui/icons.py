@@ -347,5 +347,19 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
         p.drawLine(QPointF(s * 0.37, s * 0.50), QPointF(s * 0.47, s * 0.60))
         p.drawLine(QPointF(s * 0.47, s * 0.60), QPointF(s * 0.65, s * 0.40))
 
+    elif name in ("bell", "bell_off"):
+        path = QPainterPath()
+        path.moveTo(s * 0.25, s * 0.68)
+        path.lineTo(s * 0.28, s * 0.44)
+        path.quadTo(s * 0.30, s * 0.22, s * 0.50, s * 0.20)
+        path.quadTo(s * 0.70, s * 0.22, s * 0.72, s * 0.44)
+        path.lineTo(s * 0.75, s * 0.68)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.drawLine(QPointF(s * 0.20, s * 0.68), QPointF(s * 0.80, s * 0.68))
+        p.drawArc(QRectF(s * 0.41, s * 0.66, s * 0.18, s * 0.16), 180 * 16, 180 * 16)
+        if name == "bell_off":
+            p.drawLine(QPointF(s * 0.20, s * 0.20), QPointF(s * 0.80, s * 0.80))
+
     p.end()
     return QIcon(pm)

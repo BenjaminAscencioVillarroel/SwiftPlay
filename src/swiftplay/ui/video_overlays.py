@@ -324,7 +324,7 @@ class FullscreenOverlayBar(QWidget):
 
         self.play_btn = QPushButton()
         self.play_btn.setObjectName("PlayAccentBtn")
-        self.play_btn.setFixedSize(36, 32)
+        self.play_btn.setFixedSize(34, 34)
         self.play_btn.setIconSize(QSize(17, 17))
         self.play_btn.setToolTip("Reproducir / Pausar [Espacio]")
         self.play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -365,6 +365,7 @@ class FullscreenOverlayBar(QWidget):
         btn_row.addWidget(self.quality_combo)
 
         self.audio_only_btn = QPushButton(" Solo Audio")
+        self.audio_only_btn.setObjectName("PillBtn")
         self.audio_only_btn.setCheckable(True)
         self.audio_only_btn.setChecked(initial_audio_only)
         self.audio_only_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -637,12 +638,12 @@ class FullscreenOverlayBar(QWidget):
         self.audio_only_btn.blockSignals(True)
         self.audio_only_btn.setChecked(audio_only)
         self.audio_only_btn.blockSignals(False)
-        self.audio_only_btn.setObjectName("PillBtn" if audio_only else "")
+        self.audio_only_btn.setObjectName("PillBtn")
         self.audio_only_btn.setProperty("active", "true" if audio_only else "false")
         self.audio_only_btn.setIcon(
             render_icon(
                 "audio_only",
-                self._palette.accent_text if audio_only else self._palette.text,
+                self._palette.text,
                 14,
             )
         )

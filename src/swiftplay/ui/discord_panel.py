@@ -3,26 +3,40 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime
 import html
-from typing import Any
+from typing import Any, Literal
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QIcon,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPaintEvent,
+    QPen,
+    QPixmap,
+    QResizeEvent,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
-    QStackedWidget,
+    QSplitter,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -31,8 +45,79 @@ from PySide6.QtWidgets import (
 from swiftplay.config import AppConfig, save_config
 from swiftplay.discord_service import DiscordService
 from swiftplay.security import has_discord_token
+from swiftplay.storage import LocalLibrary
 from swiftplay.themes import ThemePalette
+from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
+
+_AVATAR_TINTS: tuple[str, ...] = (
+    "#5A362D",
+    "#334155",
+    "#3B4454",
+    "#2F4840",
+    "#4B3B58",
+    "#4F4430",
+)
+
+
+def _avatar_tint_for(name: str) -> str:
+    acc = sum(ord(ch) for ch in (name or "U"))
+    return _AVATAR_TINTS[acc % len(_AVATAR_TINTS)]
+
+
+def _blend_hex(base_rgb: tuple[int, int, int], tint_rgb: tuple[int, int, int], weight: float) -> str:
+    w = max(0.0, min(1.0, float(weight)))
+    r = max(12, min(230, int(round(base_rgb[0] * (1.0 - w) + tint_rgb[0] * w))))
+    g = max(14, min(230, int(round(base_rgb[1] * (1.0 - w) + tint_rgb[1] * w))))
+    b = max(18, min(235, int(round(base_rgb[2] * (1.0 - w) + tint_rgb[2] * w))))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _extract_avatar_tint(pix: QPixmap) -> tuple[str, str]:
+    """Calcula (bg_hex, border_hex) oscuros pero teñidos con el color dominante del avatar."""
+    if pix.isNull():
+        return "#1C212B", "#2E3646"
+    img = pix.scaled(
+        8,
+        8,
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.FastTransformation,
+    ).toImage().convertToFormat(QImage.Format.Format_ARGB32)
+
+    r_sum = g_sum = b_sum = count = 0
+    fb_r = fb_g = fb_b = fb_count = 0
+    for y in range(img.height()):
+        for x in range(img.width()):
+            col = img.pixelColor(x, y)
+            if col.alpha() < 120:
+                continue
+            r, g, b = col.red(), col.green(), col.blue()
+            fb_r += r
+            fb_g += g
+            fb_b += b
+            fb_count += 1
+            if (r + g + b) >= 48 and (r + g + b) <= 710:
+                r_sum += r
+                g_sum += g
+                b_sum += b
+                count += 1
+
+    if count == 0:
+        if fb_count == 0:
+            return "#1C212B", "#2E3646"
+        ar, ag, ab = fb_r // fb_count, fb_g // fb_count, fb_b // fb_count
+    else:
+        ar, ag, ab = r_sum // count, g_sum // count, b_sum // count
+
+    card_bg = _blend_hex((21, 25, 34), (ar, ag, ab), 0.25)
+    card_border = _blend_hex((42, 49, 64), (ar, ag, ab), 0.45)
+    return card_bg, card_border
+
+
+def _default_card_tint(name: str) -> tuple[str, str]:
+    c = QColor(_avatar_tint_for(name))
+    rgb = (c.red(), c.green(), c.blue())
+    return _blend_hex((21, 25, 34), rgb, 0.22), _blend_hex((42, 49, 64), rgb, 0.38)
 
 
 def _clear_layout(layout: QLayout) -> None:
@@ -42,11 +127,23 @@ def _clear_layout(layout: QLayout) -> None:
             continue
         w = item.widget()
         if w is not None:
+            rel = getattr(w, "release_resources", None)
+            if callable(rel):
+                try:
+                    rel()
+                except Exception:
+                    pass
+            w.hide()
             w.setParent(None)
             w.deleteLater()
         sub = item.layout()
         if sub is not None:
             _clear_layout(sub)
+
+
+def _clear_grid_keep_widgets(grid: QGridLayout) -> None:
+    while grid.count() > 0:
+        grid.takeAt(0)
 
 
 def _make_section_toggle_btn(text: str) -> QPushButton:
@@ -55,9 +152,307 @@ def _make_section_toggle_btn(text: str) -> QPushButton:
     btn.setFlat(True)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setStyleSheet(
-        "QPushButton { border: none; background: transparent; text-align: left; padding: 2px 2px; }"
+        "QPushButton { border: none; background: transparent; text-align: left; padding: 4px 2px; }"
     )
     return btn
+
+
+def exec_user_dm_menu(
+    parent: QWidget,
+    uid: str,
+    name: str,
+    is_bot: bool,
+    global_pos: Any,
+) -> bool:
+    """Muestra menú contextual para abrir DM con una persona (deshabilitado para otros bots)."""
+    menu = QMenu(parent)
+    try:
+        if is_bot:
+            act = menu.addAction("No se puede enviar DM a otro bot")
+            act.setEnabled(False)
+            menu.exec(global_pos)
+            return False
+        if not uid:
+            return False
+        act_dm = menu.addAction(f"Enviar DM a {name or uid}")
+        chosen = menu.exec(global_pos)
+        return chosen is act_dm
+    finally:
+        menu.deleteLater()
+
+
+class _AvatarCircleWidget(QWidget):
+    """Avatar circular con foto de perfil real (o inicial fallback) y anillo de habla."""
+
+    def __init__(
+        self,
+        name: str,
+        palette: ThemePalette,
+        *,
+        size_px: int = 64,
+        speaking: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._name = name or "?"
+        self._palette = palette
+        self._speaking = bool(speaking)
+        self._bg_hex = _avatar_tint_for(self._name)
+        self._pixmap: QPixmap | None = None
+        self.setFixedSize(size_px, size_px)
+
+    def set_speaking(self, speaking: bool) -> None:
+        val = bool(speaking)
+        if val != self._speaking:
+            self._speaking = val
+            self.update()
+
+    def set_pixmap(self, pix: QPixmap | None) -> None:
+        self._pixmap = pix if (pix is not None and not pix.isNull()) else None
+        self.update()
+
+    def update_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.update()
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        w = float(self.width())
+        h = float(self.height())
+        ring_rect = QRectF(3.0, 3.0, w - 6.0, h - 6.0)
+        inner_rect = QRectF(7.0, 7.0, w - 14.0, h - 14.0)
+
+        ring_color = QColor("#4ADE80") if self._speaking else QColor(self._palette.border_bright)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(ring_color, 3.0))
+        painter.drawEllipse(ring_rect)
+
+        if self._pixmap is not None and not self._pixmap.isNull():
+            clip = QPainterPath()
+            clip.addEllipse(inner_rect)
+            painter.save()
+            painter.setClipPath(clip)
+            scaled = self._pixmap.scaled(
+                int(inner_rect.width()),
+                int(inner_rect.height()),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            sx = inner_rect.x() + (inner_rect.width() - scaled.width()) / 2.0
+            sy = inner_rect.y() + (inner_rect.height() - scaled.height()) / 2.0
+            painter.drawPixmap(int(round(sx)), int(round(sy)), scaled)
+            painter.restore()
+        else:
+            painter.setBrush(QColor(self._bg_hex))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(inner_rect)
+
+            initial = (self._name.strip()[:1] or "?").upper()
+            font = QFont("Segoe UI", 21, QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.setPen(QColor("#F1F3F6"))
+            painter.drawText(inner_rect, Qt.AlignmentFlag.AlignCenter, initial)
+        painter.end()
+
+
+class _ParticipantCard(QFrame):
+    """Tarjeta de participante en voz con avatar real y tinte extraído del perfil."""
+
+    volume_changed = Signal(str, int)
+    dm_requested = Signal(str, str, str)
+    _AVATAR_FETCH_SIZE = QSize(64, 64)
+
+    def __init__(
+        self,
+        part: dict[str, Any],
+        volume: int,
+        speaking: bool,
+        palette: ThemePalette,
+        thumb_cache: ThumbnailCache | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._uid = str(part.get("id") or "")
+        self._is_self = bool(part.get("is_self", False))
+        self._muted = bool(part.get("muted", False))
+        self._deafened = bool(part.get("deafened", False))
+        self._speaking = bool(speaking)
+        self._palette = palette
+        self._thumb_cache = thumb_cache
+        self._avatar_url = str(part.get("avatar_url") or "")
+        self._thumb_connected = False
+
+        name = str(part.get("name") or self._uid)
+        is_bot = bool(part.get("is_bot", False))
+        self._name = name
+        self._is_bot = is_bot
+        self._card_bg_hex, self._card_border_hex = _default_card_tint(name)
+
+        self.setObjectName("DiscordParticipantCard")
+        self.setMinimumWidth(195)
+        self.setMinimumHeight(148)
+        if not self._is_self:
+            self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.customContextMenuRequested.connect(self._on_context_menu)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 12)
+        lay.setSpacing(8)
+
+        self.avatar = _AvatarCircleWidget(
+            name=name,
+            palette=palette,
+            size_px=64,
+            speaking=speaking,
+        )
+        lay.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        title_row = QHBoxLayout()
+        title_row.setSpacing(5)
+        title_row.addStretch(1)
+
+        name_lbl = QLabel(name)
+        name_lbl.setStyleSheet(
+            "font-size: 13px; font-weight: 700;"
+            if self._is_self
+            else "font-size: 13px; font-weight: 600;"
+        )
+        title_row.addWidget(name_lbl)
+
+        if is_bot:
+            tag = QLabel("APP")
+            tag.setObjectName("DeckTag")
+            title_row.addWidget(tag)
+
+        self._mute_ico: QLabel | None = None
+        if self._muted:
+            self._mute_ico = QLabel()
+            self._mute_ico.setToolTip("Micrófono silenciado")
+            title_row.addWidget(self._mute_ico)
+
+        self._deaf_ico: QLabel | None = None
+        if self._deafened:
+            self._deaf_ico = QLabel()
+            self._deaf_ico.setToolTip("Audio ensordecido")
+            title_row.addWidget(self._deaf_ico)
+
+        title_row.addStretch(1)
+        lay.addLayout(title_row)
+
+        if not self._is_self:
+            vol_row = QHBoxLayout()
+            vol_row.setSpacing(6)
+            self._vol_ico = QLabel()
+            self._vol_ico.setFixedSize(16, 16)
+            vol_row.addWidget(self._vol_ico)
+
+            self.slider = QSlider(Qt.Orientation.Horizontal)
+            self.slider.setRange(0, 200)
+            self.slider.setValue(max(0, min(200, int(volume))))
+            self.slider.setCursor(Qt.CursorShape.PointingHandCursor)
+            vol_row.addWidget(self.slider, 1)
+
+            self.vol_lbl = QLabel(f"{self.slider.value()}%")
+            self.vol_lbl.setObjectName("MutedLabel")
+            self.vol_lbl.setFixedWidth(36)
+            self.vol_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            vol_row.addWidget(self.vol_lbl)
+
+            self.slider.valueChanged.connect(self._on_slider_changed)
+            lay.addLayout(vol_row)
+        else:
+            self._vol_ico = None
+            self.slider = None
+            self.vol_lbl = None
+            self_lbl = QLabel("Tú")
+            self_lbl.setObjectName("MutedLabel")
+            self_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self_lbl.setFixedHeight(20)
+            lay.addWidget(self_lbl)
+
+        self._load_avatar()
+        self.update_theme(palette)
+
+    def _load_avatar(self) -> None:
+        if self._thumb_cache is None or not self._avatar_url:
+            return
+        cached = self._thumb_cache.get_or_fetch(
+            self._avatar_url, self._AVATAR_FETCH_SIZE, circular=True
+        )
+        if cached is not None:
+            self._apply_avatar_pixmap(cached)
+        else:
+            self._thumb_cache.ready.connect(self._on_thumb_ready)
+            self._thumb_connected = True
+
+    def _disconnect_thumb(self) -> None:
+        if self._thumb_connected and self._thumb_cache is not None:
+            self._thumb_connected = False
+            try:
+                self._thumb_cache.ready.disconnect(self._on_thumb_ready)
+            except (RuntimeError, TypeError):
+                pass
+
+    def _on_thumb_ready(self, url: str, pix: QPixmap) -> None:
+        if url == self._avatar_url and pix.size() == self._AVATAR_FETCH_SIZE:
+            self._apply_avatar_pixmap(pix)
+            self._disconnect_thumb()
+
+    def _apply_avatar_pixmap(self, pix: QPixmap) -> None:
+        self.avatar.set_pixmap(pix)
+        self._card_bg_hex, self._card_border_hex = _extract_avatar_tint(pix)
+        self._apply_card_style()
+
+    def _apply_card_style(self) -> None:
+        border_col = "#4ADE80" if self._speaking else self._card_border_hex
+        self.setStyleSheet(
+            f"QFrame#DiscordParticipantCard {{ background-color: {self._card_bg_hex}; "
+            f"border: 1px solid {border_col}; border-radius: 12px; }}"
+        )
+
+    def release_resources(self) -> None:
+        self._disconnect_thumb()
+        self.avatar.set_pixmap(None)
+
+    def _on_slider_changed(self, value: int) -> None:
+        if self.vol_lbl is not None:
+            self.vol_lbl.setText(f"{value}%")
+        self.volume_changed.emit(self._uid, int(value))
+
+    def _on_context_menu(self, pos: Any) -> None:
+        if self._is_self:
+            return
+        if exec_user_dm_menu(
+            self, self._uid, self._name, self._is_bot, self.mapToGlobal(pos)
+        ):
+            self.dm_requested.emit(self._uid, self._name, self._avatar_url)
+
+    def set_speaking(self, speaking: bool) -> None:
+        val = bool(speaking)
+        self.avatar.set_speaking(val)
+        if val != self._speaking:
+            self._speaking = val
+            self._apply_card_style()
+
+    def update_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.avatar.update_theme(palette)
+        self._apply_card_style()
+        if self._vol_ico is not None:
+            self._vol_ico.setPixmap(
+                render_icon("volume", palette.text2, 14).pixmap(QSize(14, 14))
+            )
+        if self._mute_ico is not None:
+            self._mute_ico.setPixmap(
+                render_icon("mic_off", "#F87171", 13).pixmap(QSize(13, 13))
+            )
+        if self._deaf_ico is not None:
+            self._deaf_ico.setPixmap(
+                render_icon("headphones_off", "#F87171", 13).pixmap(QSize(13, 13))
+            )
 
 
 class DiscordVoicePanel(QWidget):
@@ -65,19 +460,27 @@ class DiscordVoicePanel(QWidget):
 
     open_token_settings_requested = Signal()
     open_shortcuts_settings_requested = Signal()
+    voice_status_changed = Signal(bool, bool, bool)  # active, muted, deafened
+    channel_alert_requested = Signal(dict)
     toast_requested = Signal(str)
+
+    _LIST_AVATAR_SIZE = QSize(28, 28)
 
     def __init__(
         self,
         config: AppConfig,
         service: DiscordService,
         palette: ThemePalette,
+        thumb_cache: ThumbnailCache | None = None,
+        db: LocalLibrary | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.cfg = config
         self.svc = service
         self.palette = palette
+        self._thumb_cache = thumb_cache
+        self._db = db
 
         self._guilds: list[dict[str, Any]] = []
         self._voice_state: dict[str, Any] = {
@@ -97,33 +500,52 @@ class DiscordVoicePanel(QWidget):
         self._bot_state = "disconnected"
         self._joining_channel_id = ""
         self._user_volumes: dict[str, int] = {}
-        self._participant_dots: dict[str, QLabel] = {}
+        self._participant_cards: dict[str, _ParticipantCard] = {}
+        self._participant_cards_order: list[_ParticipantCard] = []
+        self._last_grid_cols: int = 0
         self._populating_devices = False
         self._selected_guild_id = ""
         self._active_chat_kind = ""
         self._active_chat_id = ""
         self._active_chat_can_send = False
+        self._active_dm_peer_name = ""
+        self._active_dm_peer_avatar = ""
         self._chat_messages: deque[dict[str, Any]] = deque(maxlen=80)
+        self._dm_threads_mem: list[dict[str, str]] = []
+        self._dm_msgs_mem: dict[str, list[dict[str, Any]]] = {}
         self._members: list[dict[str, Any]] = []
+        self._online_count: int = 0
+        self._channel_members: list[dict[str, Any]] = []
+        self._channel_online_count: int = 0
+        self._channel_members_loaded: bool = False
+        self._members_scope: Literal["channel", "server"] = "channel"
+        self._member_row_by_url: dict[str, list[QListWidgetItem]] = {}
+        self._unread_channels: set[str] = set()
+        self._last_channels_sig: Any = None
+        self._last_participants_sig: Any = None
         self._worker_ws_mb = 0.0
         self._worker_priv_mb = 0.0
 
-        # Estado de acordeones y cajones plegables (interfaz limpia por defecto)
+        # Estado de acordeones y vistas (mockup limpio sin espacio muerto)
         self._channels_visible = True
         self._members_visible = False
         self._audio_drawer_open = False
         self._vc_section_open = True
-        self._tc_section_open = False
+        self._tc_section_open = True
+        self._dm_section_open = True
         self._locked_vc_expanded = False
+        self._voice_pane_visible = True
+        self._chat_pane_visible = True
 
         self._build_ui()
+        self._render_dm_threads()
         self._connect_service_signals()
         self.refresh_token_state()
         self.update_theme(self.palette)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 14, 18, 12)
+        root.setContentsMargins(18, 12, 18, 10)
         root.setSpacing(10)
 
         # --- Cabecera minimalista ---
@@ -156,7 +578,7 @@ class DiscordVoicePanel(QWidget):
         self.toggle_members_btn = QPushButton("Miembros")
         self.toggle_members_btn.setObjectName("PillBtn")
         self.toggle_members_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.toggle_members_btn.setToolTip("Mostrar u ocultar miembros conectados del servidor")
+        self.toggle_members_btn.setToolTip("Mostrar u ocultar miembros del canal o servidor")
         self.toggle_members_btn.clicked.connect(self._toggle_members_panel)
         hdr.addWidget(self.toggle_members_btn)
 
@@ -169,7 +591,7 @@ class DiscordVoicePanel(QWidget):
 
         # --- Tarjeta de configuración inicial (cuando aún no hay Bot Token) ---
         self.setup_card = QFrame()
-        self.setup_card.setObjectName("MediaCard")
+        self.setup_card.setObjectName("DiscordSidebarCard")
         setup_lay = QVBoxLayout(self.setup_card)
         setup_lay.setContentsMargins(18, 16, 18, 16)
         setup_lay.setSpacing(10)
@@ -179,7 +601,7 @@ class DiscordVoicePanel(QWidget):
         setup_lay.addWidget(setup_title)
 
         setup_desc = QLabel(
-            "Conecta voz con DAVE (E2EE), mira el estado de miembros del servidor y chatea sin la pesada "
+            "Conecta voz con DAVE (E2EE), mira los miembros del canal y chatea sin la pesada "
             "aplicación oficial (0 MB cuando desconectas el bot).\n\n"
             "Pasos rápidos (una sola vez):\n"
             "1. Abre https://discord.com/developers/applications → New Application → Bot → Token.\n"
@@ -207,11 +629,11 @@ class DiscordVoicePanel(QWidget):
         ws_lay.setContentsMargins(0, 0, 0, 0)
         ws_lay.setSpacing(10)
 
-        # Columna izquierda plegable: Selector de servidor + acordeones Voz / Texto
+        # Columna izquierda unificada: Servidor + Canales de Voz + Canales de Texto sin espacio muerto
         self.left_card = QFrame()
-        self.left_card.setObjectName("MediaCard")
-        self.left_card.setMinimumWidth(235)
-        self.left_card.setMaximumWidth(275)
+        self.left_card.setObjectName("DiscordSidebarCard")
+        self.left_card.setMinimumWidth(232)
+        self.left_card.setMaximumWidth(272)
         left_lay = QVBoxLayout(self.left_card)
         left_lay.setContentsMargins(10, 10, 10, 10)
         left_lay.setSpacing(6)
@@ -229,60 +651,78 @@ class DiscordVoicePanel(QWidget):
         self.refresh_guilds_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_guilds_btn.clicked.connect(self.svc.refresh_guilds)
         srv_row.addWidget(self.refresh_guilds_btn)
-        left_lay.addLayout(srv_row)
 
-        # Acordeón Canales de Voz (abierto por defecto)
-        self.vc_section_btn = _make_section_toggle_btn("▾ CANALES DE VOZ")
-        self.vc_section_btn.clicked.connect(self._toggle_voice_channels_section)
-        left_lay.addWidget(self.vc_section_btn)
+        self.close_channels_btn = QPushButton()
+        self.close_channels_btn.setObjectName("IconBtn")
+        self.close_channels_btn.setFixedSize(26, 26)
+        self.close_channels_btn.setToolTip("Ocultar panel de canales (reabrir con 'Canales')")
+        self.close_channels_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_channels_btn.clicked.connect(self._toggle_channels_panel)
+        srv_row.addWidget(self.close_channels_btn)
+        left_lay.addLayout(srv_row)
 
         self.channels_scroll = QScrollArea()
         self.channels_scroll.setWidgetResizable(True)
         self.channels_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.channels_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         ch_container = QWidget()
-        self.channels_lay = QVBoxLayout(ch_container)
-        self.channels_lay.setContentsMargins(0, 2, 2, 4)
+        ch_container.setStyleSheet("background: transparent;")
+        unified_lay = QVBoxLayout(ch_container)
+        unified_lay.setContentsMargins(0, 2, 2, 4)
+        unified_lay.setSpacing(6)
+
+        self.vc_section_btn = _make_section_toggle_btn("▾ CANALES DE VOZ")
+        self.vc_section_btn.clicked.connect(self._toggle_voice_channels_section)
+        unified_lay.addWidget(self.vc_section_btn)
+
+        self.vc_list_widget = QWidget()
+        self.vc_list_widget.setStyleSheet("background: transparent;")
+        self.channels_lay = QVBoxLayout(self.vc_list_widget)
+        self.channels_lay.setContentsMargins(0, 0, 0, 4)
         self.channels_lay.setSpacing(5)
         self.channels_empty_lbl = QLabel("Pulsa 'Conectar Bot' para ver tus canales.")
         self.channels_empty_lbl.setObjectName("MutedLabel")
         self.channels_empty_lbl.setWordWrap(True)
         self.channels_lay.addWidget(self.channels_empty_lbl)
-        self.channels_lay.addStretch()
-        self.channels_scroll.setWidget(ch_container)
-        left_lay.addWidget(self.channels_scroll, 2)
+        unified_lay.addWidget(self.vc_list_widget)
 
-        # Acordeón Canales de Texto (plegado por defecto)
-        self.tc_section_btn = _make_section_toggle_btn("▸ CANALES DE TEXTO")
+        self.tc_section_btn = _make_section_toggle_btn("▾ CANALES DE TEXTO")
         self.tc_section_btn.clicked.connect(self._toggle_text_channels_section)
-        left_lay.addWidget(self.tc_section_btn)
+        unified_lay.addWidget(self.tc_section_btn)
 
-        self.text_channels_scroll = QScrollArea()
-        self.text_channels_scroll.setWidgetResizable(True)
-        self.text_channels_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        tc_container = QWidget()
-        self.text_channels_lay = QVBoxLayout(tc_container)
-        self.text_channels_lay.setContentsMargins(0, 2, 2, 4)
-        self.text_channels_lay.setSpacing(4)
+        self.text_channels_scroll = QWidget()
+        self.text_channels_scroll.setStyleSheet("background: transparent;")
+        self.text_channels_lay = QVBoxLayout(self.text_channels_scroll)
+        self.text_channels_lay.setContentsMargins(0, 0, 0, 4)
+        self.text_channels_lay.setSpacing(3)
         tc_empty = QLabel("Conecta el bot para ver canales de texto.")
         tc_empty.setObjectName("MutedLabel")
         tc_empty.setWordWrap(True)
         self.text_channels_lay.addWidget(tc_empty)
-        self.text_channels_lay.addStretch()
-        self.text_channels_scroll.setWidget(tc_container)
-        self.text_channels_scroll.setVisible(False)
-        left_lay.addWidget(self.text_channels_scroll, 1)
+        unified_lay.addWidget(self.text_channels_scroll)
 
-        left_lay.addStretch(0)
+        self.dm_section_btn = _make_section_toggle_btn("▾ MENSAJES DIRECTOS")
+        self.dm_section_btn.clicked.connect(self._toggle_dm_channels_section)
+        unified_lay.addWidget(self.dm_section_btn)
+
+        self.dm_channels_scroll = QWidget()
+        self.dm_channels_scroll.setStyleSheet("background: transparent;")
+        self.dm_channels_lay = QVBoxLayout(self.dm_channels_scroll)
+        self.dm_channels_lay.setContentsMargins(0, 0, 0, 4)
+        self.dm_channels_lay.setSpacing(3)
+        unified_lay.addWidget(self.dm_channels_scroll)
+
+        unified_lay.addStretch(1)
+        self.channels_scroll.setWidget(ch_container)
+        left_lay.addWidget(self.channels_scroll, 1)
         ws_lay.addWidget(self.left_card)
 
-        # Columna central: Banner intents + Voz/Chat + Barra compacta de audio
+        # Columna central: Banner intents + Split (Voz arriba + Chat abajo) + Deck centrado
         right_col = QVBoxLayout()
         right_col.setSpacing(8)
 
         self.intents_banner = QFrame()
-        self.intents_banner.setObjectName("MediaCard")
+        self.intents_banner.setObjectName("DiscordHeaderBar")
         ib_lay = QHBoxLayout(self.intents_banner)
         ib_lay.setContentsMargins(10, 6, 10, 6)
         ib_lay.setSpacing(8)
@@ -293,80 +733,152 @@ class DiscordVoicePanel(QWidget):
         ib_lbl.setWordWrap(True)
         ib_lbl.setStyleSheet("color: #FBBF24; font-size: 11px;")
         ib_lay.addWidget(ib_lbl, 1)
-        ib_close = QPushButton("×")
-        ib_close.setFixedSize(22, 22)
-        ib_close.setToolTip("Ocultar aviso")
-        ib_close.clicked.connect(lambda: self.intents_banner.setVisible(False))
-        ib_lay.addWidget(ib_close)
+        self.intents_close_btn = QPushButton()
+        self.intents_close_btn.setObjectName("IconBtn")
+        self.intents_close_btn.setFixedSize(24, 24)
+        self.intents_close_btn.setToolTip("Ocultar aviso")
+        self.intents_close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.intents_close_btn.clicked.connect(lambda: self.intents_banner.setVisible(False))
+        ib_lay.addWidget(self.intents_close_btn)
         self.intents_banner.setVisible(False)
         right_col.addWidget(self.intents_banner)
 
-        call_card = QFrame()
-        call_card.setObjectName("MediaCard")
-        call_lay = QVBoxLayout(call_card)
-        call_lay.setContentsMargins(14, 10, 14, 10)
-        call_lay.setSpacing(8)
+        # Cabecera del área central (Voz / Chat toggles + canal activo)
+        center_hdr_card = QFrame()
+        center_hdr_card.setObjectName("DiscordHeaderBar")
+        chdr = QHBoxLayout(center_hdr_card)
+        chdr.setContentsMargins(12, 7, 12, 7)
+        chdr.setSpacing(6)
 
-        call_hdr = QHBoxLayout()
-        call_hdr.setSpacing(6)
         self.tab_voice_btn = QPushButton("Voz")
         self.tab_voice_btn.setObjectName("PillBtn")
         self.tab_voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.tab_voice_btn.clicked.connect(lambda: self._set_center_tab(0))
-        call_hdr.addWidget(self.tab_voice_btn)
+        self.tab_voice_btn.setToolTip("Mostrar u ocultar tarjetas de voz")
+        self.tab_voice_btn.clicked.connect(lambda: self._on_center_tab_toggled("voice"))
+        chdr.addWidget(self.tab_voice_btn)
 
         self.tab_chat_btn = QPushButton("Chat")
         self.tab_chat_btn.setObjectName("PillBtn")
         self.tab_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.tab_chat_btn.clicked.connect(lambda: self._set_center_tab(1))
-        call_hdr.addWidget(self.tab_chat_btn)
+        self.tab_chat_btn.setToolTip("Mostrar u ocultar panel de chat")
+        self.tab_chat_btn.clicked.connect(lambda: self._on_center_tab_toggled("chat"))
+        chdr.addWidget(self.tab_chat_btn)
 
         self.active_channel_lbl = QLabel("Sin canal activo")
-        self.active_channel_lbl.setStyleSheet("font-size: 14px; font-weight: 700; margin-left: 6px;")
-        call_hdr.addWidget(self.active_channel_lbl)
+        self.active_channel_lbl.setStyleSheet(
+            "font-size: 13px; font-weight: 700; margin-left: 6px;"
+        )
+        chdr.addWidget(self.active_channel_lbl, 1)
+        right_col.addWidget(center_hdr_card)
 
+        # Splitter vertical: área oscura de voz (arriba) + línea separadora + tarjeta de chat (abajo)
+        self.center_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.center_splitter.setChildrenCollapsible(False)
+        self.center_splitter.setHandleWidth(8)
+        self.center_splitter.setStyleSheet(
+            "QSplitter::handle { background: rgba(207, 213, 223, 38); border-radius: 2px; margin: 2px 24px; }"
+        )
+
+        # Panel superior: Fondo propio de Voz + cabecera colapsable + tarjetas de participantes
+        self.voice_pane = QFrame()
+        self.voice_pane.setObjectName("DiscordVoiceArea")
+        vp_lay = QVBoxLayout(self.voice_pane)
+        vp_lay.setContentsMargins(10, 8, 10, 10)
+        vp_lay.setSpacing(8)
+
+        voice_hdr_frame = QFrame()
+        voice_hdr_frame.setObjectName("DiscordVoiceHeader")
+        vh_lay = QHBoxLayout(voice_hdr_frame)
+        vh_lay.setContentsMargins(10, 5, 8, 5)
+        vh_lay.setSpacing(6)
+        v_title = QLabel("LLAMADA DE VOZ")
+        v_title.setObjectName("SectionHeader")
+        v_title.setStyleSheet(
+            "padding: 2px 0px; font-size: 10px; font-weight: 700; letter-spacing: 1.2px;"
+        )
+        vh_lay.addWidget(v_title)
+        vh_lay.addStretch()
+        self.close_voice_btn = QPushButton()
+        self.close_voice_btn.setObjectName("IconBtn")
+        self.close_voice_btn.setFixedSize(24, 24)
+        self.close_voice_btn.setToolTip("Ocultar panel de voz (reabrir con 'Voz')")
+        self.close_voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_voice_btn.clicked.connect(lambda: self._set_pane_visible("voice", False))
+        vh_lay.addWidget(self.close_voice_btn)
+        vp_lay.addWidget(voice_hdr_frame)
+
+        self.participants_scroll = QScrollArea()
+        self.participants_scroll.setWidgetResizable(True)
+        self.participants_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.participants_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+        )
+        part_container = QWidget()
+        part_container.setStyleSheet("background: transparent;")
+        part_outer = QVBoxLayout(part_container)
+        part_outer.setContentsMargins(0, 0, 0, 0)
+        part_outer.setSpacing(8)
+
+        self.participants_grid = QGridLayout()
+        self.participants_grid.setContentsMargins(0, 0, 0, 0)
+        self.participants_grid.setSpacing(10)
+        part_outer.addLayout(self.participants_grid)
+
+        self.participants_empty_lbl = QLabel(
+            "Elige un canal de voz a la izquierda para conectarte y hablar en tiempo real."
+        )
+        self.participants_empty_lbl.setObjectName("MutedLabel")
+        self.participants_empty_lbl.setWordWrap(True)
+        self.participants_empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.participants_empty_lbl.setContentsMargins(12, 24, 12, 24)
+        part_outer.addWidget(self.participants_empty_lbl)
+        part_outer.addStretch(1)
+
+        self.participants_scroll.setWidget(part_container)
+        vp_lay.addWidget(self.participants_scroll, 1)
+        self.center_splitter.addWidget(self.voice_pane)
+
+        # Panel inferior: Chat con cabecera propia y fondo diferenciado
+        self.chat_pane = QFrame()
+        self.chat_pane.setObjectName("DiscordChatCard")
+        chat_lay = QVBoxLayout(self.chat_pane)
+        chat_lay.setContentsMargins(0, 0, 0, 0)
+        chat_lay.setSpacing(0)
+
+        chat_hdr_frame = QFrame()
+        chat_hdr_frame.setObjectName("DiscordChatHeader")
+        chat_hdr = QHBoxLayout(chat_hdr_frame)
+        chat_hdr.setContentsMargins(14, 8, 14, 8)
+        chat_hdr.setSpacing(6)
         self.chat_title_lbl = QLabel("Sin chat seleccionado")
-        self.chat_title_lbl.setStyleSheet("font-size: 14px; font-weight: 700; margin-left: 6px;")
-        self.chat_title_lbl.setVisible(False)
-        call_hdr.addWidget(self.chat_title_lbl)
+        self.chat_title_lbl.setStyleSheet("font-size: 14px; font-weight: 700;")
+        chat_hdr.addWidget(self.chat_title_lbl)
+
+        chat_hdr.addStretch()
 
         self.bot_chat_badge = QLabel("Envía como Bot")
         self.bot_chat_badge.setObjectName("DeckTag")
         self.bot_chat_badge.setToolTip(
             "Los mensajes escritos aquí se envían usando la cuenta del Bot oficial."
         )
-        self.bot_chat_badge.setVisible(False)
-        call_hdr.addWidget(self.bot_chat_badge)
-        call_hdr.addStretch()
-        call_lay.addLayout(call_hdr)
+        chat_hdr.addWidget(self.bot_chat_badge)
 
-        self.center_stack = QStackedWidget()
+        self.close_chat_btn = QPushButton()
+        self.close_chat_btn.setObjectName("IconBtn")
+        self.close_chat_btn.setFixedSize(24, 24)
+        self.close_chat_btn.setToolTip("Ocultar panel de chat (reabrir con 'Chat')")
+        self.close_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_chat_btn.clicked.connect(lambda: self._set_pane_visible("chat", False))
+        chat_hdr.addWidget(self.close_chat_btn)
+        chat_lay.addWidget(chat_hdr_frame)
 
-        # Página 0: Participantes en llamada de voz
-        self.participants_scroll = QScrollArea()
-        self.participants_scroll.setWidgetResizable(True)
-        self.participants_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        part_container = QWidget()
-        self.participants_lay = QVBoxLayout(part_container)
-        self.participants_lay.setContentsMargins(0, 4, 4, 4)
-        self.participants_lay.setSpacing(6)
-        self.participants_empty_lbl = QLabel(
-            "Elige un canal de voz a la izquierda para conectarte y hablar en tiempo real."
-        )
-        self.participants_empty_lbl.setObjectName("MutedLabel")
-        self.participants_empty_lbl.setWordWrap(True)
-        self.participants_lay.addWidget(self.participants_empty_lbl)
-        self.participants_lay.addStretch()
-        self.participants_scroll.setWidget(part_container)
-        self.center_stack.addWidget(self.participants_scroll)
-
-        # Página 1: Chat de canal de texto o DM
-        chat_page = QWidget()
-        chat_lay = QVBoxLayout(chat_page)
-        chat_lay.setContentsMargins(0, 2, 0, 0)
-        chat_lay.setSpacing(8)
+        chat_body = QWidget()
+        chat_body.setStyleSheet("background: transparent;")
+        chat_body_lay = QVBoxLayout(chat_body)
+        chat_body_lay.setContentsMargins(14, 8, 14, 10)
+        chat_body_lay.setSpacing(8)
 
         self.chat_browser = QTextBrowser()
         self.chat_browser.setReadOnly(True)
@@ -375,14 +887,15 @@ class DiscordVoicePanel(QWidget):
             "QTextBrowser { background: transparent; border: none; padding: 2px; font-size: 13px; }"
         )
         self.chat_browser.setHtml(
-            "<p style='color:#94A3B8;'>Abre <b>Canales de texto</b> o pulsa <b>Miembros</b> en la barra superior para iniciar un chat o DM.</p>"
+            "<p style='color:#9299A8;'>Selecciona un canal de texto a la izquierda para ver y enviar mensajes aquí.</p>"
         )
-        chat_lay.addWidget(self.chat_browser, 1)
+        chat_body_lay.addWidget(self.chat_browser, 1)
 
         chat_input_row = QHBoxLayout()
         chat_input_row.setSpacing(8)
         self.chat_input = QLineEdit()
-        self.chat_input.setPlaceholderText("Selecciona un canal #texto o miembro para escribir... [Enter]")
+        self.chat_input.setObjectName("DiscordChatInput")
+        self.chat_input.setPlaceholderText("Selecciona un canal #texto para escribir... [Enter]")
         self.chat_input.setEnabled(False)
         self.chat_input.returnPressed.connect(self._on_send_chat_clicked)
         chat_input_row.addWidget(self.chat_input, 1)
@@ -393,23 +906,57 @@ class DiscordVoicePanel(QWidget):
         self.chat_send_btn.setEnabled(False)
         self.chat_send_btn.clicked.connect(self._on_send_chat_clicked)
         chat_input_row.addWidget(self.chat_send_btn)
-        chat_lay.addLayout(chat_input_row)
+        chat_body_lay.addLayout(chat_input_row)
+        chat_lay.addWidget(chat_body, 1)
 
-        self.center_stack.addWidget(chat_page)
-        call_lay.addWidget(self.center_stack, 1)
-        self._set_center_tab(0)
+        self.center_splitter.addWidget(self.chat_pane)
+        self.center_splitter.setStretchFactor(0, 4)
+        self.center_splitter.setStretchFactor(1, 5)
+        self.center_splitter.setSizes([215, 275])
 
-        right_col.addWidget(call_card, 1)
+        right_col.addWidget(self.center_splitter, 1)
 
-        # Deck inferior de audio: barra esencial 1 fila + cajón desplegable (oculto por defecto)
+        self.center_collapsed_card = QFrame()
+        self.center_collapsed_card.setObjectName("DiscordVoiceArea")
+        cc_lay = QVBoxLayout(self.center_collapsed_card)
+        cc_lay.setContentsMargins(20, 24, 20, 24)
+        cc_lay.setSpacing(10)
+        cc_lay.addStretch(1)
+        cc_lbl = QLabel("Los paneles de Voz y Chat están colapsados.")
+        cc_lbl.setObjectName("MutedLabel")
+        cc_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cc_lay.addWidget(cc_lbl)
+        cc_btns = QHBoxLayout()
+        cc_btns.setSpacing(10)
+        cc_btns.addStretch()
+        self.reopen_voice_btn = QPushButton("Abrir Voz")
+        self.reopen_voice_btn.setObjectName("AccentBtn")
+        self.reopen_voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reopen_voice_btn.clicked.connect(lambda: self._set_pane_visible("voice", True))
+        cc_btns.addWidget(self.reopen_voice_btn)
+        self.reopen_chat_btn = QPushButton("Abrir Chat")
+        self.reopen_chat_btn.setObjectName("AccentBtn")
+        self.reopen_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reopen_chat_btn.clicked.connect(lambda: self._set_pane_visible("chat", True))
+        cc_btns.addWidget(self.reopen_chat_btn)
+        cc_btns.addStretch()
+        cc_lay.addLayout(cc_btns)
+        cc_lay.addStretch(1)
+        self.center_collapsed_card.setVisible(False)
+        right_col.addWidget(self.center_collapsed_card, 1)
+
+        self._sync_center_panes()
+
+        # Deck inferior de audio centrado con superficie propia
         deck = QFrame()
-        deck.setObjectName("MediaCard")
+        deck.setObjectName("DiscordDeckCard")
         deck_lay = QVBoxLayout(deck)
-        deck_lay.setContentsMargins(12, 9, 12, 9)
+        deck_lay.setContentsMargins(12, 8, 12, 8)
         deck_lay.setSpacing(8)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
+        btn_row.addStretch(1)
 
         self.mute_btn = QPushButton(" Silenciar")
         self.mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -431,9 +978,9 @@ class DiscordVoicePanel(QWidget):
         self.mic_vu_bar.setRange(0, 100)
         self.mic_vu_bar.setValue(0)
         self.mic_vu_bar.setTextVisible(False)
-        self.mic_vu_bar.setFixedHeight(8)
-        self.mic_vu_bar.setMinimumWidth(90)
-        btn_row.addWidget(self.mic_vu_bar, 1)
+        self.mic_vu_bar.setFixedHeight(7)
+        self.mic_vu_bar.setFixedWidth(84)
+        btn_row.addWidget(self.mic_vu_bar)
 
         self.audio_toggle_btn = QPushButton("Audio ▾")
         self.audio_toggle_btn.setObjectName("PillBtn")
@@ -449,9 +996,10 @@ class DiscordVoicePanel(QWidget):
         self.hangup_btn.clicked.connect(self.svc.leave_channel)
         self.hangup_btn.setVisible(False)
         btn_row.addWidget(self.hangup_btn)
+
+        btn_row.addStretch(1)
         deck_lay.addLayout(btn_row)
 
-        # Cajón avanzado oculto por defecto
         self.audio_advanced_box = QWidget()
         adv_lay = QVBoxLayout(self.audio_advanced_box)
         adv_lay.setContentsMargins(0, 4, 0, 0)
@@ -569,11 +1117,11 @@ class DiscordVoicePanel(QWidget):
         right_col.addWidget(deck)
         ws_lay.addLayout(right_col, 1)
 
-        # Columna derecha desplegable: Miembros del servidor (OCULTA por defecto)
+        # Columna derecha desplegable: Miembros por Canal o Servidor (OCULTA por defecto)
         self.members_card = QFrame()
-        self.members_card.setObjectName("MediaCard")
-        self.members_card.setMinimumWidth(210)
-        self.members_card.setMaximumWidth(245)
+        self.members_card.setObjectName("DiscordSidebarCard")
+        self.members_card.setMinimumWidth(215)
+        self.members_card.setMaximumWidth(250)
         m_lay = QVBoxLayout(self.members_card)
         m_lay.setContentsMargins(10, 10, 10, 10)
         m_lay.setSpacing(6)
@@ -581,37 +1129,67 @@ class DiscordVoicePanel(QWidget):
         m_hdr = QHBoxLayout()
         m_title = QLabel("MIEMBROS")
         m_title.setObjectName("SectionHeader")
+        m_title.setStyleSheet(
+            "padding: 2px 0px; font-size: 10px; font-weight: 700; letter-spacing: 1.2px;"
+        )
         m_hdr.addWidget(m_title)
         m_hdr.addStretch()
+
+        self.close_members_btn = QPushButton()
+        self.close_members_btn.setObjectName("IconBtn")
+        self.close_members_btn.setFixedSize(24, 24)
+        self.close_members_btn.setToolTip("Ocultar panel de miembros")
+        self.close_members_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_members_btn.clicked.connect(self._toggle_members_panel)
+        m_hdr.addWidget(self.close_members_btn)
+        m_lay.addLayout(m_hdr)
+
+        scope_row = QHBoxLayout()
+        scope_row.setSpacing(6)
+        self.members_scope_channel_btn = QPushButton("Canal")
+        self.members_scope_channel_btn.setObjectName("PillBtn")
+        self.members_scope_channel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.members_scope_channel_btn.setToolTip("Mostrar solo miembros con acceso al canal activo")
+        self.members_scope_channel_btn.clicked.connect(lambda: self._set_members_scope("channel"))
+        scope_row.addWidget(self.members_scope_channel_btn, 1)
+
+        self.members_scope_server_btn = QPushButton("Servidor")
+        self.members_scope_server_btn.setObjectName("PillBtn")
+        self.members_scope_server_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.members_scope_server_btn.setToolTip("Mostrar todos los miembros del servidor")
+        self.members_scope_server_btn.clicked.connect(lambda: self._set_members_scope("server"))
+        scope_row.addWidget(self.members_scope_server_btn, 1)
+        m_lay.addLayout(scope_row)
+
         self.members_online_lbl = QLabel("0 en línea")
         self.members_online_lbl.setObjectName("MutedLabel")
-        m_hdr.addWidget(self.members_online_lbl)
-
-        m_close = QPushButton("×")
-        m_close.setFixedSize(22, 22)
-        m_close.setToolTip("Ocultar panel de miembros")
-        m_close.setCursor(Qt.CursorShape.PointingHandCursor)
-        m_close.clicked.connect(self._toggle_members_panel)
-        m_hdr.addWidget(m_close)
-        m_lay.addLayout(m_hdr)
+        m_lay.addWidget(self.members_online_lbl)
 
         self.members_list = QListWidget()
         self.members_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.members_list.setWordWrap(True)
+        self.members_list.setIconSize(self._LIST_AVATAR_SIZE)
         self.members_list.setStyleSheet(
             "QListWidget { background: transparent; border: none; outline: none; }"
             "QListWidget::item { padding: 5px 4px; border-radius: 6px; }"
         )
-        self.members_list.setToolTip("Haz doble clic en un miembro para abrir un chat directo (DM)")
+        self.members_list.setToolTip("Miembros del canal o servidor (clic derecho o doble clic para DM)")
+        self.members_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.members_list.customContextMenuRequested.connect(self._on_members_context_menu)
         self.members_list.itemDoubleClicked.connect(lambda _it: self._on_open_selected_dm())
         m_lay.addWidget(self.members_list, 1)
 
+        self.dm_hint_lbl = QLabel("Entre bots usen un canal privado")
+        self.dm_hint_lbl.setObjectName("MutedLabel")
+        self.dm_hint_lbl.setWordWrap(True)
+        self.dm_hint_lbl.setVisible(False)
+        m_lay.addWidget(self.dm_hint_lbl)
+
         self.dm_btn = QPushButton("Enviar DM")
-        self.dm_btn.setToolTip(
-            "Abrir conversación directa con la persona seleccionada (se envía como tu Bot)"
-        )
+        self.dm_btn.setToolTip("Abrir conversación directa con la persona seleccionada")
         self.dm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dm_btn.setEnabled(False)
+        self.dm_btn.setVisible(False)
         self.dm_btn.clicked.connect(self._on_open_selected_dm)
         self.members_list.itemSelectionChanged.connect(self._on_member_selection_changed)
         m_lay.addWidget(self.dm_btn)
@@ -621,6 +1199,7 @@ class DiscordVoicePanel(QWidget):
 
         root.addWidget(self.workspace_widget, 1)
         self._refresh_header_toggles()
+        self._refresh_scope_buttons()
 
     def _connect_service_signals(self) -> None:
         self.svc.state_changed.connect(self._on_bot_state_changed)
@@ -628,6 +1207,7 @@ class DiscordVoicePanel(QWidget):
         self.svc.guild_members_updated.connect(self._on_guild_members_updated)
         self.svc.chat_history_loaded.connect(self._on_chat_history_loaded)
         self.svc.chat_message_received.connect(self._on_chat_message_received)
+        self.svc.channel_message_incoming.connect(self._on_channel_message_incoming)
         self.svc.dm_incoming.connect(self._on_dm_incoming)
         self.svc.voice_state_updated.connect(self._on_voice_state_updated)
         self.svc.speaking_updated.connect(self._on_speaking_updated)
@@ -636,6 +1216,31 @@ class DiscordVoicePanel(QWidget):
         self.svc.worker_ram_updated.connect(self._on_worker_ram_updated)
         self.svc.error_occurred.connect(self._on_service_error)
         self.svc.warning_occurred.connect(lambda msg: self.toast_requested.emit(msg))
+        if self._thumb_cache is not None:
+            self._thumb_cache.ready.connect(self._on_member_avatar_ready)
+
+    def _emit_voice_status(self) -> None:
+        active = bool(
+            self._voice_state.get("in_voice", False)
+            or self._bot_state == "connected"
+            or self.svc.is_connected
+        )
+        self.voice_status_changed.emit(active, self._muted, self._deafened)
+
+    def sync_notify_channels(self) -> None:
+        self.svc.set_notify_channels(self.cfg.discord_notify_channels)
+
+    def is_viewing_channel(self, channel_id: str) -> bool:
+        return (
+            self._active_chat_kind == "channel"
+            and self._active_chat_id == str(channel_id)
+            and self._chat_pane_visible
+        )
+
+    def refresh_ui_preferences(self) -> None:
+        """Aplica cambios de preferencias visuales (canales sin permiso, avisos, etc.)."""
+        self._render_channels(force=True)
+        self._emit_voice_status()
 
     def _refresh_header_toggles(self) -> None:
         self.toggle_channels_btn.setProperty("active", "true" if self._channels_visible else "false")
@@ -645,6 +1250,22 @@ class DiscordVoicePanel(QWidget):
             b.style().unpolish(b)
             b.style().polish(b)
         self.audio_toggle_btn.setText("Audio ▴" if self._audio_drawer_open else "Audio ▾")
+
+    def _refresh_scope_buttons(self) -> None:
+        self.members_scope_channel_btn.setProperty(
+            "active", "true" if self._members_scope == "channel" else "false"
+        )
+        self.members_scope_server_btn.setProperty(
+            "active", "true" if self._members_scope == "server" else "false"
+        )
+        for b in (self.members_scope_channel_btn, self.members_scope_server_btn):
+            b.style().unpolish(b)
+            b.style().polish(b)
+
+    def _set_members_scope(self, scope: Literal["channel", "server"]) -> None:
+        self._members_scope = "server" if scope == "server" else "channel"
+        self._refresh_scope_buttons()
+        self._refresh_members_list()
 
     def _toggle_channels_panel(self) -> None:
         self._channels_visible = not self._channels_visible
@@ -663,7 +1284,7 @@ class DiscordVoicePanel(QWidget):
 
     def _toggle_voice_channels_section(self) -> None:
         self._vc_section_open = not self._vc_section_open
-        self.channels_scroll.setVisible(self._vc_section_open)
+        self.vc_list_widget.setVisible(self._vc_section_open)
         self.vc_section_btn.setText(
             "▾ CANALES DE VOZ" if self._vc_section_open else "▸ CANALES DE VOZ"
         )
@@ -676,10 +1297,107 @@ class DiscordVoicePanel(QWidget):
     def _update_tc_section_label(self) -> None:
         gid = str(self.guild_combo.currentData() or "")
         guild = next((g for g in self._guilds if str(g.get("id")) == gid), None)
-        tc_cnt = len((guild or {}).get("text_channels") or ())
+        hidden = set(self.cfg.discord_hidden_channels)
+        tc_cnt = sum(
+            1
+            for tc in ((guild or {}).get("text_channels") or ())
+            if str(tc.get("id") or "") not in hidden
+        )
         arrow = "▾" if self._tc_section_open else "▸"
         suffix = f" ({tc_cnt})" if tc_cnt > 0 else ""
         self.tc_section_btn.setText(f"{arrow} CANALES DE TEXTO{suffix}")
+
+    def _sync_center_panes(self) -> None:
+        self.voice_pane.setVisible(self._voice_pane_visible)
+        self.chat_pane.setVisible(self._chat_pane_visible)
+        any_center = bool(self._voice_pane_visible or self._chat_pane_visible)
+        self.center_splitter.setVisible(any_center)
+        self.center_collapsed_card.setVisible(not any_center)
+        self.tab_voice_btn.setProperty("active", "true" if self._voice_pane_visible else "false")
+        self.tab_chat_btn.setProperty("active", "true" if self._chat_pane_visible else "false")
+        for b in (self.tab_voice_btn, self.tab_chat_btn):
+            b.style().unpolish(b)
+            b.style().polish(b)
+
+    def _set_pane_visible(self, which: Literal["voice", "chat"], visible: bool) -> None:
+        if which == "voice":
+            self._voice_pane_visible = bool(visible)
+        else:
+            self._chat_pane_visible = bool(visible)
+        self._sync_center_panes()
+
+    def _on_center_tab_toggled(self, which: Literal["voice", "chat"]) -> None:
+        if which == "voice":
+            self._voice_pane_visible = not self._voice_pane_visible
+        else:
+            self._chat_pane_visible = not self._chat_pane_visible
+        self._sync_center_panes()
+
+    def get_available_channels_for_settings(self) -> list[tuple[str, str]]:
+        """Retorna [(channel_id, etiqueta)] de los canales conocidos para la gestión en Ajustes."""
+        items: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for g in self._guilds:
+            gname = str(g.get("name") or "").strip() or "Servidor"
+            for ch in g.get("voice_channels") or ():
+                cid = str(ch.get("id") or "").strip()
+                cname = str(ch.get("name") or "voz").strip()
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    items.append((cid, f"🔊 {cname} ({gname})"))
+            for tc in g.get("text_channels") or ():
+                cid = str(tc.get("id") or "").strip()
+                cname = str(tc.get("name") or "texto").strip()
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    items.append((cid, f"# {cname} ({gname})"))
+        for cid in self.cfg.discord_hidden_channels:
+            if cid not in seen:
+                seen.add(cid)
+                lbl = self.cfg.discord_hidden_channel_names.get(cid) or f"Canal {cid}"
+                items.append((cid, lbl))
+        return items
+
+    def hide_channel_permanently(self, channel_id: str, label: str = "") -> None:
+        cid = str(channel_id or "").strip()
+        if not cid:
+            return
+        if cid not in self.cfg.discord_hidden_channels:
+            self.cfg.discord_hidden_channels = list(self.cfg.discord_hidden_channels) + [cid]
+        if label:
+            names = dict(self.cfg.discord_hidden_channel_names)
+            names[cid] = str(label).strip()
+            self.cfg.discord_hidden_channel_names = names
+        save_config(self.cfg)
+        self._render_channels(force=True)
+        disp = label or cid
+        self.toast_requested.emit(f"Canal oculto siempre: {disp} (Ajustes → Discord)")
+
+    def _show_channel_context_menu(self, global_pos: Any, channel_id: str, label: str) -> None:
+        menu = QMenu(self)
+        act_hide = menu.addAction("Ocultar este canal siempre")
+        chosen = menu.exec(global_pos)
+        if chosen is act_hide:
+            self.hide_channel_permanently(channel_id, label)
+
+    def _ensure_chat_pane_visible(self) -> None:
+        if not self._chat_pane_visible:
+            self._chat_pane_visible = True
+            self._sync_center_panes()
+
+    def _set_center_tab(self, idx: int) -> None:
+        """Compatibilidad: 0 = solo voz, 1 = solo chat, 2 = vista dividida."""
+        val = int(idx)
+        if val == 0:
+            self._voice_pane_visible = True
+            self._chat_pane_visible = False
+        elif val == 1:
+            self._voice_pane_visible = False
+            self._chat_pane_visible = True
+        else:
+            self._voice_pane_visible = True
+            self._chat_pane_visible = True
+        self._sync_center_panes()
 
     def _update_info_pill(self) -> None:
         if self._bot_state != "connected" and not self.svc.is_connected:
@@ -697,7 +1415,9 @@ class DiscordVoicePanel(QWidget):
             rx_pkt = int(self._voice_state.get("rx_packets") or 0)
             tx_err = int(self._voice_state.get("tx_errors") or 0)
             rx_err = int(self._voice_state.get("rx_decrypt_errors") or 0)
-            self.info_pill.setIcon(render_icon("shield", "#4ADE80" if dave_active else "#FBBF24", 13))
+            self.info_pill.setIcon(
+                render_icon("shield", "#4ADE80" if dave_active else "#FBBF24", 13)
+            )
             self.info_pill.setText(f" {ram_txt}")
             dave_line = (
                 f"Cifrado E2EE DAVE activo (código: {dave_code})"
@@ -721,7 +1441,7 @@ class DiscordVoicePanel(QWidget):
             self._joining_channel_id = ""
             if self.svc.is_connected and not self.svc.is_in_voice:
                 self.status_pill.setText(f"Conectado · {self.svc.bot_name}")
-            self._render_channels()
+            self._render_channels(force=True)
         self.toast_requested.emit(f"Discord: {msg}")
 
     def refresh_token_state(self) -> None:
@@ -736,8 +1456,19 @@ class DiscordVoicePanel(QWidget):
         self.refresh_guilds_btn.setIcon(render_icon("refresh", p.text, 14))
         self.refresh_dev_btn.setIcon(render_icon("refresh", p.text, 14))
         self.hangup_btn.setIcon(render_icon("phone_off", "#F87171", 15))
+        close_ico = render_icon("close", p.text2, 13)
+        for btn in (
+            self.close_channels_btn,
+            self.intents_close_btn,
+            self.close_voice_btn,
+            self.close_chat_btn,
+            self.close_members_btn,
+        ):
+            btn.setIcon(close_ico)
         self._update_info_pill()
         self._refresh_mute_deaf_buttons()
+        for card in self._participant_cards_order:
+            card.update_theme(p)
 
     def _refresh_mute_deaf_buttons(self) -> None:
         p = self.palette
@@ -788,10 +1519,13 @@ class DiscordVoicePanel(QWidget):
             priv_ok = bool(data.get("privileged_intents_ok", False))
             self.intents_banner.setVisible(not priv_ok)
             self._update_info_pill()
+            self.sync_notify_channels()
         elif state == "error":
             self._joining_channel_id = ""
             self.status_pill.setText("Error")
-            self.connect_btn.setText("Desconectar" if self.svc.is_worker_running else "Conectar Bot")
+            self.connect_btn.setText(
+                "Desconectar" if self.svc.is_worker_running else "Conectar Bot"
+            )
             self.connect_btn.setObjectName(
                 "DangerBtn" if self.svc.is_worker_running else "AccentBtn"
             )
@@ -803,20 +1537,33 @@ class DiscordVoicePanel(QWidget):
             self._active_chat_kind = ""
             self._active_chat_id = ""
             self._active_chat_can_send = False
+            self._active_dm_peer_name = ""
+            self._active_dm_peer_avatar = ""
+            self._unread_channels.clear()
+            self._last_channels_sig = None
+            self._last_participants_sig = None
             self._worker_ws_mb = 0.0
             self._worker_priv_mb = 0.0
             self._chat_messages.clear()
             self._members = []
+            self._online_count = 0
+            self._channel_members = []
+            self._channel_online_count = 0
+            self._channel_members_loaded = False
+            self._member_row_by_url.clear()
             self.members_list.clear()
             self.members_online_lbl.setText("0 en línea")
             self.toggle_members_btn.setText("Miembros")
             self.dm_btn.setEnabled(False)
+            self.dm_btn.setVisible(False)
+            self.dm_hint_lbl.setVisible(False)
             self.chat_title_lbl.setText("Sin chat seleccionado")
             self.chat_input.clear()
+            self.chat_input.setPlaceholderText("Selecciona un canal #texto para escribir... [Enter]")
             self.chat_input.setEnabled(False)
             self.chat_send_btn.setEnabled(False)
             self.chat_browser.setHtml(
-                "<p style='color:#94A3B8;'>Abre <b>Canales de texto</b> o pulsa <b>Miembros</b> en la barra superior para iniciar un chat o DM.</p>"
+                "<p style='color:#9299A8;'>Selecciona un canal de texto a la izquierda para ver y enviar mensajes aquí.</p>"
             )
             self.intents_banner.setVisible(False)
             self.info_pill.setVisible(False)
@@ -825,17 +1572,45 @@ class DiscordVoicePanel(QWidget):
             self.connect_btn.setObjectName("AccentBtn")
             self.hangup_btn.setVisible(False)
             self._guilds = []
-            self._render_channels()
+            self._render_channels(force=True)
+            self._render_dm_threads()
             self._voice_state = {"in_voice": False, "participants": []}
-            self._render_participants()
+            self._render_participants(force=True)
 
         self.connect_btn.style().unpolish(self.connect_btn)
         self.connect_btn.style().polish(self.connect_btn)
+        self._emit_voice_status()
 
     def _on_worker_ram_updated(self, ws_mb: float, priv_mb: float) -> None:
         self._worker_ws_mb = float(ws_mb)
         self._worker_priv_mb = float(priv_mb)
         self._update_info_pill()
+
+    def _auto_open_first_text_channel(self, gid: str) -> None:
+        if not gid or not self.svc.is_connected or self._active_chat_id:
+            return
+        guild = next((g for g in self._guilds if str(g.get("id")) == gid), None)
+        if guild is None:
+            return
+        hidden = set(self.cfg.discord_hidden_channels)
+        tcs = [
+            tc
+            for tc in (guild.get("text_channels") or ())
+            if str(tc.get("id") or "") not in hidden
+        ]
+        if not tcs:
+            return
+        chosen = next((tc for tc in tcs if tc.get("can_read", True)), tcs[0])
+        cid = str(chosen.get("id") or "")
+        cname = str(chosen.get("name") or "texto")
+        if cid:
+            self._active_chat_kind = "channel"
+            self._active_chat_id = cid
+            self._unread_channels.discard(cid)
+            self.chat_title_lbl.setText(f"# {cname}")
+            self.chat_input.setPlaceholderText(f"Enviar mensaje a #{cname}... [Enter]")
+            self._render_channels(force=True)
+            self.svc.open_text_channel(gid, cid)
 
     def _on_guilds_updated(self, guilds: list[dict[str, Any]]) -> None:
         self._guilds = guilds
@@ -854,28 +1629,29 @@ class DiscordVoicePanel(QWidget):
         if gid and self.svc.is_connected and gid != self._selected_guild_id:
             self._selected_guild_id = gid
             self.svc.select_guild(gid)
+        if gid:
+            self._auto_open_first_text_channel(gid)
 
     def _on_guild_combo_changed(self, _idx: int) -> None:
-        self._render_channels()
+        self._active_chat_kind = ""
+        self._active_chat_id = ""
+        self._active_chat_can_send = False
+        self._channel_members = []
+        self._channel_online_count = 0
+        self._channel_members_loaded = False
+        self._chat_messages.clear()
+        self._render_channels(force=True)
         gid = str(self.guild_combo.currentData() or "")
         if gid and self.svc.is_connected and gid != self._selected_guild_id:
             self._selected_guild_id = gid
+            self._member_row_by_url.clear()
             self.members_list.clear()
             self.members_online_lbl.setText("Cargando...")
             self.dm_btn.setEnabled(False)
+            self.dm_btn.setVisible(False)
+            self.dm_hint_lbl.setVisible(False)
             self.svc.select_guild(gid)
-
-    def _set_center_tab(self, idx: int) -> None:
-        tab = 1 if int(idx) == 1 else 0
-        self.center_stack.setCurrentIndex(tab)
-        self.tab_voice_btn.setProperty("active", "true" if tab == 0 else "false")
-        self.tab_chat_btn.setProperty("active", "true" if tab == 1 else "false")
-        for b in (self.tab_voice_btn, self.tab_chat_btn):
-            b.style().unpolish(b)
-            b.style().polish(b)
-        self.active_channel_lbl.setVisible(tab == 0)
-        self.chat_title_lbl.setVisible(tab == 1)
-        self.bot_chat_badge.setVisible(tab == 1)
+            self._auto_open_first_text_channel(gid)
 
     def _build_voice_channel_row(
         self, gid: str, ch: dict[str, Any], active_cid: str
@@ -888,18 +1664,34 @@ class DiscordVoicePanel(QWidget):
         is_joining = bool(self._joining_channel_id and cid == self._joining_channel_id)
 
         row_frame = QFrame()
-        row_frame.setObjectName("MediaCard")
+        row_frame.setObjectName("DiscordChannelRow")
+        row_frame.setProperty("active", "true" if is_cur else "false")
+        gname = next(
+            (str(g.get("name") or "") for g in self._guilds if str(g.get("id") or "") == gid),
+            "",
+        ).strip() or "Servidor"
+        vc_label = f"🔊 {cname} ({gname})"
+        row_frame.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        row_frame.customContextMenuRequested.connect(
+            lambda pos, c=cid, lbl=vc_label, w=row_frame: self._show_channel_context_menu(
+                w.mapToGlobal(pos), c, lbl
+            )
+        )
         row_lay = QVBoxLayout(row_frame)
-        row_lay.setContentsMargins(9, 6, 9, 6)
-        row_lay.setSpacing(3)
+        row_lay.setContentsMargins(9, 7, 9, 7)
+        row_lay.setSpacing(4)
 
         top = QHBoxLayout()
-        top.setSpacing(6)
+        top.setSpacing(5)
         name_lbl = QLabel(f"🔊 {cname}")
-        name_lbl.setStyleSheet("font-weight: 600;" if is_cur else "font-weight: 500;")
+        name_lbl.setStyleSheet("font-weight: 700;" if is_cur else "font-weight: 500;")
         top.addWidget(name_lbl, 1)
 
-        if members:
+        if is_cur:
+            live_lbl = QLabel("En Voz")
+            live_lbl.setStyleSheet("color: #4ADE80; font-size: 11px; font-weight: 700;")
+            top.addWidget(live_lbl)
+        elif members:
             cnt_lbl = QLabel(f"{len(members)}")
             cnt_lbl.setObjectName("DeckTag")
             top.addWidget(cnt_lbl)
@@ -915,9 +1707,7 @@ class DiscordVoicePanel(QWidget):
         elif not can_connect:
             btn = QPushButton("Bloq.")
             btn.setEnabled(False)
-            btn.setToolTip(
-                "El bot no tiene permiso 'Conectar' en este canal. Ajusta los permisos o el rol del bot en Discord."
-            )
+            btn.setToolTip("El bot no tiene permiso 'Conectar' en este canal.")
         else:
             btn = QPushButton("Entrar")
             btn.setObjectName("AccentBtn")
@@ -929,27 +1719,140 @@ class DiscordVoicePanel(QWidget):
         row_lay.addLayout(top)
 
         if members:
-            names = ", ".join(str(m.get("name") or "") for m in members[:5])
-            if len(members) > 5:
-                names += f" +{len(members) - 5}"
-            sub = QLabel(names)
-            sub.setObjectName("MutedLabel")
-            sub.setWordWrap(True)
-            row_lay.addWidget(sub)
+            members_box = QVBoxLayout()
+            members_box.setContentsMargins(10, 2, 2, 0)
+            members_box.setSpacing(2)
+            for m in members[:12]:
+                m_id = str(m.get("id") or "")
+                m_name = str(m.get("name") or "")
+                m_bot = bool(m.get("is_bot", False))
+                m_av = str(m.get("avatar_url") or "")
+                m_muted = bool(m.get("muted", False))
+                m_deaf = bool(m.get("deafened", False))
+
+                mrow_w = QWidget()
+                mrow_w.setStyleSheet("background: transparent;")
+                mrow_w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                mrow_w.customContextMenuRequested.connect(
+                    lambda pos, w=mrow_w, u=m_id, n=m_name, b=m_bot, a=m_av: (
+                        self._open_dm_with_user(u, n, a)
+                        if exec_user_dm_menu(w, u, n, b, w.mapToGlobal(pos))
+                        else None
+                    )
+                )
+                m_row = QHBoxLayout(mrow_w)
+                m_row.setContentsMargins(0, 1, 0, 1)
+                m_row.setSpacing(5)
+
+                dot = QLabel("●")
+                dot.setStyleSheet(
+                    "color: #4ADE80; font-size: 9px;"
+                    if is_cur
+                    else f"color: {self.palette.text2}; font-size: 9px;"
+                )
+                m_row.addWidget(dot)
+
+                mlbl = QLabel(m_name)
+                mlbl.setObjectName("MutedLabel")
+                mlbl.setStyleSheet("font-size: 11px;")
+                m_row.addWidget(mlbl, 1)
+
+                if m_bot:
+                    btag = QLabel("APP")
+                    btag.setObjectName("DeckTag")
+                    m_row.addWidget(btag)
+                if m_deaf:
+                    dl = QLabel()
+                    dl.setPixmap(render_icon("headphones_off", "#F87171", 11).pixmap(QSize(11, 11)))
+                    m_row.addWidget(dl)
+                elif m_muted:
+                    ml = QLabel()
+                    ml.setPixmap(render_icon("mic_off", "#F87171", 11).pixmap(QSize(11, 11)))
+                    m_row.addWidget(ml)
+
+                members_box.addWidget(mrow_w)
+            if len(members) > 12:
+                extra = QLabel(f"+{len(members) - 12} más")
+                extra.setObjectName("MutedLabel")
+                extra.setStyleSheet("font-size: 11px;")
+                members_box.addWidget(extra)
+            row_lay.addLayout(members_box)
 
         return row_frame
 
     def _toggle_locked_vc_group(self) -> None:
         self._locked_vc_expanded = not self._locked_vc_expanded
-        self._render_channels()
+        self._render_channels(force=True)
 
-    def _render_channels(self) -> None:
+    def _toggle_channel_notify(self, channel_id: str, name: str) -> None:
+        cid = str(channel_id or "").strip()
+        if not cid:
+            return
+        if cid in self.cfg.discord_notify_channels:
+            self.cfg.discord_notify_channels = [
+                x for x in self.cfg.discord_notify_channels if x != cid
+            ]
+            msg = f"Avisos silenciados para #{name}"
+        else:
+            self.cfg.discord_notify_channels = list(self.cfg.discord_notify_channels) + [cid]
+            msg = f"Avisos activos para #{name}"
+        save_config(self.cfg)
+        self.sync_notify_channels()
+        self._render_channels(force=True)
+        self.toast_requested.emit(msg)
+
+    def _channels_signature(self, gid: str, guild: dict[str, Any] | None) -> Any:
+        if guild is None:
+            return (gid, None, len(self._guilds))
+        vcs = tuple(
+            (
+                str(ch.get("id") or ""),
+                str(ch.get("name") or ""),
+                bool(ch.get("can_connect", True)),
+                tuple(
+                    (
+                        str(m.get("id") or ""),
+                        str(m.get("name") or ""),
+                        bool(m.get("muted", False)),
+                        bool(m.get("deafened", False)),
+                    )
+                    for m in (ch.get("members") or ())
+                ),
+            )
+            for ch in (guild.get("voice_channels") or ())
+        )
+        tcs = tuple(
+            (str(tc.get("id") or ""), str(tc.get("name") or ""))
+            for tc in (guild.get("text_channels") or ())
+        )
+        return (
+            gid,
+            vcs,
+            tcs,
+            bool(self._voice_state.get("in_voice")),
+            str(self._voice_state.get("channel_id") or ""),
+            self._joining_channel_id,
+            self._active_chat_kind,
+            self._active_chat_id,
+            self.cfg.discord_show_locked_channels,
+            self._locked_vc_expanded,
+            tuple(self.cfg.discord_notify_channels),
+            tuple(self.cfg.discord_hidden_channels),
+            tuple(sorted(self._unread_channels)),
+        )
+
+    def _render_channels(self, force: bool = False) -> None:
+        gid = str(self.guild_combo.currentData() or "")
+        guild = next((g for g in self._guilds if str(g.get("id")) == gid), None)
+        sig = self._channels_signature(gid, guild)
+        if not force and sig == self._last_channels_sig:
+            return
+        self._last_channels_sig = sig
+
         _clear_layout(self.channels_lay)
         _clear_layout(self.text_channels_lay)
         self._update_tc_section_label()
 
-        gid = str(self.guild_combo.currentData() or "")
-        guild = next((g for g in self._guilds if str(g.get("id")) == gid), None)
         if guild is None:
             msg = (
                 "No se encontraron servidores."
@@ -960,23 +1863,27 @@ class DiscordVoicePanel(QWidget):
             lbl.setObjectName("MutedLabel")
             lbl.setWordWrap(True)
             self.channels_lay.addWidget(lbl)
-            self.channels_lay.addStretch()
 
             tlbl = QLabel("Conecta el bot para ver canales de texto.")
             tlbl.setObjectName("MutedLabel")
             tlbl.setWordWrap(True)
             self.text_channels_lay.addWidget(tlbl)
-            self.text_channels_lay.addStretch()
             return
 
-        voice_channels = guild.get("voice_channels") or []
+        hidden = set(self.cfg.discord_hidden_channels)
+        active_cid = str(self._voice_state.get("channel_id") or "")
+        gname = str(guild.get("name") or "").strip() or "Servidor"
+        voice_channels = [
+            ch
+            for ch in (guild.get("voice_channels") or [])
+            if str(ch.get("id") or "") not in hidden
+        ]
         if not voice_channels:
-            lbl = QLabel("No se encontraron canales de voz en este servidor.")
+            lbl = QLabel("No hay canales de voz visibles en este servidor.")
             lbl.setObjectName("MutedLabel")
             lbl.setWordWrap(True)
             self.channels_lay.addWidget(lbl)
         else:
-            active_cid = str(self._voice_state.get("channel_id") or "")
             allowed = []
             locked = []
             for ch in voice_channels:
@@ -991,26 +1898,38 @@ class DiscordVoicePanel(QWidget):
                 self.channels_lay.addWidget(self._build_voice_channel_row(gid, ch, active_cid))
 
             if locked:
-                if not allowed:
-                    for ch in locked:
-                        self.channels_lay.addWidget(
-                            self._build_voice_channel_row(gid, ch, active_cid)
+                if not self.cfg.discord_show_locked_channels:
+                    if not allowed:
+                        hint = QLabel(
+                            "No tienes canales de voz accesibles aquí.\n"
+                            "Activa 'Mostrar canales sin permiso' en Ajustes → Discord para verlos."
                         )
+                        hint.setObjectName("MutedLabel")
+                        hint.setWordWrap(True)
+                        self.channels_lay.addWidget(hint)
                 else:
-                    arrow = "▾" if self._locked_vc_expanded else "▸"
-                    lbtn = _make_section_toggle_btn(f"{arrow} {len(locked)} sin permiso")
-                    lbtn.setObjectName("MutedLabel")
-                    lbtn.clicked.connect(self._toggle_locked_vc_group)
-                    self.channels_lay.addWidget(lbtn)
-                    if self._locked_vc_expanded:
+                    if not allowed:
                         for ch in locked:
                             self.channels_lay.addWidget(
                                 self._build_voice_channel_row(gid, ch, active_cid)
                             )
+                    else:
+                        arrow = "▾" if self._locked_vc_expanded else "▸"
+                        lbtn = _make_section_toggle_btn(f"{arrow} {len(locked)} sin permiso")
+                        lbtn.setObjectName("MutedLabel")
+                        lbtn.clicked.connect(self._toggle_locked_vc_group)
+                        self.channels_lay.addWidget(lbtn)
+                        if self._locked_vc_expanded:
+                            for ch in locked:
+                                self.channels_lay.addWidget(
+                                    self._build_voice_channel_row(gid, ch, active_cid)
+                                )
 
-        self.channels_lay.addStretch()
-
-        text_channels = guild.get("text_channels") or []
+        text_channels = [
+            tc
+            for tc in (guild.get("text_channels") or [])
+            if str(tc.get("id") or "") not in hidden
+        ]
         if not text_channels:
             tlbl = QLabel("Sin canales de texto visibles.")
             tlbl.setObjectName("MutedLabel")
@@ -1023,36 +1942,142 @@ class DiscordVoicePanel(QWidget):
                 is_active_tc = (
                     self._active_chat_kind == "channel" and self._active_chat_id == cid
                 )
-                tbtn = QPushButton(f"  # {cname}")
+                has_unread = cid in self._unread_channels
+
+                row_w = QWidget()
+                row_w.setStyleSheet("background: transparent;")
+                tc_row = QHBoxLayout(row_w)
+                tc_row.setContentsMargins(0, 0, 0, 0)
+                tc_row.setSpacing(4)
+
+                prefix = "● " if has_unread else ""
+                tbtn = QPushButton(f"  {prefix}# {cname}")
                 tbtn.setObjectName("NavBtn")
                 tbtn.setProperty("active", "true" if is_active_tc else "false")
+                if has_unread and not is_active_tc:
+                    tbtn.setStyleSheet("color: #F1F3F6; font-weight: 700;")
                 tbtn.setCursor(Qt.CursorShape.PointingHandCursor)
+                tbtn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                tc_label = f"# {cname} ({gname})"
+                tbtn.customContextMenuRequested.connect(
+                    lambda pos, c=cid, lbl=tc_label, w=tbtn: self._show_channel_context_menu(
+                        w.mapToGlobal(pos), c, lbl
+                    )
+                )
                 tbtn.clicked.connect(
                     lambda _c=False, g=gid, c=cid, n=cname: self._open_text_channel_clicked(g, c, n)
                 )
-                self.text_channels_lay.addWidget(tbtn)
-        self.text_channels_lay.addStretch()
+                tc_row.addWidget(tbtn, 1)
+
+                notified = cid in self.cfg.discord_notify_channels
+                bell_btn = QPushButton()
+                bell_btn.setObjectName("IconBtn")
+                bell_btn.setFixedSize(26, 26)
+                bell_btn.setIcon(
+                    render_icon(
+                        "bell" if notified else "bell_off",
+                        self.palette.accent if notified else self.palette.text2,
+                        13,
+                    )
+                )
+                bell_btn.setToolTip(
+                    "Avisos activos para este canal (clic para silenciar)"
+                    if notified
+                    else "Activar avisos en barra de tareas para este canal"
+                )
+                bell_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                bell_btn.clicked.connect(
+                    lambda _c=False, c=cid, n=cname: self._toggle_channel_notify(c, n)
+                )
+                tc_row.addWidget(bell_btn)
+                self.text_channels_lay.addWidget(row_w)
 
     def _open_text_channel_clicked(self, guild_id: str, channel_id: str, name: str) -> None:
         self._active_chat_kind = "channel"
         self._active_chat_id = channel_id
-        self.chat_title_lbl.setText(f"#{name}")
-        self._set_center_tab(1)
-        self._render_channels()
+        self._unread_channels.discard(channel_id)
+        self.chat_title_lbl.setText(f"# {name}")
+        self.chat_input.setPlaceholderText(f"Enviar mensaje a #{name}... [Enter]")
+        self._ensure_chat_pane_visible()
+        self._render_channels(force=True)
         self.svc.open_text_channel(guild_id, channel_id)
+
+    def _on_channel_message_incoming(self, data: dict[str, Any]) -> None:
+        if not self.cfg.discord_notify_chat_enabled:
+            return
+        cid = str(data.get("channel_id") or "")
+        if not cid or cid not in self.cfg.discord_notify_channels:
+            return
+        if not self.is_viewing_channel(cid):
+            self._unread_channels.add(cid)
+            self._render_channels(force=True)
+        self.channel_alert_requested.emit(data)
 
     def _on_guild_members_updated(self, data: dict[str, Any]) -> None:
         cur_gid = str(self.guild_combo.currentData() or "")
         if cur_gid and str(data.get("guild_id") or "") != cur_gid:
             return
-        members = list(data.get("members") or [])
-        self._members = members
-        online_count = int(data.get("online_count") or 0)
-        self.members_online_lbl.setText(f"{online_count} en línea")
+        self._members = list(data.get("members") or [])
+        self._online_count = int(data.get("online_count") or 0)
+        self._refresh_members_list()
+
+    def _on_member_avatar_ready(self, url: str, pix: QPixmap) -> None:
+        if pix.size() != self._LIST_AVATAR_SIZE:
+            return
+        rows = self._member_row_by_url.get(url)
+        if not rows:
+            return
+        ico = QIcon(pix)
+        for item in rows:
+            try:
+                item.setIcon(ico)
+            except RuntimeError:
+                pass
+
+    def _refresh_members_list(self) -> None:
+        in_voice = bool(self._voice_state.get("in_voice", False))
+        voice_parts = list(self._voice_state.get("participants") or [])
+
+        source_members: list[dict[str, Any]]
+        header_label: str
+
+        if self._members_scope == "channel":
+            if self._active_chat_kind == "channel" and self._channel_members_loaded:
+                source_members = self._channel_members
+                ch_title = self.chat_title_lbl.text().strip() or "#canal"
+                header_label = f"En {ch_title} · {len(source_members)} ({self._channel_online_count} en línea)"
+            elif in_voice and voice_parts:
+                source_members = [
+                    {
+                        "id": str(pt.get("id") or ""),
+                        "name": str(pt.get("name") or ""),
+                        "is_bot": bool(pt.get("is_bot", False)),
+                        "avatar_url": str(pt.get("avatar_url") or ""),
+                        "status": "online",
+                        "activity": "En canal de voz",
+                    }
+                    for pt in voice_parts
+                ]
+                ch_name = str(self._voice_state.get("channel_name") or "Voz")
+                header_label = f"En 🔊 {ch_name} · {len(source_members)}"
+            else:
+                source_members = self._members
+                header_label = f"{self._online_count} en línea"
+        else:
+            source_members = self._members
+            header_label = f"Servidor · {self._online_count} en línea"
+
+        self.members_online_lbl.setText(header_label)
+        badge_count = (
+            len(source_members)
+            if (self._members_scope == "channel" and (self._channel_members_loaded or in_voice))
+            else self._online_count
+        )
         self.toggle_members_btn.setText(
-            f"Miembros · {online_count}" if online_count > 0 else "Miembros"
+            f"Miembros · {badge_count}" if badge_count > 0 else "Miembros"
         )
 
+        self._member_row_by_url.clear()
         self.members_list.clear()
         status_dots = {
             "online": "🟢",
@@ -1066,10 +2091,11 @@ class DiscordVoicePanel(QWidget):
             "idle": "Ausente",
             "offline": "Desconectado",
         }
-        for m in members:
+        for m in source_members:
             uid = str(m.get("id") or "")
             name = str(m.get("name") or uid)
             is_bot = bool(m.get("is_bot", False))
+            av_url = str(m.get("avatar_url") or "")
             st = str(m.get("status") or "offline")
             full_act = str(m.get("activity") or "").strip()
             short_act = full_act[:33] + "..." if len(full_act) > 36 else full_act
@@ -1079,9 +2105,19 @@ class DiscordVoicePanel(QWidget):
             if short_act:
                 text += f"\n    {short_act}"
             item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, {"id": uid, "name": name, "is_bot": is_bot})
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                {"id": uid, "name": name, "is_bot": is_bot, "avatar_url": av_url},
+            )
             st_lbl = status_names.get(st, st)
             item.setToolTip(f"{name} ({st_lbl})" + (f" · {full_act}" if full_act else ""))
+            if av_url and self._thumb_cache is not None:
+                self._member_row_by_url.setdefault(av_url, []).append(item)
+                cached = self._thumb_cache.get_or_fetch(
+                    av_url, self._LIST_AVATAR_SIZE, circular=True
+                )
+                if cached is not None:
+                    item.setIcon(QIcon(cached))
             self.members_list.addItem(item)
         self._on_member_selection_changed()
 
@@ -1089,9 +2125,30 @@ class DiscordVoicePanel(QWidget):
         items = self.members_list.selectedItems()
         if not items:
             self.dm_btn.setEnabled(False)
+            self.dm_btn.setVisible(False)
+            self.dm_hint_lbl.setVisible(False)
             return
         meta = items[0].data(Qt.ItemDataRole.UserRole) or {}
-        self.dm_btn.setEnabled(bool(meta.get("id")) and not bool(meta.get("is_bot", False)))
+        has_id = bool(meta.get("id"))
+        is_bot = bool(meta.get("is_bot", False))
+        can_dm = has_id and not is_bot
+        self.dm_btn.setVisible(can_dm)
+        self.dm_btn.setEnabled(can_dm)
+        self.dm_hint_lbl.setVisible(has_id and is_bot)
+
+    def _on_members_context_menu(self, pos: Any) -> None:
+        item = self.members_list.itemAt(pos)
+        if item is None:
+            return
+        meta = item.data(Qt.ItemDataRole.UserRole) or {}
+        uid = str(meta.get("id") or "")
+        name = str(meta.get("name") or uid)
+        is_bot = bool(meta.get("is_bot", False))
+        av = str(meta.get("avatar_url") or "")
+        vp = self.members_list.viewport()
+        gpos = vp.mapToGlobal(pos) if vp is not None else self.members_list.mapToGlobal(pos)
+        if exec_user_dm_menu(self.members_list, uid, name, is_bot, gpos):
+            self._open_dm_with_user(uid, name, av)
 
     def _on_open_selected_dm(self) -> None:
         items = self.members_list.selectedItems()
@@ -1100,14 +2157,172 @@ class DiscordVoicePanel(QWidget):
         meta = items[0].data(Qt.ItemDataRole.UserRole) or {}
         uid = str(meta.get("id") or "")
         name = str(meta.get("name") or uid)
+        av = str(meta.get("avatar_url") or "")
         if not uid or bool(meta.get("is_bot", False)):
             return
+        self._open_dm_with_user(uid, name, av)
+
+    def _toggle_dm_channels_section(self) -> None:
+        self._dm_section_open = not self._dm_section_open
+        self.dm_channels_scroll.setVisible(self._dm_section_open)
+        self._render_dm_threads()
+
+    def _load_dm_threads(self) -> list[dict[str, str]]:
+        if self._db is not None:
+            return self._db.list_discord_dm_threads(limit=25)
+        return list(self._dm_threads_mem)
+
+    def _upsert_dm_thread_local(
+        self, uid: str, name: str, avatar_url: str = "", preview: str = ""
+    ) -> None:
+        clean_id = str(uid or "").strip()
+        if not clean_id:
+            return
+        clean_name = str(name or clean_id).strip() or clean_id
+        clean_av = str(avatar_url or "").strip()
+        clean_prev = str(preview or "").strip()[:120]
+        if self._db is not None:
+            self._db.upsert_discord_dm_thread(
+                clean_id, clean_name, avatar_url=clean_av, last_preview=clean_prev
+            )
+            return
+        prev_entry = next((t for t in self._dm_threads_mem if t["user_id"] == clean_id), None)
+        self._dm_threads_mem = [t for t in self._dm_threads_mem if t["user_id"] != clean_id]
+        self._dm_threads_mem.insert(
+            0,
+            {
+                "user_id": clean_id,
+                "user_name": clean_name or (prev_entry["user_name"] if prev_entry else clean_id),
+                "avatar_url": clean_av or (prev_entry["avatar_url"] if prev_entry else ""),
+                "last_preview": clean_prev or (prev_entry["last_preview"] if prev_entry else ""),
+            },
+        )
+
+    def _save_dm_message_local(
+        self, uid: str, msg: dict[str, Any], peer_name: str = "", peer_avatar_url: str = ""
+    ) -> None:
+        clean_id = str(uid or "").strip()
+        if not clean_id or not isinstance(msg, dict):
+            return
+        if self._db is not None:
+            self._db.save_discord_dm_message(
+                clean_id, msg, peer_name=peer_name, peer_avatar_url=peer_avatar_url
+            )
+            return
+        bucket = self._dm_msgs_mem.setdefault(clean_id, [])
+        mid = str(msg.get("id") or "")
+        if not mid or not any(str(x.get("id") or "") == mid for x in bucket):
+            bucket.append(dict(msg))
+            if len(bucket) > 80:
+                del bucket[:-80]
+        prev = str(msg.get("content") or "").strip()
+        self._upsert_dm_thread_local(clean_id, peer_name, peer_avatar_url, prev)
+
+    def _load_dm_messages_local(self, uid: str) -> list[dict[str, Any]]:
+        clean_id = str(uid or "").strip()
+        if not clean_id:
+            return []
+        if self._db is not None:
+            return self._db.list_discord_dm_messages(clean_id, limit=80)
+        return list(self._dm_msgs_mem.get(clean_id, []))
+
+    def _remove_dm_thread_local(self, uid: str) -> None:
+        clean_id = str(uid or "").strip()
+        if not clean_id:
+            return
+        if self._db is not None:
+            self._db.remove_discord_dm_thread(clean_id)
+        else:
+            self._dm_threads_mem = [t for t in self._dm_threads_mem if t["user_id"] != clean_id]
+            self._dm_msgs_mem.pop(clean_id, None)
+        if self._active_chat_kind == "dm" and self._active_chat_id == clean_id:
+            self._active_chat_kind = ""
+            self._active_chat_id = ""
+            self._active_dm_peer_name = ""
+            self._active_dm_peer_avatar = ""
+            self.chat_title_lbl.setText("Sin chat seleccionado")
+        self._render_dm_threads()
+
+    def _show_dm_thread_context_menu(self, global_pos: Any, uid: str, name: str) -> None:
+        menu = QMenu(self)
+        try:
+            act_rm = menu.addAction(f"Quitar DM con {name}")
+            chosen = menu.exec(global_pos)
+            if chosen is act_rm:
+                self._remove_dm_thread_local(uid)
+        finally:
+            menu.deleteLater()
+
+    def _render_dm_threads(self) -> None:
+        if not hasattr(self, "dm_channels_lay"):
+            return
+        threads = self._load_dm_threads()
+        arrow = "▾" if self._dm_section_open else "▸"
+        suffix = f" ({len(threads)})" if threads else ""
+        self.dm_section_btn.setText(f"{arrow} MENSAJES DIRECTOS{suffix}")
+        _clear_layout(self.dm_channels_lay)
+        if not threads:
+            empty_lbl = QLabel("Clic derecho en una persona → DM.")
+            empty_lbl.setObjectName("MutedLabel")
+            empty_lbl.setWordWrap(True)
+            self.dm_channels_lay.addWidget(empty_lbl)
+            return
+
+        for th in threads:
+            uid = str(th.get("user_id") or "")
+            uname = str(th.get("user_name") or uid)
+            av = str(th.get("avatar_url") or "")
+            prev = str(th.get("last_preview") or "").strip()
+            is_act = self._active_chat_kind == "dm" and self._active_chat_id == uid
+            btn = QPushButton(f"  @ {uname}")
+            btn.setObjectName("NavBtn")
+            btn.setProperty("active", "true" if is_act else "false")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            tip = f"DM con {uname}" + (f"\nÚltimo: {prev}" if prev else "")
+            btn.setToolTip(tip)
+            btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            btn.customContextMenuRequested.connect(
+                lambda pos, w=btn, u=uid, n=uname: self._show_dm_thread_context_menu(
+                    w.mapToGlobal(pos), u, n
+                )
+            )
+            btn.clicked.connect(
+                lambda _c=False, u=uid, n=uname, a=av: self._open_dm_with_user(u, n, a)
+            )
+            self.dm_channels_lay.addWidget(btn)
+
+    def _open_dm_with_user(self, uid: str, name: str, avatar_url: str = "") -> None:
+        clean_id = str(uid or "").strip()
+        if not clean_id:
+            return
+        peer_name = str(name or clean_id).strip() or clean_id
         self._active_chat_kind = "dm"
-        self._active_chat_id = uid
-        self.chat_title_lbl.setText(f"DM · {name}")
-        self._set_center_tab(1)
-        self._render_channels()
-        self.svc.open_dm(uid)
+        self._active_chat_id = clean_id
+        self._active_dm_peer_name = peer_name
+        self._active_dm_peer_avatar = str(avatar_url or "").strip()
+        self.chat_title_lbl.setText(f"DM · {peer_name}")
+
+        self._upsert_dm_thread_local(clean_id, peer_name, self._active_dm_peer_avatar)
+        saved_msgs = self._load_dm_messages_local(clean_id)
+        self._chat_messages.clear()
+        for sm in saved_msgs[-80:]:
+            self._chat_messages.append(sm)
+
+        can_send = self.svc.is_connected
+        self._active_chat_can_send = can_send
+        self.chat_input.setEnabled(can_send)
+        self.chat_send_btn.setEnabled(can_send)
+        self.chat_input.setPlaceholderText(
+            f"Enviar mensaje directo a {peer_name}... [Enter]"
+            if can_send
+            else "Conecta el Bot para enviar nuevos mensajes (historial guardado visible)."
+        )
+        self._ensure_chat_pane_visible()
+        self._render_channels(force=True)
+        self._render_dm_threads()
+        self._render_chat_messages(can_read=True)
+        if can_send:
+            self.svc.open_dm(clean_id)
 
     def _on_chat_history_loaded(self, data: dict[str, Any]) -> None:
         kind = str(data.get("kind") or "")
@@ -1117,34 +2332,89 @@ class DiscordVoicePanel(QWidget):
         self._active_chat_kind = kind
         self._active_chat_id = tid
         self._active_chat_can_send = bool(data.get("can_send", False))
-        self.chat_title_lbl.setText(str(data.get("title") or "Chat"))
+        if kind == "channel":
+            self._unread_channels.discard(tid)
+        raw_title = str(data.get("title") or "Chat")
+        clean_title = (
+            f"# {raw_title[1:].strip()}"
+            if raw_title.startswith("#") and not raw_title.startswith("# ")
+            else raw_title
+        )
+        self.chat_title_lbl.setText(clean_title)
+        live_msgs = list(data.get("messages") or [])[-80:]
+        if kind == "dm":
+            peer_name = str(
+                data.get("peer_name")
+                or clean_title.replace("DM · ", "").strip()
+                or self._active_dm_peer_name
+                or tid
+            )
+            peer_av = str(data.get("peer_avatar_url") or self._active_dm_peer_avatar or "")
+            self._active_dm_peer_name = peer_name
+            self._active_dm_peer_avatar = peer_av
+            self._upsert_dm_thread_local(tid, peer_name, peer_av)
+            for m in live_msgs:
+                if isinstance(m, dict):
+                    self._save_dm_message_local(tid, m, peer_name=peer_name, peer_avatar_url=peer_av)
+            if not live_msgs:
+                live_msgs = self._load_dm_messages_local(tid)
+            self._render_dm_threads()
+
         self._chat_messages.clear()
-        for m in list(data.get("messages") or [])[-80:]:
+        for m in live_msgs[-80:]:
             self._chat_messages.append(m)
+
+        if kind == "channel" and "channel_members" in data:
+            self._channel_members = list(data.get("channel_members") or [])
+            self._channel_online_count = int(data.get("channel_online_count") or 0)
+            self._channel_members_loaded = True
+            self._refresh_members_list()
 
         can_read = bool(data.get("can_read", True))
         self.chat_input.setEnabled(self._active_chat_can_send)
         self.chat_send_btn.setEnabled(self._active_chat_can_send)
         if self._active_chat_can_send:
-            self.chat_input.setPlaceholderText("Escribe un mensaje (se envía como tu Bot)... [Enter]")
-            self.chat_input.setFocus()
+            target_label = clean_title.replace("# ", "#")
+            self.chat_input.setPlaceholderText(f"Enviar mensaje a {target_label}... [Enter]")
         else:
             self.chat_input.setPlaceholderText("Sin permiso para enviar mensajes en este canal.")
-        self._set_center_tab(1)
+        self._ensure_chat_pane_visible()
+        self._render_channels()
         self._render_chat_messages(can_read=can_read)
 
     def _on_chat_message_received(self, data: dict[str, Any]) -> None:
         kind = str(data.get("kind") or "")
         tid = str(data.get("target_id") or "")
         msg = data.get("message")
-        if kind != self._active_chat_kind or tid != self._active_chat_id or not isinstance(msg, dict):
+        if not isinstance(msg, dict):
+            return
+        if kind == "dm" and tid:
+            peer_name = str(
+                data.get("peer_name") or self._active_dm_peer_name or tid
+            )
+            peer_av = str(data.get("peer_avatar_url") or self._active_dm_peer_avatar or "")
+            self._save_dm_message_local(tid, msg, peer_name=peer_name, peer_avatar_url=peer_av)
+            self._render_dm_threads()
+        if kind != self._active_chat_kind or tid != self._active_chat_id:
+            return
+        mid = str(msg.get("id") or "")
+        if mid and any(str(x.get("id") or "") == mid for x in self._chat_messages):
             return
         self._chat_messages.append(msg)
         self._render_chat_messages(can_read=True)
 
     def _on_dm_incoming(self, data: dict[str, Any]) -> None:
+        uid = str(data.get("user_id") or "")
         author = str(data.get("author_name") or "Usuario")
+        peer_name = str(data.get("peer_name") or author)
+        peer_av = str(data.get("peer_avatar_url") or "")
         preview = str(data.get("preview") or "").strip()
+        raw_msg = data.get("message")
+        if uid and isinstance(raw_msg, dict):
+            self._save_dm_message_local(uid, raw_msg, peer_name=peer_name, peer_avatar_url=peer_av)
+        elif uid:
+            self._upsert_dm_thread_local(uid, peer_name, peer_av, preview)
+        self._render_dm_threads()
         msg = f"DM de {author}: {preview}" if preview else f"Nuevo mensaje directo de {author}"
         self.toast_requested.emit(msg)
 
@@ -1155,32 +2425,59 @@ class DiscordVoicePanel(QWidget):
         if not text:
             return
         self.chat_input.clear()
+        if self._active_chat_kind == "dm":
+            self._upsert_dm_thread_local(
+                self._active_chat_id,
+                self._active_dm_peer_name or self._active_chat_id,
+                self._active_dm_peer_avatar,
+                preview=text[:120],
+            )
+            self._render_dm_threads()
         self.svc.send_chat_message(self._active_chat_kind, self._active_chat_id, text)
 
     def _render_chat_messages(self, *, can_read: bool = True) -> None:
         if not can_read and not self._chat_messages:
             self.chat_browser.setHtml(
-                "<p style='color:#94A3B8;'>El bot no tiene permiso <b>Read Message History</b> en este canal. Los mensajes nuevos en vivo sí aparecerán aquí.</p>"
+                "<p style='color:#9299A8;'>El bot no tiene permiso <b>Read Message History</b> en este canal. Los mensajes nuevos en vivo sí aparecerán aquí.</p>"
             )
             return
         if not self._chat_messages:
             self.chat_browser.setHtml(
-                "<p style='color:#94A3B8;'>Aún no hay mensajes recientes en este chat.</p>"
+                "<p style='color:#9299A8;'>Aún no hay mensajes recientes en este chat.</p>"
             )
             return
 
         blocks: list[str] = []
+        last_date = ""
         for msg in self._chat_messages:
-            author = html.escape(str(msg.get("author_name") or "Usuario"))
+            dlabel = str(msg.get("date_label") or "").strip()
+            if dlabel and dlabel != last_date:
+                last_date = dlabel
+                d_esc = html.escape(dlabel)
+                blocks.append(
+                    "<table width='100%' cellspacing='0' cellpadding='0' style='margin: 6px 0 6px 0;'>"
+                    "<tr>"
+                    "<td width='45%' valign='middle'><hr color='#262B36'></td>"
+                    f"<td align='center' valign='middle' style='color:#9299A8; font-size:11px; padding:0 8px; white-space:nowrap;'>{d_esc}</td>"
+                    "<td width='45%' valign='middle'><hr color='#262B36'></td>"
+                    "</tr></table>"
+                )
+
+            raw_author = str(msg.get("author_name") or "Usuario")
+            author = html.escape(raw_author)
+            initial = html.escape((raw_author.strip()[:1] or "?").upper())
+            av_bg = _avatar_tint_for(raw_author)
             ts = html.escape(str(msg.get("timestamp") or ""))
             is_self = bool(msg.get("is_self", False))
             is_bot = bool(msg.get("is_bot", False))
-            color = "#93C5FD" if is_self else "#E2E8F0"
+            color = "#CFD5DF" if is_self else "#F1F3F6"
             bot_tag = (
-                " <span style='color:#94A3B8; font-size:10px;'>[APP]</span>" if is_bot else ""
+                " <span style='background-color:#262B36; color:#CFD5DF; font-size:10px; font-weight:700;'> APP </span>"
+                if is_bot
+                else ""
             )
             ts_html = (
-                f" <span style='color:#64748B; font-size:11px;'>{ts}</span>" if ts else ""
+                f" <span style='color:#9299A8; font-size:11px;'>{ts}</span>" if ts else ""
             )
             raw_content = str(msg.get("content") or "")
             body_html = html.escape(raw_content).replace("\n", "<br>") if raw_content else ""
@@ -1193,18 +2490,25 @@ class DiscordVoicePanel(QWidget):
                     aurl = html.escape(str(a.get("url") or ""))
                     if aurl:
                         links.append(
-                            f"<a href='{aurl}' style='color:#60A5FA;'>[{aname}]</a>"
+                            f"<a href='{aurl}' style='color:#93C5FD;'>[{aname}]</a>"
                         )
                     else:
                         links.append(f"[{aname}]")
                 att_html = ("<br>" if body_html else "") + " ".join(links)
             if not body_html and not att_html:
-                body_html = "<span style='color:#64748B; font-style:italic;'>(contenido multimedia o embed)</span>"
+                body_html = "<span style='color:#9299A8; font-style:italic;'>(contenido multimedia o embed)</span>"
+
             blocks.append(
-                f"<div style='margin-bottom:7px; line-height:1.35;'>"
+                "<table width='100%' cellspacing='0' cellpadding='2' style='margin-bottom:4px;'>"
+                "<tr>"
+                f"<td width='34' valign='top' align='center' style='padding-top:2px;'>"
+                f"<span style='background-color:{av_bg}; color:#F1F3F6; font-weight:700; font-size:12px;'>&nbsp;{initial}&nbsp;</span>"
+                "</td>"
+                "<td valign='top' style='line-height:1.35;'>"
                 f"<b style='color:{color};'>{author}</b>{bot_tag}{ts_html}<br>"
-                f"<span style='color:#CBD5E1;'>{body_html}{att_html}</span>"
-                f"</div>"
+                f"<span style='color:#D8DEE9;'>{body_html}{att_html}</span>"
+                "</td>"
+                "</tr></table>"
             )
         self.chat_browser.setHtml("".join(blocks))
         sb = self.chat_browser.verticalScrollBar()
@@ -1228,11 +2532,13 @@ class DiscordVoicePanel(QWidget):
     def _on_join_channel_clicked(self, guild_id: str, channel_id: str, channel_name: str) -> None:
         self._joining_channel_id = channel_id
         self.status_pill.setText(f"Conectando a {channel_name}...")
-        self._render_channels()
+        self._render_channels(force=True)
         self.svc.sync_audio_config(self.cfg, muted=self._muted, deafened=self._deafened)
         self.svc.join_channel(guild_id, channel_id)
 
     def _on_voice_state_updated(self, state: dict[str, Any]) -> None:
+        prev_in_voice = bool(self._voice_state.get("in_voice", False))
+        prev_parts = self._voice_state.get("participants") or []
         self._voice_state = state
         self._joining_channel_id = str(state.get("joining_channel_id") or "")
         in_voice = bool(state.get("in_voice", False))
@@ -1253,91 +2559,96 @@ class DiscordVoicePanel(QWidget):
         self._update_info_pill()
         self._render_channels()
         self._render_participants()
+        new_parts = state.get("participants") or []
+        if in_voice != prev_in_voice or [p.get("id") for p in new_parts] != [p.get("id") for p in prev_parts]:
+            self._refresh_members_list()
+        self._emit_voice_status()
 
-    def _render_participants(self) -> None:
-        self._participant_dots.clear()
-        _clear_layout(self.participants_lay)
+    def _compute_grid_cols(self) -> int:
+        vp = self.participants_scroll.viewport()
+        w = vp.width() if vp is not None else self.width()
+        if w <= 0:
+            w = 680
+        if w >= 660:
+            return 3
+        if w >= 420:
+            return 2
+        return 1
+
+    def _relayout_participant_cards(self) -> None:
+        if not self._participant_cards_order:
+            return
+        cols = self._compute_grid_cols()
+        self._last_grid_cols = cols
+        _clear_grid_keep_widgets(self.participants_grid)
+        for c in range(3):
+            self.participants_grid.setColumnStretch(c, 1 if c < cols else 0)
+        for idx, card in enumerate(self._participant_cards_order):
+            r, c = divmod(idx, cols)
+            self.participants_grid.addWidget(card, r, c)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if self._participant_cards_order and self._compute_grid_cols() != self._last_grid_cols:
+            self._relayout_participant_cards()
+
+    def _participants_signature(self) -> Any:
+        in_voice = bool(self._voice_state.get("in_voice", False))
+        parts = self._voice_state.get("participants") or []
+        return (
+            in_voice,
+            tuple(
+                (
+                    str(p.get("id") or ""),
+                    str(p.get("name") or ""),
+                    bool(p.get("is_bot", False)),
+                    bool(p.get("is_self", False)),
+                    bool(p.get("muted", False)),
+                    bool(p.get("deafened", False)),
+                    str(p.get("avatar_url") or ""),
+                )
+                for p in parts
+            ),
+        )
+
+    def _render_participants(self, force: bool = False) -> None:
+        sig = self._participants_signature()
+        if not force and sig == self._last_participants_sig:
+            return
+        self._last_participants_sig = sig
+
+        self._participant_cards.clear()
+        self._participant_cards_order.clear()
+        _clear_layout(self.participants_grid)
         parts = self._voice_state.get("participants") or []
         if not self._voice_state.get("in_voice") or not parts:
-            lbl = QLabel(
-                "Elige un canal de voz a la izquierda para conectarte y hablar en tiempo real."
-            )
-            lbl.setObjectName("MutedLabel")
-            lbl.setWordWrap(True)
-            self.participants_lay.addWidget(lbl)
-            self.participants_lay.addStretch()
+            self.participants_empty_lbl.setVisible(True)
             return
 
+        self.participants_empty_lbl.setVisible(False)
         for part in parts:
             uid = str(part.get("id") or "")
-            name = str(part.get("name") or uid)
             is_self = bool(part.get("is_self", False))
-            is_bot = bool(part.get("is_bot", False))
-            muted = bool(part.get("muted", False))
-            deaf = bool(part.get("deafened", False))
-
-            row = QFrame()
-            row.setObjectName("MediaCard")
-            rlay = QHBoxLayout(row)
-            rlay.setContentsMargins(10, 7, 10, 7)
-            rlay.setSpacing(8)
-
-            dot = QLabel()
-            dot.setFixedSize(10, 10)
             key = "local" if is_self else uid
             speaking = bool(self._speaking.get(key, False))
-            dot.setStyleSheet(self._dot_style(speaking))
-            self._participant_dots[key] = dot
-            rlay.addWidget(dot)
-
-            name_lbl = QLabel(name)
-            name_lbl.setStyleSheet("font-weight: 600;" if is_self else "")
-            rlay.addWidget(name_lbl)
-
-            if is_bot:
-                tag = QLabel("APP")
-                tag.setObjectName("DeckTag")
-                rlay.addWidget(tag)
-            if muted:
-                m_lbl = QLabel("Silenciado")
-                m_lbl.setObjectName("MutedLabel")
-                rlay.addWidget(m_lbl)
-            if deaf:
-                d_lbl = QLabel("Ensordecido")
-                d_lbl.setObjectName("MutedLabel")
-                rlay.addWidget(d_lbl)
-
-            rlay.addStretch()
-
-            if not is_self:
-                vol = self._user_volumes.get(uid, 100)
-                val_lbl = QLabel(f"{vol}%")
-                val_lbl.setObjectName("MutedLabel")
-                val_lbl.setFixedWidth(38)
-                val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-                sld = QSlider(Qt.Orientation.Horizontal)
-                sld.setRange(0, 200)
-                sld.setValue(vol)
-                sld.setFixedWidth(115)
-                sld.valueChanged.connect(
-                    lambda v, u=uid, l=val_lbl: self._on_user_vol_changed(u, v, l)
-                )
-                rlay.addWidget(sld)
-                rlay.addWidget(val_lbl)
-
-            self.participants_lay.addWidget(row)
-
-        self.participants_lay.addStretch()
-
-    def _dot_style(self, speaking: bool) -> str:
-        color = "#4ADE80" if speaking else self.palette.border_bright
-        return f"background-color: {color}; border-radius: 5px;"
+            vol = self._user_volumes.get(uid, 100)
+            card = _ParticipantCard(
+                part,
+                vol,
+                speaking,
+                self.palette,
+                thumb_cache=self._thumb_cache,
+            )
+            card.volume_changed.connect(self._on_user_vol_value_changed)
+            card.dm_requested.connect(self._open_dm_with_user)
+            self._participant_cards[key] = card
+            self._participant_cards_order.append(card)
+        self._relayout_participant_cards()
 
     def _on_speaking_updated(self, speaking_map: dict[str, bool]) -> None:
         self._speaking = dict(speaking_map)
-        for key, dot in self._participant_dots.items():
-            dot.setStyleSheet(self._dot_style(bool(self._speaking.get(key, False))))
+        for key, card in self._participant_cards.items():
+            card.set_speaking(bool(self._speaking.get(key, False)))
 
     def _on_mic_level_updated(self, rms: int, transmitting: bool) -> None:
         val = max(0, min(100, int(rms)))
@@ -1394,11 +2705,13 @@ class DiscordVoicePanel(QWidget):
         self._muted = not self._muted
         self._refresh_mute_deaf_buttons()
         self.svc.set_mute(self._muted)
+        self._emit_voice_status()
 
     def _toggle_deaf(self) -> None:
         self._deafened = not self._deafened
         self._refresh_mute_deaf_buttons()
         self.svc.set_deaf(self._deafened)
+        self._emit_voice_status()
 
     def _on_out_vol_changed(self, value: int) -> None:
         self.out_vol_val.setText(f"{value}%")
@@ -1445,7 +2758,6 @@ class DiscordVoicePanel(QWidget):
         save_config(self.cfg)
         self.svc.set_vad_threshold(value)
 
-    def _on_user_vol_changed(self, uid: str, value: int, label: QLabel) -> None:
+    def _on_user_vol_value_changed(self, uid: str, value: int) -> None:
         self._user_volumes[uid] = value
-        label.setText(f"{value}%")
         self.svc.set_user_volume(uid, value)

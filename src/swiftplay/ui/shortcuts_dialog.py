@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeyEvent
+from collections.abc import Callable
+
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer
+from PySide6.QtGui import QCursor, QKeyEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -46,6 +49,97 @@ _SHORTCUT_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ),
     ),
 )
+
+
+class OutsideClickDismissFilter(QObject):
+    """Cierra un diálogo al hacer clic fuera de su ventana (sin cerrar en popups/hijos)."""
+
+    def __init__(
+        self,
+        dialog: QDialog,
+        *,
+        should_ignore_deactivate: Callable[[], bool] | None = None,
+    ) -> None:
+        super().__init__(dialog)
+        self._dialog = dialog
+        self._should_ignore_deactivate = should_ignore_deactivate
+        self._was_activated = False
+        self._closing = False
+        self._installed = False
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            self._installed = True
+
+    def uninstall(self) -> None:
+        if not self._installed:
+            return
+        self._installed = False
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except Exception:
+                pass
+
+    def _trigger_close(self) -> None:
+        if self._closing or not self._dialog.isVisible():
+            return
+        self._closing = True
+        QTimer.singleShot(0, self._dialog.reject)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        etype = event.type()
+        if etype == QEvent.Type.WindowActivate and watched is self._dialog:
+            self._was_activated = True
+            return False
+
+        if not self._dialog.isVisible() or self._closing:
+            return False
+
+        if etype in (QEvent.Type.MouseButtonPress, QEvent.Type.NonClientAreaMouseButtonPress):
+            if QApplication.activePopupWidget() is not None:
+                return False
+            modal = QApplication.activeModalWidget()
+            if modal is not None and modal is not self._dialog:
+                return False
+            try:
+                gpos = event.globalPosition().toPoint()  # type: ignore[attr-defined]
+            except Exception:
+                gpos = QCursor.pos()
+            if not self._dialog.frameGeometry().contains(gpos):
+                self._trigger_close()
+                return True
+            return False
+
+        if etype == QEvent.Type.WindowDeactivate and watched is self._dialog and self._was_activated:
+            if QApplication.activePopupWidget() is not None:
+                return False
+            modal = QApplication.activeModalWidget()
+            if modal is not None and modal is not self._dialog:
+                return False
+            if self._should_ignore_deactivate is not None and self._should_ignore_deactivate():
+                return False
+            # Defer para distinguir cambio interno a otro hijo/popup frente a clic externo real
+            def _check_deactivated() -> None:
+                if self._closing or not self._dialog.isVisible():
+                    return
+                if QApplication.activePopupWidget() is not None:
+                    return
+                cur_modal = QApplication.activeModalWidget()
+                if cur_modal is not None and cur_modal is not self._dialog:
+                    return
+                active_w = QApplication.activeWindow()
+                if active_w is self._dialog or (
+                    active_w is not None and self._dialog.isAncestorOf(active_w)
+                ):
+                    return
+                if not self._dialog.frameGeometry().contains(QCursor.pos()):
+                    self._trigger_close()
+
+            QTimer.singleShot(10, _check_deactivated)
+
+        return False
 
 
 class ShortcutsDialog(QDialog):
@@ -143,9 +237,18 @@ class ShortcutsDialog(QDialog):
         footer.setAlignment(Qt.AlignmentFlag.AlignRight)
         footer.setStyleSheet("padding-top: 6px; font-size: 11px;")
         root.addWidget(footer)
+        self._outside_filter = OutsideClickDismissFilter(self)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Question) or event.text() == "?":
             self.accept()
             return
         super().keyPressEvent(event)
+
+    def done(self, result: int) -> None:
+        self._outside_filter.uninstall()
+        super().done(result)
+
+    def closeEvent(self, event) -> None:
+        self._outside_filter.uninstall()
+        super().closeEvent(event)

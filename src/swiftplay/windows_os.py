@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import math
 import os
 import subprocess
 import sys
 from ctypes import wintypes
+from dataclasses import dataclass
 from pathlib import Path
 
 from swiftplay.paths import APP_NAME, APP_ROOT, ICON_ICO_PATH, LAUNCH_SCRIPT_PATH
@@ -452,3 +454,330 @@ def open_folder_in_explorer(path: str) -> None:
     target.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32":
         os.startfile(str(target))  # noqa: S606
+
+
+class _FLASHWINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("hwnd", wintypes.HWND),
+        ("dwFlags", wintypes.DWORD),
+        ("uCount", wintypes.UINT),
+        ("dwTimeout", wintypes.DWORD),
+    ]
+
+
+def flash_window_taskbar(hwnd: int, count: int = 3) -> None:
+    """Ilumina discretamente el icono en la barra de tareas de Windows sin robar foco."""
+    if sys.platform != "win32" or not hwnd:
+        return
+    try:
+        user32 = ctypes.windll.user32
+        user32.FlashWindowEx.argtypes = [ctypes.POINTER(_FLASHWINFO)]
+        user32.FlashWindowEx.restype = wintypes.BOOL
+        info = _FLASHWINFO()
+        info.cbSize = ctypes.sizeof(_FLASHWINFO)
+        info.hwnd = wintypes.HWND(int(hwnd))
+        info.dwFlags = 0x00000002 | 0x0000000C  # FLASHW_TRAY | FLASHW_TIMERNOFG
+        info.uCount = max(1, int(count))
+        info.dwTimeout = 0
+        user32.FlashWindowEx(ctypes.byref(info))
+    except Exception:
+        pass
+
+
+@dataclass(slots=True)
+class ResourceSnapshot:
+    ws_mb: float = 0.0
+    priv_mb: float = 0.0
+    app_cpu_pct: float = 0.0
+    sys_cpu_pct: float = 0.0
+    app_gpu_pct: float = 0.0
+    sys_gpu_pct: float = 0.0
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", wintypes.DWORD),
+        ("dwHighDateTime", wintypes.DWORD),
+    ]
+
+
+class _PDH_FMT_COUNTERVALUE_UNION(ctypes.Union):
+    _fields_ = [
+        ("longValue", ctypes.c_long),
+        ("doubleValue", ctypes.c_double),
+        ("largeValue", ctypes.c_longlong),
+        ("AnsiStringValue", ctypes.c_char_p),
+        ("WideStringValue", ctypes.c_wchar_p),
+    ]
+
+
+class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [
+        ("CStatus", wintypes.DWORD),
+        ("union", _PDH_FMT_COUNTERVALUE_UNION),
+    ]
+
+
+class _PDH_FMT_COUNTERVALUE_ITEM_W(ctypes.Structure):
+    _fields_ = [
+        ("szName", wintypes.LPWSTR),
+        ("FmtValue", _PDH_FMT_COUNTERVALUE),
+    ]
+
+
+def _ft_to_int(ft: _FILETIME) -> int:
+    return (int(ft.dwHighDateTime) << 32) | int(ft.dwLowDateTime)
+
+
+class SystemResourceMonitor:
+    """Monitor liviano nativo de RAM, CPU% y GPU% (Win32 API + PDH sin dependencias)."""
+
+    _PDH_FMT_DOUBLE = 0x00000200
+    _PDH_MORE_DATA = 0x800007D2
+
+    def __init__(self, pid: int | None = None) -> None:
+        self._pid = int(pid or os.getpid())
+        self._last_proc_cpu: int | None = None
+        self._last_sys_total: int | None = None
+        self._last_sys_idle: int | None = None
+        self._pdh = None
+        self._pdh_query: ctypes.c_void_p | None = None
+        self._pdh_gpu_counter: ctypes.c_void_p | None = None
+        self._proc_handle: wintypes.HANDLE | None = None
+        self._init_native()
+
+    def _init_native(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            self._proc_handle = k32.GetCurrentProcess()
+            k32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+            ]
+            k32.GetProcessTimes.restype = wintypes.BOOL
+            k32.GetSystemTimes.argtypes = [
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+            ]
+            k32.GetSystemTimes.restype = wintypes.BOOL
+            self._sample_cpu_pct()
+        except Exception:
+            self._proc_handle = None
+
+        try:
+            pdh = ctypes.windll.pdh
+            pdh.PdhOpenQueryW.argtypes = [
+                wintypes.LPCWSTR,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            pdh.PdhOpenQueryW.restype = ctypes.c_long
+            pdh.PdhAddEnglishCounterW.argtypes = [
+                ctypes.c_void_p,
+                wintypes.LPCWSTR,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            pdh.PdhAddEnglishCounterW.restype = ctypes.c_long
+            pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+            pdh.PdhCollectQueryData.restype = ctypes.c_long
+            pdh.PdhGetFormattedCounterArrayW.argtypes = [
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(_PDH_FMT_COUNTERVALUE_ITEM_W),
+            ]
+            pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_long
+            pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+            pdh.PdhCloseQuery.restype = ctypes.c_long
+
+            q = ctypes.c_void_p()
+            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)) == 0:
+                c = ctypes.c_void_p()
+                if (
+                    pdh.PdhAddEnglishCounterW(
+                        q,
+                        r"\GPU Engine(*)\Utilization Percentage",
+                        0,
+                        ctypes.byref(c),
+                    )
+                    == 0
+                ):
+                    pdh.PdhCollectQueryData(q)
+                    self._pdh = pdh
+                    self._pdh_query = q
+                    self._pdh_gpu_counter = c
+                else:
+                    pdh.PdhCloseQuery(q)
+        except Exception:
+            self._pdh = None
+            self._pdh_query = None
+            self._pdh_gpu_counter = None
+
+    def _sample_cpu_pct(self) -> tuple[float, float]:
+        if sys.platform != "win32" or self._proc_handle is None:
+            return 0.0, 0.0
+        try:
+            k32 = ctypes.windll.kernel32
+            ft_create, ft_exit, ft_p_kern, ft_p_user = (
+                _FILETIME(),
+                _FILETIME(),
+                _FILETIME(),
+                _FILETIME(),
+            )
+            ft_idle, ft_s_kern, ft_s_user = _FILETIME(), _FILETIME(), _FILETIME()
+            if not k32.GetProcessTimes(
+                self._proc_handle,
+                ctypes.byref(ft_create),
+                ctypes.byref(ft_exit),
+                ctypes.byref(ft_p_kern),
+                ctypes.byref(ft_p_user),
+            ):
+                return 0.0, 0.0
+            if not k32.GetSystemTimes(
+                ctypes.byref(ft_idle),
+                ctypes.byref(ft_s_kern),
+                ctypes.byref(ft_s_user),
+            ):
+                return 0.0, 0.0
+
+            proc_total = _ft_to_int(ft_p_kern) + _ft_to_int(ft_p_user)
+            sys_idle = _ft_to_int(ft_idle)
+            sys_total = _ft_to_int(ft_s_kern) + _ft_to_int(ft_s_user)
+
+            if self._last_proc_cpu is None or self._last_sys_total is None or self._last_sys_idle is None:
+                self._last_proc_cpu = proc_total
+                self._last_sys_total = sys_total
+                self._last_sys_idle = sys_idle
+                return 0.0, 0.0
+
+            d_proc = max(0, proc_total - self._last_proc_cpu)
+            d_total = sys_total - self._last_sys_total
+            d_idle = max(0, sys_idle - self._last_sys_idle)
+            self._last_proc_cpu = proc_total
+            self._last_sys_total = sys_total
+            self._last_sys_idle = sys_idle
+
+            if d_total <= 0:
+                return 0.0, 0.0
+            app_pct = max(0.0, min(100.0, (d_proc / float(d_total)) * 100.0))
+            sys_busy = max(0, d_total - d_idle)
+            sys_pct = max(0.0, min(100.0, (sys_busy / float(d_total)) * 100.0))
+            return app_pct, sys_pct
+        except Exception:
+            return 0.0, 0.0
+
+    def _sample_gpu_pct(self) -> tuple[float, float]:
+        if sys.platform != "win32" or self._pdh is None or not self._pdh_query or not self._pdh_gpu_counter:
+            return 0.0, 0.0
+        try:
+            if self._pdh.PdhCollectQueryData(self._pdh_query) != 0:
+                return 0.0, 0.0
+            buf_sz = wintypes.DWORD(0)
+            cnt = wintypes.DWORD(0)
+            rc = self._pdh.PdhGetFormattedCounterArrayW(
+                self._pdh_gpu_counter,
+                self._PDH_FMT_DOUBLE,
+                ctypes.byref(buf_sz),
+                ctypes.byref(cnt),
+                None,
+            )
+            if (rc & 0xFFFFFFFF) != self._PDH_MORE_DATA or buf_sz.value == 0:
+                return 0.0, 0.0
+
+            raw = ctypes.create_string_buffer(buf_sz.value)
+            arr_ptr = ctypes.cast(raw, ctypes.POINTER(_PDH_FMT_COUNTERVALUE_ITEM_W))
+            if (
+                self._pdh.PdhGetFormattedCounterArrayW(
+                    self._pdh_gpu_counter,
+                    self._PDH_FMT_DOUBLE,
+                    ctypes.byref(buf_sz),
+                    ctypes.byref(cnt),
+                    arr_ptr,
+                )
+                != 0
+            ):
+                return 0.0, 0.0
+
+            app_by_eng: dict[str, float] = {}
+            sys_by_eng: dict[str, float] = {}
+            pid_prefix = f"pid_{self._pid}_"
+            n_items = int(cnt.value)
+            for idx in range(n_items):
+                item = arr_ptr[idx]
+                status = int(item.FmtValue.CStatus)
+                if status not in (0, 1):
+                    continue
+                val = float(item.FmtValue.union.doubleValue)
+                if not math.isfinite(val) or val < 0.0:
+                    continue
+                name = str(item.szName or "")
+                eng_pos = name.find("engtype_")
+                eng_key = name[eng_pos:] if eng_pos >= 0 else "other"
+                luid_pos = name.find("luid_")
+                sys_key = name[luid_pos:] if luid_pos >= 0 else eng_key
+                sys_by_eng[sys_key] = sys_by_eng.get(sys_key, 0.0) + val
+                if name.startswith(pid_prefix):
+                    app_by_eng[eng_key] = app_by_eng.get(eng_key, 0.0) + val
+
+            app_gpu = max(app_by_eng.values(), default=0.0)
+            sys_gpu = max(sys_by_eng.values(), default=0.0)
+            return max(0.0, min(100.0, app_gpu)), max(0.0, min(100.0, sys_gpu))
+        except Exception:
+            return 0.0, 0.0
+
+    def sample(self) -> ResourceSnapshot:
+        ws_mb, priv_mb = get_process_memory_mb()
+        app_cpu, sys_cpu = self._sample_cpu_pct()
+        app_gpu, sys_gpu = self._sample_gpu_pct()
+        return ResourceSnapshot(
+            ws_mb=ws_mb,
+            priv_mb=priv_mb,
+            app_cpu_pct=app_cpu,
+            sys_cpu_pct=sys_cpu,
+            app_gpu_pct=app_gpu,
+            sys_gpu_pct=sys_gpu,
+        )
+
+    def close(self) -> None:
+        if self._pdh is not None and self._pdh_query is not None:
+            try:
+                self._pdh.PdhCloseQuery(self._pdh_query)
+            except Exception:
+                pass
+        self._pdh = None
+        self._pdh_query = None
+        self._pdh_gpu_counter = None
+
+
+class _WIN_MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("message", ctypes.c_uint),
+        ("wParam", ctypes.c_size_t),
+        ("lParam", ctypes.c_ssize_t),
+    ]
+
+
+def is_win32_disabled_parent_click(message: object) -> bool:
+    """Detecta clic sobre ventana padre bloqueada por un diálogo modal (WM_SETCURSOR + HTERROR)."""
+    if sys.platform != "win32" or not message:
+        return False
+    try:
+        msg = _WIN_MSG.from_address(int(message))  # type: ignore[arg-type]
+        if int(msg.message) != 0x0020:
+            return False
+        hit = int(msg.lParam) & 0xFFFF
+        mouse_msg = (int(msg.lParam) >> 16) & 0xFFFF
+        return hit == 0xFFFE and mouse_msg in (0x0201, 0x0204, 0x0207)
+    except Exception:
+        return False

@@ -104,7 +104,7 @@ class MiniBarWindow(QWidget):
 
         self.play_btn = QPushButton()
         self.play_btn.setObjectName("PlayAccentBtn")
-        self.play_btn.setFixedSize(32, 32)
+        self.play_btn.setFixedSize(34, 34)
         self.play_btn.setIconSize(QSize(16, 16))
         self.play_btn.setToolTip("Reproducir / Pausar [Espacio]")
         self.play_btn.clicked.connect(self.play_pause_requested.emit)

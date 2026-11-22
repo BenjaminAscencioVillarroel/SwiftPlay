@@ -181,12 +181,77 @@ def _innertube_web_context() -> dict[str, Any]:
     }
 
 
+def _extract_feed_continuation_token(root: Any) -> str | None:
+    """Extrae el token de paginación del grid principal o appendContinuationItemsAction."""
+    tokens: list[str] = []
+
+    def _collect_items(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for el in items:
+            if not isinstance(el, dict):
+                continue
+            cir = el.get("continuationItemRenderer")
+            if isinstance(cir, dict):
+                tok = (
+                    cir.get("continuationEndpoint", {})
+                    .get("continuationCommand", {})
+                    .get("token")
+                )
+                if tok:
+                    tokens.append(str(tok))
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, list):
+            for el in node:
+                _walk(el)
+            return
+        if not isinstance(node, dict):
+            return
+        grid = node.get("richGridRenderer")
+        if isinstance(grid, dict):
+            _collect_items(grid.get("contents"))
+        app_act = node.get("appendContinuationItemsAction")
+        if isinstance(app_act, dict):
+            _collect_items(app_act.get("continuationItems"))
+        rel_act = node.get("reloadContinuationItemsCommand")
+        if isinstance(rel_act, dict):
+            _collect_items(rel_act.get("continuationItems"))
+        for v in node.values():
+            _walk(v)
+
+    _walk(root)
+    return tokens[-1] if tokens else None
+
+
+def _is_badge_live(badge_vm: dict[str, Any]) -> bool:
+    txt = str(badge_vm.get("text") or "").strip().upper()
+    style = str(badge_vm.get("badgeStyle") or "").upper()
+    if "LIVE" in style or txt in ("LIVE", "EN VIVO", "EN DIRECTO", "DIRECTO"):
+        return True
+    sources = (badge_vm.get("icon") or {}).get("sources") or []
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        img_name = str(
+            (src.get("clientResource") or {}).get("imageName") or ""
+        ).upper()
+        if "LIVE" in img_name:
+            return True
+    return False
+
+
 def _extract_innertube_videos(
-    root: Any, limit: int = 20, block_shorts: bool = True
+    root: Any,
+    limit: int = 20,
+    block_shorts: bool = True,
+    exclude_ids: set[str] | None = None,
+    exclude_watched: bool = False,
 ) -> list[MediaItem]:
     """Recorre respuesta InnerTube WEB extrayendo videoRenderer y lockupViewModel sin Shorts."""
     results: list[MediaItem] = []
     seen: set[str] = set()
+    skip_ids = exclude_ids or set()
 
     def _walk(node: Any) -> None:
         if len(results) >= limit:
@@ -219,14 +284,41 @@ def _extract_innertube_videos(
         if "videoRenderer" in node and isinstance(node["videoRenderer"], dict):
             vr = node["videoRenderer"]
             vid = str(vr.get("videoId") or "")
-            if vid and vid not in seen:
+            if vid and vid not in seen and vid not in skip_ids:
+                overlays = vr.get("thumbnailOverlays") or []
+                watched_pct = 0
+                ov_dur = ""
+                ov_live = False
+                for ov in overlays:
+                    if not isinstance(ov, dict):
+                        continue
+                    rep = ov.get("thumbnailOverlayResumePlaybackRenderer")
+                    if isinstance(rep, dict):
+                        watched_pct = max(
+                            watched_pct, int(rep.get("percentDurationWatched") or 0)
+                        )
+                    tsr = ov.get("thumbnailOverlayTimeStatusRenderer")
+                    if isinstance(tsr, dict):
+                        ts_txt = _extract_text(tsr.get("text"))
+                        ts_style = str(tsr.get("style") or "").upper()
+                        if "LIVE" in ts_style or ts_txt.upper() in (
+                            "LIVE",
+                            "EN VIVO",
+                            "EN DIRECTO",
+                        ):
+                            ov_live = True
+                        elif ":" in ts_txt and not ov_dur:
+                            ov_dur = ts_txt
+                if exclude_watched and watched_pct >= 80:
+                    return
+
                 title = _extract_text(vr.get("title"))
                 author = _extract_text(
                     vr.get("ownerText")
                     or vr.get("longBylineText")
                     or vr.get("shortBylineText")
                 )
-                dur_str = _extract_text(vr.get("lengthText"))
+                dur_str = _extract_text(vr.get("lengthText")) or ov_dur
                 dur_sec = parse_duration_text(dur_str)
                 nav_url = (
                     vr.get("navigationEndpoint", {})
@@ -234,9 +326,12 @@ def _extract_innertube_videos(
                     .get("webCommandMetadata", {})
                     .get("url", "")
                 )
+                badges_blob = json.dumps(vr.get("badges") or []).upper()
                 is_live = not dur_str and (
-                    "LIVE" in json.dumps(vr.get("badges") or []).upper()
-                    or "EN VIVO" in json.dumps(vr.get("badges") or []).upper()
+                    ov_live
+                    or "LIVE" in badges_blob
+                    or "EN VIVO" in badges_blob
+                    or "EN DIRECTO" in badges_blob
                 )
                 if title and not (
                     block_shorts
@@ -264,10 +359,11 @@ def _extract_innertube_videos(
                             video_id=vid,
                             title=title,
                             author=_normalize_space(author) or "YouTube",
-                            duration=dur_str or ("EN VIVO" if is_live else ""),
+                            duration="EN VIVO" if is_live else dur_str,
                             duration_sec=dur_sec,
                             thumb_url=thumb,
                             kind="video",
+                            is_live=is_live,
                             channel_avatar_url=avatar,
                             published_text=published,
                         )
@@ -291,6 +387,7 @@ def _extract_innertube_videos(
                 vid
                 and len(vid) == 11
                 and vid not in seen
+                and vid not in skip_ids
                 and ctype in ("LOCKUP_CONTENT_TYPE_VIDEO", "")
                 and "/shorts/" not in nav_url.lower()
             ):
@@ -307,22 +404,54 @@ def _extract_innertube_videos(
                     if parts and isinstance(parts[0], dict):
                         author = _extract_text(parts[0].get("text"))
 
-                # Extraer duración desde overlays de thumbnailViewModel
+                # Extraer duración, estado EN VIVO y barra de progreso visto desde overlays actuales de YT
                 dur_str = ""
                 is_live = False
+                watched_pct = 0
                 cimg = lm.get("contentImage", {}).get("thumbnailViewModel", {})
                 for ov in cimg.get("overlays") or []:
                     if not isinstance(ov, dict):
                         continue
-                    badge_vm = ov.get("thumbnailOverlayBadgeViewModel", {})
-                    for b in badge_vm.get("thumbnailBadges") or []:
-                        tb = b.get("thumbnailBadgeViewModel", {}) if isinstance(b, dict) else {}
-                        txt = str(tb.get("text") or "").strip()
-                        style = str(tb.get("badgeStyle") or "").upper()
-                        if "LIVE" in style or txt.upper() in ("LIVE", "EN VIVO"):
-                            is_live = True
-                        elif ":" in txt:
-                            dur_str = txt
+                    pb_vm = ov.get("thumbnailOverlayProgressBarViewModel")
+                    if isinstance(pb_vm, dict):
+                        watched_pct = max(
+                            watched_pct, int(pb_vm.get("startPercent") or 0)
+                        )
+                    bottom_ov = ov.get("thumbnailBottomOverlayViewModel")
+                    if isinstance(bottom_ov, dict):
+                        pb_nested = (
+                            bottom_ov.get("progressBar", {})
+                            .get("thumbnailOverlayProgressBarViewModel", {})
+                        )
+                        if isinstance(pb_nested, dict):
+                            watched_pct = max(
+                                watched_pct, int(pb_nested.get("startPercent") or 0)
+                            )
+                    badge_lists = [
+                        (ov.get("thumbnailOverlayBadgeViewModel") or {}).get(
+                            "thumbnailBadges"
+                        ),
+                        (bottom_ov or {}).get("badges")
+                        if isinstance(bottom_ov, dict)
+                        else None,
+                    ]
+                    for b_list in badge_lists:
+                        for b in b_list or []:
+                            tb = (
+                                b.get("thumbnailBadgeViewModel", {})
+                                if isinstance(b, dict)
+                                else {}
+                            )
+                            if not isinstance(tb, dict):
+                                continue
+                            txt = str(tb.get("text") or "").strip()
+                            if _is_badge_live(tb):
+                                is_live = True
+                            elif ":" in txt and not dur_str:
+                                dur_str = txt
+
+                if exclude_watched and watched_pct >= 80:
+                    return
 
                 dur_sec = parse_duration_text(dur_str)
                 if title and not (
@@ -345,10 +474,11 @@ def _extract_innertube_videos(
                             video_id=vid,
                             title=title,
                             author=_normalize_space(author) or "YouTube",
-                            duration=dur_str or ("EN VIVO" if is_live else ""),
+                            duration="EN VIVO" if is_live else dur_str,
                             duration_sec=dur_sec,
                             thumb_url=thumb,
                             kind="video",
+                            is_live=is_live,
                             channel_avatar_url=avatar,
                             published_text=published,
                         )
@@ -376,6 +506,9 @@ class YouTubeService:
         self._sessions_lock = threading.Lock()
         self._http_sessions: list[requests.Session] = []
         self._worker = YtdlpWorkerClient()
+        self._feed_lock = threading.Lock()
+        self._feed_continuation: str | None = None
+        self._fallback_seed_idx: int = 0
         self._stream_lock = threading.Lock()
         self._stream_cache: OrderedDict[tuple[str, bool, str], tuple[float, ResolvedStream]] = OrderedDict()
         self._inflight_streams: dict[
@@ -412,6 +545,8 @@ class YouTubeService:
                 pass
         with self._stream_lock:
             self._stream_cache.clear()
+        with self._feed_lock:
+            self._feed_continuation = None
         with self._ytm_lock:
             self._ytmusic = None
             self._ytmusic_search = None
@@ -423,6 +558,8 @@ class YouTubeService:
             self._ytmusic_search = None
         with self._stream_lock:
             self._stream_cache.clear()
+        with self._feed_lock:
+            self._feed_continuation = None
         self._worker.reset_for_auth()
 
         raw = load_cookies_decrypted()
@@ -555,13 +692,14 @@ class YouTubeService:
     # Feeds de Inicio (Video sin Shorts & Música en 2-3 secciones)
     # ------------------------------------------------------------------
 
-    def get_video_home_feed(
-        self, limit: int = 18, fallback_queries: list[str] | None = None
-    ) -> list[MediaItem]:
-        """Feed liviano de YouTube sin Shorts (bloquea /shorts/ y videos <= 60s)."""
-        headers = _build_innertube_headers("https://www.youtube.com")
+    def _fetch_browse_page(
+        self, headers: dict[str, str], continuation: str | None = None
+    ) -> dict[str, Any] | None:
         payload = _innertube_web_context()
-        payload["browseId"] = "FEwhat_to_watch"
+        if continuation:
+            payload["continuation"] = continuation
+        else:
+            payload["browseId"] = "FEwhat_to_watch"
         try:
             with self._get_session().post(
                 "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false",
@@ -570,18 +708,130 @@ class YouTubeService:
                 timeout=10,
             ) as resp:
                 if resp.ok:
-                    items = _extract_innertube_videos(
-                        resp.json(), limit=limit, block_shorts=True
-                    )
-                    if items:
-                        return items
+                    data = resp.json()
+                    return data if isinstance(data, dict) else None
         except Exception:
             pass
+        return None
+
+    def get_video_home_feed(
+        self,
+        limit: int = 36,
+        fallback_queries: list[str] | None = None,
+        watched_ids: set[str] | None = None,
+        recent_shown_ids: set[str] | None = None,
+        refresh: bool = False,
+    ) -> list[MediaItem]:
+        """Feed de YouTube sin Shorts, paginado, sin videos ya vistos y renovado al refrescar."""
+        headers = _build_innertube_headers("https://www.youtube.com")
+        hard_skip = {str(x) for x in (watched_ids or ()) if x}
+        soft_skip = {str(x) for x in (recent_shown_ids or ()) if x}
+        collected: list[MediaItem] = []
+        seen_ids: set[str] = set()
+
+        with self._feed_lock:
+            token = self._feed_continuation if refresh else None
+        latest_token: str | None = None
+
+        for page_idx in range(4):
+            if len(collected) >= limit:
+                break
+            used_token = token
+            data = self._fetch_browse_page(headers, continuation=used_token)
+            if data is None and used_token is not None and page_idx == 0:
+                token = None
+                data = self._fetch_browse_page(headers, continuation=None)
+                used_token = None
+            if data is None:
+                break
+
+            batch = _extract_innertube_videos(
+                data,
+                limit=limit - len(collected),
+                block_shorts=True,
+                exclude_ids=hard_skip | soft_skip | seen_ids,
+                exclude_watched=True,
+            )
+            if not batch and used_token is not None and page_idx == 0:
+                # Si el token de continuación ya se agotó, reintentar feed inicial fresco
+                data = self._fetch_browse_page(headers, continuation=None)
+                if data is None:
+                    break
+                batch = _extract_innertube_videos(
+                    data,
+                    limit=limit - len(collected),
+                    block_shorts=True,
+                    exclude_ids=hard_skip | soft_skip | seen_ids,
+                    exclude_watched=True,
+                )
+
+            for item in batch:
+                if item.video_id and item.video_id not in seen_ids:
+                    seen_ids.add(item.video_id)
+                    collected.append(item)
+
+            next_tok = _extract_feed_continuation_token(data)
+            if next_tok:
+                latest_token = next_tok
+            token = next_tok
+            if not token:
+                break
+
+        if len(collected) < min(8, limit) and soft_skip:
+            fresh_data = self._fetch_browse_page(headers, continuation=None)
+            if fresh_data is not None:
+                extra = _extract_innertube_videos(
+                    fresh_data,
+                    limit=limit - len(collected),
+                    block_shorts=True,
+                    exclude_ids=hard_skip | seen_ids,
+                    exclude_watched=True,
+                )
+                for item in extra:
+                    if item.video_id and item.video_id not in seen_ids:
+                        seen_ids.add(item.video_id)
+                        collected.append(item)
+                if not latest_token:
+                    latest_token = _extract_feed_continuation_token(fresh_data)
+
+        if latest_token is not None:
+            with self._feed_lock:
+                self._feed_continuation = latest_token
+
+        if collected:
+            return collected[:limit]
 
         # Respaldo liviano si no hay sesión o FEwhat_to_watch vino vacío
-        queries = [q for q in (fallback_queries or []) if q.strip()]
-        seed = queries[0] if queries else "documentales tecnologia musica en vivo"
-        return self.search_videos(seed, limit=limit, block_shorts=True)
+        defaults = [
+            "documentales tecnologia ciencia",
+            "programacion ia desarrollo",
+            "conciertos musica en vivo",
+            "naturaleza historia 4k",
+        ]
+        pool = [q.strip() for q in (fallback_queries or []) if q and q.strip()]
+        for d in defaults:
+            if d not in pool:
+                pool.append(d)
+        with self._feed_lock:
+            if refresh:
+                self._fallback_seed_idx = (self._fallback_seed_idx + 1) % len(pool)
+            seed = pool[self._fallback_seed_idx % len(pool)]
+        raw_items = self.search_videos(
+            seed, limit=min(50, limit + len(hard_skip) + 6), block_shorts=True
+        )
+        fresh_items = [
+            it
+            for it in raw_items
+            if it.video_id not in hard_skip and it.video_id not in soft_skip
+        ]
+        if len(fresh_items) < min(8, limit):
+            fresh_ids = {it.video_id for it in fresh_items}
+            fresh_items.extend(
+                it
+                for it in raw_items
+                if it.video_id not in hard_skip and it.video_id not in fresh_ids
+            )
+        return fresh_items[:limit]
 
     def get_music_home_sections(
         self, local_listen_again: list[MediaItem]

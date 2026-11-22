@@ -16,9 +16,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPropertyAnimation, QSize, QTimer  # noqa: E402
-from PySide6.QtGui import QImage, QPixmap  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPointF, QPropertyAnimation, QSize, Qt, QTimer  # noqa: E402
+from PySide6.QtGui import QImage, QMouseEvent, QPixmap  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton  # noqa: E402
 
 from swiftplay.config import AppConfig, VALID_SPEEDS, load_config, save_config  # noqa: E402
 from swiftplay.discord_service import DiscordService  # noqa: E402
@@ -51,6 +51,7 @@ from swiftplay.ui.settings_dialog import SettingsDialog  # noqa: E402
 from swiftplay.ui.shortcuts_dialog import ShortcutsDialog  # noqa: E402
 from swiftplay.ui.widgets import VideoGridCard  # noqa: E402
 from swiftplay.windows_os import (  # noqa: E402
+    SystemResourceMonitor,
     apply_window_taskbar_properties,
     get_desktop_shortcut_path,
     get_process_memory_mb,
@@ -58,7 +59,11 @@ from swiftplay.windows_os import (  # noqa: E402
     is_startup_enabled,
     set_process_app_user_model_id,
 )
-from swiftplay.youtube_service import YouTubeService, is_short_video  # noqa: E402
+from swiftplay.youtube_service import (  # noqa: E402
+    YouTubeService,
+    _extract_innertube_videos,
+    is_short_video,
+)
 
 
 def test_dpapi_security() -> None:
@@ -116,10 +121,14 @@ def test_storage_config_themes() -> None:
 
         cfg.music_download_dir = str(Path(tmp) / "MiMusicaDL")
         cfg.video_download_dir = str(Path(tmp) / "MiVideoDL")
+        cfg.discord_hidden_channels = [" 101 ", "101", "202"]
+        cfg.discord_hidden_channel_names = {"101": "🔊 Sala", "999": "Ignorado"}
         save_config(cfg, cfg_path)
         cfg2 = load_config(cfg_path)
         assert cfg2.music_download_dir == cfg.music_download_dir
         assert cfg2.video_download_dir == cfg.video_download_dir
+        assert cfg2.discord_hidden_channels == ["101", "202"]
+        assert cfg2.discord_hidden_channel_names == {"101": "🔊 Sala"}
 
         db = LocalLibrary(Path(tmp) / "library.db")
         v = MediaItem("vid1", "Video Test", "Canal Test", "5:10", 310, "", "video")
@@ -152,11 +161,13 @@ def test_storage_config_themes() -> None:
         assert db.get_play_position("vid1") == 0.0
         assert [x.video_id for x in db.list_listen_again("music", limit=5)] == ["mus1"]
         assert [x.video_id for x in db.list_listen_again("video", limit=5)] == ["vid1"]
+        assert "vid1" in db.list_watched_video_ids()
         db.remove_from_history("vid1")
         assert db.count_video_history() == 0
         db.record_play(v)
         db.clear_video_history()
         assert db.count_video_history() == 0
+        assert "vid1" not in db.list_watched_video_ids()
         # Historial local de música
         db.record_play(m)
         assert db.count_music_history() == 1
@@ -188,6 +199,29 @@ def test_storage_config_themes() -> None:
         assert [x.video_id for x in db.list_twitch_favorites()] == ["ibai"]
         db.remove_twitch_favorite("ibai")
         assert db.count_twitch_favorites() == 0
+
+        # Persistencia local de DMs de Discord
+        db.upsert_discord_dm_thread("u99", "Carlos", "", "hola")
+        db.save_discord_dm_message(
+            "u99",
+            {
+                "id": "dm1",
+                "author_id": "1",
+                "author_name": "TuBot",
+                "is_self": True,
+                "is_bot": True,
+                "content": "Que tal?",
+                "timestamp": "21:10",
+                "date_label": "Hoy",
+            },
+            peer_name="Carlos",
+        )
+        threads = db.list_discord_dm_threads()
+        assert len(threads) == 1 and threads[0]["user_name"] == "Carlos"
+        saved_dms = db.list_discord_dm_messages("u99")
+        assert len(saved_dms) == 1 and saved_dms[0]["content"] == "Que tal?"
+        db.remove_discord_dm_thread("u99")
+        assert db.list_discord_dm_messages("u99") == []
         db.close()
 
         # Persistencia de última sesión (video + música + cola <= 15)
@@ -255,8 +289,100 @@ def test_storage_config_themes() -> None:
     assert len(qss) > 500
     assert "PlayAccentBtn" in qss, "Falta regla dedicada PlayAccentBtn en QSS"
     assert "QFrame#PlayerBar QWidget" not in qss, "No debe existir regla 'QFrame#PlayerBar QWidget' que rompa PlayAccentBtn"
+    assert "border-left: 3px" not in qss, "NavBtn activo debe usar borde redondeado uniforme sin esquinas de 90 grados"
+    assert "QFrame#ResourceMonitorCard" in qss and "QFrame#DiscordVoiceHeader" in qss
+    assert qss.count("{") == qss.count("}"), "QSS tiene llaves desbalanceadas"
+    for sel in ("QFrame#DiscordChatCard", "QFrame#DiscordVoiceArea", "QFrame#DiscordDeckCard", "QFrame#DiscordSidebarMiniCard"):
+        assert sel in qss, f"Falta selector {sel} en QSS"
+    accent_section = qss.split("QPushButton#AccentBtn {{")[1].split("}}")[0] if "QPushButton#AccentBtn {{" in qss else qss.split("QPushButton#AccentBtn {")[1].split("}")[0]
+    assert "#F1F3F6" in accent_section, "AccentBtn debe usar texto claro (#F1F3F6) legible"
+    pill_section = qss.split("QPushButton#PillBtn {")[1].split("}")[0]
+    assert "border-radius: 10px" in pill_section, "PillBtn debe usar radio <= 10px para mantener esquinas redondeadas"
+    play_section = qss.split("QPushButton#PlayAccentBtn {")[1].split("}")[0]
+    assert "border-radius: 16px" in play_section, "PlayAccentBtn debe usar border-radius: 16px"
+    pill_active_section = qss.split('QPushButton#PillBtn[active="true"] {')[1].split("}")[0]
+    assert "#F1F3F6" in pill_active_section, "PillBtn activo debe usar texto claro (#F1F3F6) legible"
     for hx in expected_tokens:
         assert hx in qss, f"Falta color {hx} en tema matte_silver"
+
+    mock_it_data = {
+        "contents": [
+            {
+                "lockupViewModel": {
+                    "contentId": "vidNormal11",
+                    "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                    "contentImage": {
+                        "thumbnailViewModel": {
+                            "image": {"sources": [{"url": "https://i.ytimg.com/vi/vidNormal11/hqdefault.jpg", "width": 480}]},
+                            "overlays": [
+                                {
+                                    "thumbnailBottomOverlayViewModel": {
+                                        "badges": [
+                                            {"thumbnailBadgeViewModel": {"text": "33:44", "badgeStyle": "THUMBNAIL_OVERLAY_BADGE_STYLE_DEFAULT"}}
+                                        ]
+                                    }
+                                }
+                            ],
+                        }
+                    },
+                    "metadata": {"lockupMetadataViewModel": {"title": {"content": "Tutorial largo"}, "metadata": {"contentMetadataViewModel": {"metadataRows": [{"metadataParts": [{"text": {"content": "CanalPro"}}]}]}}}},
+                }
+            },
+            {
+                "lockupViewModel": {
+                    "contentId": "vidLive1111",
+                    "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                    "contentImage": {
+                        "thumbnailViewModel": {
+                            "image": {"sources": [{"url": "https://i.ytimg.com/vi/vidLive1111/hqdefault.jpg", "width": 480}]},
+                            "overlays": [
+                                {
+                                    "thumbnailBottomOverlayViewModel": {
+                                        "badges": [
+                                            {"thumbnailBadgeViewModel": {"text": "EN DIRECTO", "badgeStyle": "THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE"}}
+                                        ]
+                                    }
+                                }
+                            ],
+                        }
+                    },
+                    "metadata": {"lockupMetadataViewModel": {"title": {"content": "Stream en vivo"}, "metadata": {"contentMetadataViewModel": {"metadataRows": [{"metadataParts": [{"text": {"content": "Streamer"}}]}]}}}},
+                }
+            },
+            {
+                "lockupViewModel": {
+                    "contentId": "vidWatched1",
+                    "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                    "contentImage": {
+                        "thumbnailViewModel": {
+                            "image": {"sources": [{"url": "https://i.ytimg.com/vi/vidWatched1/hqdefault.jpg", "width": 480}]},
+                            "overlays": [
+                                {
+                                    "thumbnailBottomOverlayViewModel": {
+                                        "badges": [{"thumbnailBadgeViewModel": {"text": "10:00", "badgeStyle": "THUMBNAIL_OVERLAY_BADGE_STYLE_DEFAULT"}}],
+                                        "progressBar": {"thumbnailOverlayProgressBarViewModel": {"startPercent": 95}},
+                                    }
+                                }
+                            ],
+                        }
+                    },
+                    "metadata": {"lockupMetadataViewModel": {"title": {"content": "Video ya visto"}, "metadata": {"contentMetadataViewModel": {"metadataRows": [{"metadataParts": [{"text": {"content": "CanalPro"}}]}]}}}},
+                }
+            },
+        ]
+    }
+    parsed_mock = _extract_innertube_videos(mock_it_data, limit=10, block_shorts=True, exclude_watched=True)
+    assert [x.video_id for x in parsed_mock] == ["vidNormal11", "vidLive1111"], parsed_mock
+    assert parsed_mock[0].duration == "33:44" and parsed_mock[0].duration_sec == 2024 and not parsed_mock[0].is_live
+    assert parsed_mock[1].duration == "EN VIVO" and parsed_mock[1].is_live is True
+
+    res_mon = SystemResourceMonitor()
+    try:
+        snap1 = res_mon.sample()
+        snap2 = res_mon.sample()
+        assert snap2.ws_mb > 0.0 and 0.0 <= snap2.app_cpu_pct <= 100.0 and 0.0 <= snap2.app_gpu_pct <= 100.0
+    finally:
+        res_mon.close()
     print("   OK: Config, SQLite y tema Grafito Oscuro / Plateado Mate verificados.")
 
 
@@ -267,12 +393,28 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
     assert len(videos) >= 5, f"Se esperaban >= 5 videos, llegaron {len(videos)}"
     print(f"   Videos encontrados: {len(videos)} (ej: {videos[0].title})")
 
-    feed = yt.get_video_home_feed(limit=10)
-    assert len(feed) >= 1, "El feed de video no devolvió resultados"
-    assert all(not is_short_video(x.duration_sec, title=x.title) for x in feed)
+    feed = yt.get_video_home_feed(limit=24)
+    assert len(feed) >= 18, f"El feed de video debe devolver >= 18 resultados, llegaron {len(feed)}"
+    assert all(not is_short_video(x.duration_sec, title=x.title, is_live=x.is_live) for x in feed)
+    dur_count = sum(1 for x in feed if x.duration)
+    assert dur_count >= len(feed) // 2, f"Se esperaba duración o EN VIVO en el feed ({dur_count}/{len(feed)})"
     dated_count = sum(1 for x in feed if x.published_text)
     assert dated_count >= 1, "Se esperaba al menos un video del feed con fecha de subida"
-    print(f"   Feed de video sin Shorts OK ({len(feed)} videos, {dated_count} con fecha).")
+    watched_sample = {feed[0].video_id}
+    recent_sample = {x.video_id for x in feed}
+    feed_refresh = yt.get_video_home_feed(
+        limit=18,
+        watched_ids=watched_sample,
+        recent_shown_ids=recent_sample,
+        refresh=True,
+    )
+    assert len(feed_refresh) >= 1, "Refrescar el feed no debe devolver lista vacía"
+    assert feed[0].video_id not in {x.video_id for x in feed_refresh}, (
+        "Videos ya vistos deben quedar excluidos del feed"
+    )
+    new_on_refresh = {x.video_id for x in feed_refresh} - recent_sample
+    assert len(new_on_refresh) >= 1, "Refrescar el feed debe traer videos nuevos"
+    print(f"   Feed de video sin Shorts OK ({len(feed)} videos, {dur_count} con duración/live, {dated_count} con fecha, refresh +{len(new_on_refresh)} nuevos).")
 
     songs = yt.search_music("daft punk", search_filter="songs", limit=10)
     assert len(songs) >= 5, f"Se esperaban >= 5 canciones, llegaron {len(songs)}"
@@ -349,16 +491,16 @@ def test_gui_and_libmpv_smoke(
         # Verificar modo teatro animado (ocultar/mostrar barra lateral) y restauración de tamaño tras fullscreen
         assert win.sidebar.isVisible() and not win.video_panel._is_theater
         win.toggle_sidebar()
-        deadline_sb = time.monotonic() + 0.26
-        while time.monotonic() < deadline_sb:
+        deadline_sb = time.monotonic() + 1.0
+        while win.sidebar.isVisible() and time.monotonic() < deadline_sb:
             app.processEvents()
-            time.sleep(0.02)
+            time.sleep(0.01)
         assert not win.sidebar.isVisible() and win.video_panel._is_theater
         win.toggle_sidebar()
-        deadline_sb2 = time.monotonic() + 0.26
-        while time.monotonic() < deadline_sb2:
+        deadline_sb2 = time.monotonic() + 1.0
+        while not win.sidebar.isVisible() and time.monotonic() < deadline_sb2:
             app.processEvents()
-            time.sleep(0.02)
+            time.sleep(0.01)
         assert win.sidebar.isVisible() and not win.video_panel._is_theater
 
         win.resize(1040, 680)
@@ -586,6 +728,52 @@ def test_gui_and_libmpv_smoke(
         assert not win.fs_overlay.seek_slider.isHidden()
         assert win.bb_deck_tag.text() == "VIDEO"
         assert not win.bb_seek.isHidden()
+        assert win.fs_overlay.play_btn.width() >= 34 and win.fs_overlay.play_btn.height() >= 34
+        assert win.mini_bar.play_btn.width() >= 34 and win.mini_bar.play_btn.height() >= 34
+
+        card_norm = VideoGridCard(
+            MediaItem("vnorm1", "Video Con Duración", "Autor", "12:34", 754, "", "video"),
+            False,
+            win.thumb_cache,
+            win.palette,
+        )
+        card_live = VideoGridCard(
+            MediaItem("vlive1", "Directo YT", "Streamer", "", 0, "", "video", is_live=True),
+            False,
+            win.thumb_cache,
+            win.palette,
+        )
+        assert card_norm.thumb_widget._duration_text == "12:34"
+        assert card_live.thumb_widget._duration_text == "EN VIVO"
+        card_norm.release_resources()
+        card_live.release_resources()
+        card_norm.deleteLater()
+        card_live.deleteLater()
+
+        # Verificar botón Cerrar video / directo / música en top_bar
+        win._video_item = MediaItem("vclose", "Video a cerrar", "Autor", "10:00", 600, "", "video")
+        win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
+        app.processEvents()
+        assert not win.close_media_btn.isHidden() and "Cerrar video" in win.close_media_btn.text()
+        win._close_active_media()
+        app.processEvents()
+        assert win._video_item is None and win.close_media_btn.isHidden()
+
+        win._video_item = MediaItem("twclose", "Stream TW", "Streamer", "EN VIVO", 0, "", "twitch", is_live=True)
+        win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
+        app.processEvents()
+        assert "Cerrar directo" in win.close_media_btn.text()
+        win._close_active_media()
+        app.processEvents()
+        assert win._video_item is None and win.close_media_btn.isHidden()
+
+        win._music_item = MediaItem("mclose", "Canción", "Artista", "3:10", 190, "", "music")
+        win._switch_page(MainWindow.PAGE_MUSIC_PLAYER)
+        app.processEvents()
+        assert "Cerrar música" in win.close_media_btn.text()
+        win._close_active_media()
+        app.processEvents()
+        assert win._music_item is None and win.close_media_btn.isHidden()
 
         win._video_item = None
         win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
@@ -619,19 +807,55 @@ def test_gui_and_libmpv_smoke(
         assert not win.mini_bar.isVisible()
 
         sdlg = ShortcutsDialog(win.palette, config=win.cfg, parent=win)
-        QTimer.singleShot(120, sdlg.accept)
-        sdlg.exec()
+        sdlg.move(win.geometry().center() - QPointF(sdlg.width() / 2, sdlg.height() / 2).toPoint())
+        def _send_outside_click_to_sdlg() -> None:
+            outside_g = QPointF(float(win.geometry().left() + 8), float(win.geometry().top() + 8))
+            ev = QMouseEvent(
+                QEvent.Type.MouseButtonPress,
+                QPointF(8.0, 8.0),
+                outside_g,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            QCoreApplication.sendEvent(win, ev)
+        QTimer.singleShot(90, _send_outside_click_to_sdlg)
+        QTimer.singleShot(500, sdlg.reject)  # Fallback por si fallara el filtro
+        assert sdlg.exec() == ShortcutsDialog.DialogCode.Rejected, (
+            "ShortcutsDialog debe cerrarse al hacer clic fuera de su ventana"
+        )
+        sdlg.deleteLater()
         app.processEvents()
 
         dlg = SettingsDialog(win.cfg, win.yt, thumb_cache=win.thumb_cache, parent=win)
+        dlg.move(win.geometry().center() - QPointF(dlg.width() / 2, dlg.height() / 2).toPoint())
         dlg.select_discord_tab()
         app.processEvents()
         dlg.select_discord_shortcuts_tab()
         dlg.update_discord_hotkey_statuses(win._discord_hotkey_statuses)
-        QTimer.singleShot(150, dlg.accept)
-        dlg.exec()
+        def _send_outside_click_to_dlg() -> None:
+            outside_g = QPointF(float(win.geometry().left() + 8), float(win.geometry().top() + 8))
+            ev = QMouseEvent(
+                QEvent.Type.MouseButtonPress,
+                QPointF(8.0, 8.0),
+                outside_g,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            QCoreApplication.sendEvent(win, ev)
+        QTimer.singleShot(90, _send_outside_click_to_dlg)
+        QTimer.singleShot(500, dlg.reject)
+        assert dlg.exec() == SettingsDialog.DialogCode.Rejected, (
+            "SettingsDialog debe cerrarse al hacer clic fuera de su ventana"
+        )
         dlg.deleteLater()
         app.processEvents()
+
+        assert win.resource_card is not None
+        win._refresh_resource_monitor()
+        assert win.res_ram_lbl.text().endswith(" MB")
+        assert "%" in win.res_cpu_lbl.text() and "%" in win.res_gpu_lbl.text()
 
         # Verificar aislamiento lazy y ausencia de fugas Qt tras navegar incluyendo Discord
         assert not win.discord_service.is_worker_running, (
@@ -651,8 +875,13 @@ def test_gui_and_libmpv_smoke(
         )
         assert dp.members_card.isHidden(), "El panel de miembros debe iniciar oculto por defecto"
         assert dp.audio_advanced_box.isHidden(), "El cajón de audio avanzado debe iniciar oculto por defecto"
-        assert dp.text_channels_scroll.isHidden(), "Los canales de texto deben iniciar plegados por defecto"
-        assert not dp.left_card.isHidden(), "Los canales de voz deben iniciar visibles"
+        assert not dp.left_card.isHidden(), "Los canales deben iniciar visibles"
+        assert not dp.voice_pane.isHidden() and not dp.chat_pane.isHidden(), (
+            "La vista dividida (Voz arriba + Chat abajo) debe iniciar activa por defecto"
+        )
+        assert not dp.text_channels_scroll.isHidden(), (
+            "Los canales de texto unificados deben iniciar visibles bajo Voz"
+        )
         dp._toggle_members_panel()
         assert not dp.members_card.isHidden()
         dp._toggle_members_panel()
@@ -662,9 +891,317 @@ def test_gui_and_libmpv_smoke(
         dp._toggle_audio_drawer()
         assert dp.audio_advanced_box.isHidden()
         dp._toggle_text_channels_section()
-        assert not dp.text_channels_scroll.isHidden()
-        dp._toggle_text_channels_section()
         assert dp.text_channels_scroll.isHidden()
+        dp._toggle_text_channels_section()
+        assert not dp.text_channels_scroll.isHidden()
+
+        # Colapsar y reabrir canales, voz y chat
+        dp.close_channels_btn.click()
+        assert dp.left_card.isHidden()
+        dp.toggle_channels_btn.click()
+        assert not dp.left_card.isHidden()
+        dp.close_voice_btn.click()
+        assert dp.voice_pane.isHidden() and not dp.chat_pane.isHidden()
+        dp.close_chat_btn.click()
+        assert dp.center_splitter.isHidden() and not dp.center_collapsed_card.isHidden()
+        dp.reopen_voice_btn.click()
+        dp.tab_chat_btn.click()
+        assert not dp.voice_pane.isHidden() and not dp.chat_pane.isHidden() and dp.center_collapsed_card.isHidden()
+
+        # Verificar canales sin permiso ocultos por defecto y visibles al activarlo + miembros por canal + overlay
+        assert win.cfg.discord_show_locked_channels is False
+        orig_locked_cfg = win.cfg.discord_show_locked_channels
+        orig_overlay_cfg = win.cfg.discord_overlay_enabled
+        orig_overlay_op = win.cfg.discord_overlay_opacity
+        orig_notify_en = win.cfg.discord_notify_chat_enabled
+        orig_notify_chs = list(win.cfg.discord_notify_channels)
+        orig_hidden_chs = list(win.cfg.discord_hidden_channels)
+        orig_hidden_names = dict(win.cfg.discord_hidden_channel_names)
+        try:
+            discord_popups: list[str] = []
+
+            class _DiscordPopupWatcher(QObject):
+                def eventFilter(self, obj, ev) -> bool:
+                    if (
+                        ev.type() == QEvent.Type.Show
+                        and getattr(obj, "isWindow", lambda: False)()
+                        and obj not in (win, win.discord_overlay)
+                    ):
+                        discord_popups.append(type(obj).__name__)
+                    return False
+
+            d_watcher = _DiscordPopupWatcher(win)
+            app.installEventFilter(d_watcher)
+            try:
+                demo_guilds = [
+                    {
+                        "id": "10",
+                        "name": "SrvDemo",
+                        "voice_channels": [
+                            {
+                                "id": "101",
+                                "name": "Sala",
+                                "can_connect": True,
+                                "members": [
+                                    {
+                                        "id": "1",
+                                        "name": "Socio",
+                                        "is_bot": True,
+                                        "avatar_url": "",
+                                        "muted": False,
+                                        "deafened": False,
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "102",
+                                "name": "Privado",
+                                "can_connect": False,
+                                "members": [],
+                            },
+                        ],
+                        "text_channels": [
+                            {"id": "201", "name": "bots", "can_read": True, "can_send": True},
+                            {"id": "202", "name": "clips", "can_read": True, "can_send": True},
+                        ],
+                    }
+                ]
+                dp._on_guilds_updated(demo_guilds)
+                app.processEvents()
+                texts_hidden = [b.text() for b in dp.vc_list_widget.findChildren(type(dp.vc_section_btn))]
+                assert not any("sin permiso" in t for t in texts_hidden), (
+                    "Canales sin permiso no deben mostrarse por defecto"
+                )
+
+                win.cfg.discord_show_locked_channels = True
+                dp.refresh_ui_preferences()
+                app.processEvents()
+                texts_shown = [b.text() for b in dp.vc_list_widget.findChildren(type(dp.vc_section_btn))]
+                assert any("sin permiso" in t for t in texts_shown), (
+                    "Canales sin permiso deben mostrarse al activar la opción"
+                )
+
+                # Simular cambio de voz y re-renders repetidos sin emitir ventanas fantasma
+                dp._on_voice_state_updated(
+                    {
+                        "in_voice": True,
+                        "guild_id": "10",
+                        "guild_name": "SrvDemo",
+                        "channel_id": "101",
+                        "channel_name": "Sala",
+                        "participants": [
+                            {
+                                "id": "1",
+                                "name": "TuBot",
+                                "is_bot": True,
+                                "avatar_url": "",
+                                "is_self": True,
+                                "muted": False,
+                                "deafened": False,
+                            },
+                            {
+                                "id": "2",
+                                "name": "SocioBot",
+                                "is_bot": True,
+                                "avatar_url": "",
+                                "is_self": False,
+                                "muted": False,
+                                "deafened": False,
+                            },
+                        ],
+                    }
+                )
+                dp._render_participants(force=True)
+                dp._render_channels(force=True)
+                app.processEvents()
+            finally:
+                app.removeEventFilter(d_watcher)
+            assert not discord_popups, (
+                f"Se detectaron ventanas fantasma en Discord: {discord_popups}"
+            )
+
+            # Verificar tinte dinámico según color del avatar
+            from swiftplay.ui.discord_panel import _extract_avatar_tint
+
+            blue_img = QImage(16, 16, QImage.Format.Format_ARGB32)
+            blue_img.fill(0xFF2563EB)
+            red_img = QImage(16, 16, QImage.Format.Format_ARGB32)
+            red_img.fill(0xFFDC2626)
+            blue_bg, _ = _extract_avatar_tint(QPixmap.fromImage(blue_img))
+            red_bg, _ = _extract_avatar_tint(QPixmap.fromImage(red_img))
+            assert blue_bg != red_bg, "El tinte de tarjeta debe adaptarse al color de perfil"
+
+            # Verificar campana selectiva de avisos por canal
+            alerts_seen: list[str] = []
+            dp.channel_alert_requested.connect(lambda d: alerts_seen.append(str(d.get("channel_id") or "")))
+            win.cfg.discord_notify_chat_enabled = True
+            win.cfg.discord_notify_channels = []
+            dp._toggle_channel_notify("202", "clips")
+            assert "202" in win.cfg.discord_notify_channels
+            dp._on_channel_message_incoming({"channel_id": "201", "channel_name": "bots", "author_name": "Socio", "preview": "hola"})
+            dp._on_channel_message_incoming({"channel_id": "202", "channel_name": "clips", "author_name": "Socio", "preview": "mira"})
+            assert alerts_seen == ["202"], f"Solo debe alertar canales con campana activa: {alerts_seen}"
+            dp._toggle_channel_notify("202", "clips")
+            assert "202" not in win.cfg.discord_notify_channels
+
+            # Verificar ocultado persistente de canales (voz + texto) y reactivación desde Ajustes
+            dp.hide_channel_permanently("101", "🔊 Sala (SrvDemo)")
+            dp.hide_channel_permanently("202", "# clips (SrvDemo)")
+            app.processEvents()
+            vc_labels = [lb.text() for lb in dp.vc_list_widget.findChildren(QLabel)]
+            tc_btns = [b.text() for b in dp.text_channels_scroll.findChildren(QPushButton)]
+            assert not any("Sala" in t for t in vc_labels), f"El canal de voz oculto debe desaparecer: {vc_labels}"
+            assert not any("clips" in t for t in tc_btns), f"El canal de texto oculto debe desaparecer: {tc_btns}"
+            assert any("bots" in t for t in tc_btns), "# bots debe seguir visible"
+            known_chs = dp.get_available_channels_for_settings()
+            assert any(cid == "101" for cid, _ in known_chs) and any(cid == "202" for cid, _ in known_chs)
+            hdlg = SettingsDialog(win.cfg, win.yt, thumb_cache=win.thumb_cache, discord_channels=known_chs, parent=win)
+            hdlg._on_unhide_all_channels()
+            hdlg.done(0)
+            hdlg.deleteLater()
+            dp.refresh_ui_preferences()
+            app.processEvents()
+            vc_labels2 = [lb.text() for lb in dp.vc_list_widget.findChildren(QLabel)]
+            tc_btns2 = [b.text() for b in dp.text_channels_scroll.findChildren(QPushButton)]
+            assert any("Sala" in t for t in vc_labels2) and any("clips" in t for t in tc_btns2)
+
+            dp._on_guild_members_updated(
+                {
+                    "guild_id": "10",
+                    "online_count": 3,
+                    "members": [
+                        {"id": "1", "name": "TuBot", "is_bot": True, "avatar_url": "", "status": "online", "activity": ""},
+                        {"id": "2", "name": "SocioBot", "is_bot": True, "avatar_url": "", "status": "online", "activity": ""},
+                        {"id": "3", "name": "Admin", "is_bot": False, "avatar_url": "", "status": "online", "activity": ""},
+                    ],
+                }
+            )
+            dp._on_chat_history_loaded(
+                {
+                    "kind": "channel",
+                    "target_id": "201",
+                    "title": "#bots",
+                    "can_read": True,
+                    "can_send": True,
+                    "messages": [
+                        {
+                            "id": "m1",
+                            "author_id": "1",
+                            "author_name": "TuBot",
+                            "is_self": True,
+                            "is_bot": True,
+                            "content": "Hola",
+                            "attachments": [],
+                            "timestamp": "19:40",
+                            "date_label": "Hoy",
+                        }
+                    ],
+                    "channel_members": [
+                        {"id": "1", "name": "TuBot", "is_bot": True, "avatar_url": "", "status": "online", "activity": ""},
+                        {"id": "2", "name": "SocioBot", "is_bot": True, "avatar_url": "", "status": "online", "activity": ""},
+                    ],
+                    "channel_online_count": 2,
+                }
+            )
+            assert dp.members_list.count() == 2, "Modo 'Canal' debe filtrar miembros al canal activo"
+            dp._set_members_scope("server")
+            assert dp.members_list.count() == 3, "Modo 'Servidor' debe mostrar todos los miembros"
+            dp._set_members_scope("channel")
+            dp.members_list.setCurrentRow(0)
+            assert dp.dm_btn.isHidden(), "No debe ofrecer Enviar DM al seleccionar otro bot"
+
+            assert bool(win.discord_overlay.windowFlags() & Qt.WindowType.WindowDoesNotAcceptFocus)
+            assert win.discord_overlay.isHidden(), "Overlay debe iniciar oculto al estar desconectado"
+            win.discord_overlay.update_state(
+                enabled=True, active=True, muted=True, deafened=False, opacity_pct=25
+            )
+            app.processEvents()
+            assert (
+                not win.discord_overlay.isHidden()
+                and win.discord_overlay._mode == "muted"
+                and win.discord_overlay.width() == 46
+            )
+            assert abs(win.discord_overlay.windowOpacity() - 0.25) < 0.05
+            win.discord_overlay.update_state(
+                enabled=True, active=True, muted=True, deafened=True, opacity_pct=30
+            )
+            app.processEvents()
+            assert win.discord_overlay._mode == "both" and win.discord_overlay.width() == 86
+            win.discord_overlay.update_state(
+                enabled=True, active=True, muted=False, deafened=True, opacity_pct=30
+            )
+            app.processEvents()
+            assert win.discord_overlay._mode == "deafened" and win.discord_overlay.width() == 46
+            win.discord_overlay.update_state(
+                enabled=False, active=True, muted=True, deafened=True, opacity_pct=30
+            )
+            app.processEvents()
+            assert win.discord_overlay.isHidden()
+
+            # DMs persistentes desde clic derecho / lista Mensajes Directos
+            dp._open_dm_with_user("u777", "AmigoTest")
+            dp._on_chat_message_received(
+                {
+                    "kind": "dm",
+                    "target_id": "u777",
+                    "peer_name": "AmigoTest",
+                    "message": {
+                        "id": "dm_t1",
+                        "author_id": "1",
+                        "author_name": "TuBot",
+                        "is_self": True,
+                        "is_bot": True,
+                        "content": "DM guardado",
+                        "attachments": [],
+                        "timestamp": "21:30",
+                        "date_label": "Hoy",
+                    },
+                }
+            )
+            app.processEvents()
+            assert "DM guardado" in dp.chat_browser.toPlainText()
+            dm_btns = [b.text() for b in dp.dm_channels_scroll.findChildren(QPushButton)]
+            assert any("@ AmigoTest" in t for t in dm_btns), dm_btns
+            dp._open_dm_with_user("u777", "AmigoTest")
+            assert "DM guardado" in dp.chat_browser.toPlainText()
+
+            # Tarjeta fija del bot Discord bajo RAM/CPU/GPU visible incluso en YouTube
+            win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+            win._on_discord_state_changed_for_log(
+                "connected", {"bot_name": "TestBot", "bot_avatar_url": ""}
+            )
+            app.processEvents()
+            assert not win.discord_mini_card.isHidden() and win.discord_mini_name.text() == "TestBot"
+            win.discord_mini_mute_btn.click()
+            assert dp._muted is True
+            win.discord_mini_deaf_btn.click()
+            assert dp._deafened is True
+            win.discord_mini_mute_btn.click()
+            win.discord_mini_deaf_btn.click()
+            assert not dp._muted and not dp._deafened
+            win._on_discord_state_changed_for_log("disconnected", {})
+            app.processEvents()
+            assert win.discord_mini_card.isHidden()
+        finally:
+            win.discord_overlay.hide()
+            win.db.remove_discord_dm_thread("u777")
+            win._on_discord_state_changed_for_log("disconnected", {})
+            dp._muted = False
+            dp._deafened = False
+            dp._refresh_mute_deaf_buttons()
+            win.cfg.discord_show_locked_channels = orig_locked_cfg
+            win.cfg.discord_overlay_enabled = orig_overlay_cfg
+            win.cfg.discord_overlay_opacity = orig_overlay_op
+            win.cfg.discord_notify_chat_enabled = orig_notify_en
+            win.cfg.discord_notify_channels = orig_notify_chs
+            win.cfg.discord_hidden_channels = orig_hidden_chs
+            win.cfg.discord_hidden_channel_names = orig_hidden_names
+            save_config(win.cfg)
+            dp._guilds = []
+            dp._members = []
+            dp._channel_members = []
+            dp._chat_messages.clear()
+            dp._on_bot_state_changed("disconnected", {})
         win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
         app.processEvents()
         assert not win.top_bar.isHidden(), (
@@ -836,6 +1373,11 @@ def test_discord_voice_bridge() -> None:
         cfg.discord_hotkey_deafen = "Ctrl+Alt+D"
         cfg.discord_hotkey_hangup = "Pause"
         cfg.discord_hotkey_mute_priority = False
+        cfg.discord_show_locked_channels = True
+        cfg.discord_overlay_enabled = False
+        cfg.discord_overlay_opacity = 40
+        cfg.discord_notify_chat_enabled = False
+        cfg.discord_notify_channels = ["201", "202", "201"]
         save_config(cfg, cfg_p)
         cfg2 = load_config(cfg_p)
         assert cfg2.discord_input_device == "Mic Test"
@@ -849,6 +1391,13 @@ def test_discord_voice_bridge() -> None:
         assert cfg2.discord_hotkey_deafen == "Ctrl+Alt+D"
         assert cfg2.discord_hotkey_hangup == "Pause"
         assert cfg2.discord_hotkey_mute_priority is False
+        assert cfg2.discord_show_locked_channels is True
+        assert cfg2.discord_overlay_enabled is False
+        assert cfg2.discord_overlay_opacity == 40
+        assert cfg2.discord_notify_chat_enabled is False
+        assert cfg2.discord_notify_channels == ["201", "202"]
+        assert AppConfig(discord_overlay_opacity=2).discord_overlay_opacity == 10
+        assert AppConfig(discord_overlay_opacity=250).discord_overlay_opacity == 100
 
         from swiftplay.media_keys import GlobalMediaKeyFilter, parse_hotkey_string
 
@@ -1250,20 +1799,31 @@ assert online_cnt == 4
 assert [m["name"] for m in serialized_members] == ["Carlos", "BotHelper", "Luis"]
 assert serialized_members[2]["activity"] == "Jugando a Minecraft"
 
+priv_ch = SimpleNamespace(
+    permissions_for=lambda mem: SimpleNamespace(view_channel=(mem.id in (2, 5)))
+)
+priv_online, priv_members = _serialize_guild_members(mock_guild, limit=10, channel=priv_ch)
+assert priv_online == 2 and [m["name"] for m in priv_members] == ["Carlos", "BotHelper"]
+
 msg_obj = SimpleNamespace(
     id=9991,
     author=SimpleNamespace(id=55, display_name="Pablo", bot=False),
     content="Hola equipo",
     attachments=[SimpleNamespace(filename="clip.png", url="https://cdn.example/clip.png")],
-    created_at=datetime(2026, 11, 21, 18, 30, tzinfo=timezone.utc),
+    created_at=datetime.now(timezone.utc),
 )
 msg_dict = _serialize_chat_message(msg_obj, bot_id=55)
 assert msg_dict["is_self"] is True and msg_dict["author_name"] == "Pablo"
 assert msg_dict["attachments"][0]["name"] == "clip.png"
 assert len(msg_dict["timestamp"]) == 5 and ":" in msg_dict["timestamp"]
+assert msg_dict["date_label"] == "Hoy"
+assert "avatar_url" in serialized_members[0] and "author_avatar_url" in msg_dict
 
 # Verificar text_channels en _build_guilds_snapshot y flags de intents en _build_client
+import asyncio as _asyncio
 snap_app = DiscordWorkerApp(io.StringIO())
+_asyncio.run(snap_app.handle_command({"cmd": "set_notify_channels", "channel_ids": ["201", "305"]}))
+assert snap_app._notify_channel_ids == {201, 305}
 tc_ok = SimpleNamespace(
     id=201,
     name="general",

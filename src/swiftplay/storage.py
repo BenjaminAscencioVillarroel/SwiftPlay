@@ -71,6 +71,27 @@ class LocalLibrary:
                     avatar_url TEXT NOT NULL DEFAULT '',
                     added_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS discord_dm_threads (
+                    user_id TEXT PRIMARY KEY,
+                    user_name TEXT NOT NULL,
+                    avatar_url TEXT NOT NULL DEFAULT '',
+                    last_preview TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS discord_dm_messages (
+                    msg_key TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    author_id TEXT NOT NULL DEFAULT '',
+                    author_name TEXT NOT NULL DEFAULT '',
+                    is_self INTEGER NOT NULL DEFAULT 0,
+                    is_bot INTEGER NOT NULL DEFAULT 0,
+                    content TEXT NOT NULL DEFAULT '',
+                    timestamp TEXT NOT NULL DEFAULT '',
+                    date_label TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_discord_dm_user_created
+                    ON discord_dm_messages (user_id, created_at);
                 """
             )
             # Migraciones seguras para bases de datos previas
@@ -394,6 +415,165 @@ class LocalLibrary:
                 for r in rows
             ]
 
+    # --- Mensajes Directos de Discord persistentes ---
+
+    def upsert_discord_dm_thread(
+        self,
+        user_id: str,
+        user_name: str,
+        avatar_url: str = "",
+        last_preview: str = "",
+    ) -> None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+        uname = str(user_name or uid).strip() or uid
+        av = str(avatar_url or "").strip()
+        prev = str(last_preview or "").strip()[:120]
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO discord_dm_threads (user_id, user_name, avatar_url, last_preview, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    user_name=CASE WHEN excluded.user_name != '' THEN excluded.user_name ELSE discord_dm_threads.user_name END,
+                    avatar_url=CASE WHEN excluded.avatar_url != '' THEN excluded.avatar_url ELSE discord_dm_threads.avatar_url END,
+                    last_preview=CASE WHEN excluded.last_preview != '' THEN excluded.last_preview ELSE discord_dm_threads.last_preview END,
+                    updated_at=excluded.updated_at
+                """,
+                (uid, uname, av, prev, now),
+            )
+
+    def list_discord_dm_threads(self, limit: int = 30) -> list[dict[str, str]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT user_id, user_name, avatar_url, last_preview
+                FROM discord_dm_threads
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [
+                {
+                    "user_id": str(r["user_id"]),
+                    "user_name": str(r["user_name"]),
+                    "avatar_url": str(r["avatar_url"] or ""),
+                    "last_preview": str(r["last_preview"] or ""),
+                }
+                for r in rows
+            ]
+
+    def remove_discord_dm_thread(self, user_id: str) -> None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM discord_dm_messages WHERE user_id = ?", (uid,))
+            self._conn.execute("DELETE FROM discord_dm_threads WHERE user_id = ?", (uid,))
+
+    def save_discord_dm_message(
+        self,
+        user_id: str,
+        msg: dict,
+        peer_name: str = "",
+        peer_avatar_url: str = "",
+    ) -> None:
+        uid = str(user_id or "").strip()
+        if not uid or not isinstance(msg, dict):
+            return
+        raw_id = str(msg.get("id") or "").strip()
+        content = str(msg.get("content") or "")
+        ts = str(msg.get("timestamp") or "")
+        date_lbl = str(msg.get("date_label") or "")
+        author_id = str(msg.get("author_id") or "")
+        author_name = str(msg.get("author_name") or "Usuario")
+        is_self = 1 if msg.get("is_self", False) else 0
+        is_bot = 1 if msg.get("is_bot", False) else 0
+        if not raw_id:
+            raw_id = f"local_{uid}_{int(time.time() * 1000)}_{hash(content) & 0xFFFF}"
+        msg_key = f"{uid}:{raw_id}"
+        now = time.time()
+        thread_name = str(peer_name or (author_name if not is_self else uid)).strip() or uid
+        preview = (content or ("[adjunto]" if msg.get("attachments") else "")).strip()[:120]
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO discord_dm_messages (
+                    msg_key, user_id, author_id, author_name, is_self, is_bot,
+                    content, timestamp, date_label, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(msg_key) DO UPDATE SET
+                    content=excluded.content,
+                    timestamp=excluded.timestamp,
+                    date_label=excluded.date_label
+                """,
+                (msg_key, uid, author_id, author_name, is_self, is_bot, content, ts, date_lbl, now),
+            )
+            self._conn.execute(
+                """
+                DELETE FROM discord_dm_messages
+                WHERE user_id = ? AND msg_key NOT IN (
+                    SELECT msg_key FROM discord_dm_messages
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 100
+                )
+                """,
+                (uid, uid),
+            )
+            self.upsert_discord_dm_thread(
+                uid,
+                thread_name,
+                avatar_url=peer_avatar_url,
+                last_preview=preview,
+            )
+
+    def list_discord_dm_messages(self, user_id: str, limit: int = 80) -> list[dict]:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT msg_key, author_id, author_name, is_self, is_bot, content, timestamp, date_label
+                FROM discord_dm_messages
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (uid, max(1, int(limit))),
+            ).fetchall()
+            out: list[dict] = []
+            for r in reversed(rows):
+                mk = str(r["msg_key"])
+                raw_id = mk.split(":", 1)[1] if ":" in mk else mk
+                out.append(
+                    {
+                        "id": raw_id,
+                        "author_id": str(r["author_id"] or ""),
+                        "author_name": str(r["author_name"] or "Usuario"),
+                        "is_self": bool(r["is_self"]),
+                        "is_bot": bool(r["is_bot"]),
+                        "content": str(r["content"] or ""),
+                        "attachments": [],
+                        "timestamp": str(r["timestamp"] or ""),
+                        "date_label": str(r["date_label"] or ""),
+                    }
+                )
+            return out
+
+    def list_watched_video_ids(self) -> set[str]:
+        """Retorna IDs de videos ya reproducidos para excluirlos del feed de Inicio."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT video_id FROM play_history WHERE kind = 'video'"
+            ).fetchall()
+            return {str(r[0]) for r in rows if r and r[0]}
+
     # --- Favoritos locales de Twitch ---
 
     def add_twitch_favorite(self, item: MediaItem) -> None:
@@ -508,6 +688,157 @@ class LocalLibrary:
                 for r in rows
             ]
 
+    # --- Mensajes Directos de Discord persistentes ---
+
+    def upsert_discord_dm_thread(
+        self,
+        user_id: str,
+        user_name: str,
+        avatar_url: str = "",
+        last_preview: str = "",
+    ) -> None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+        uname = str(user_name or uid).strip() or uid
+        av = str(avatar_url or "").strip()
+        prev = str(last_preview or "").strip()[:120]
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO discord_dm_threads (user_id, user_name, avatar_url, last_preview, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    user_name=CASE WHEN excluded.user_name != '' THEN excluded.user_name ELSE discord_dm_threads.user_name END,
+                    avatar_url=CASE WHEN excluded.avatar_url != '' THEN excluded.avatar_url ELSE discord_dm_threads.avatar_url END,
+                    last_preview=CASE WHEN excluded.last_preview != '' THEN excluded.last_preview ELSE discord_dm_threads.last_preview END,
+                    updated_at=excluded.updated_at
+                """,
+                (uid, uname, av, prev, now),
+            )
+
+    def list_discord_dm_threads(self, limit: int = 30) -> list[dict[str, str]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT user_id, user_name, avatar_url, last_preview
+                FROM discord_dm_threads
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [
+                {
+                    "user_id": str(r["user_id"]),
+                    "user_name": str(r["user_name"]),
+                    "avatar_url": str(r["avatar_url"] or ""),
+                    "last_preview": str(r["last_preview"] or ""),
+                }
+                for r in rows
+            ]
+
+    def remove_discord_dm_thread(self, user_id: str) -> None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM discord_dm_messages WHERE user_id = ?", (uid,))
+            self._conn.execute("DELETE FROM discord_dm_threads WHERE user_id = ?", (uid,))
+
+    def save_discord_dm_message(
+        self,
+        user_id: str,
+        msg: dict,
+        peer_name: str = "",
+        peer_avatar_url: str = "",
+    ) -> None:
+        uid = str(user_id or "").strip()
+        if not uid or not isinstance(msg, dict):
+            return
+        raw_id = str(msg.get("id") or "").strip()
+        content = str(msg.get("content") or "")
+        ts = str(msg.get("timestamp") or "")
+        date_lbl = str(msg.get("date_label") or "")
+        author_id = str(msg.get("author_id") or "")
+        author_name = str(msg.get("author_name") or "Usuario")
+        is_self = 1 if msg.get("is_self", False) else 0
+        is_bot = 1 if msg.get("is_bot", False) else 0
+        if not raw_id:
+            raw_id = f"local_{uid}_{int(time.time() * 1000)}_{hash(content) & 0xFFFF}"
+        msg_key = f"{uid}:{raw_id}"
+        now = time.time()
+        thread_name = str(peer_name or (author_name if not is_self else uid)).strip() or uid
+        preview = (content or ("[adjunto]" if msg.get("attachments") else "")).strip()[:120]
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO discord_dm_messages (
+                    msg_key, user_id, author_id, author_name, is_self, is_bot,
+                    content, timestamp, date_label, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(msg_key) DO UPDATE SET
+                    content=excluded.content,
+                    timestamp=excluded.timestamp,
+                    date_label=excluded.date_label
+                """,
+                (msg_key, uid, author_id, author_name, is_self, is_bot, content, ts, date_lbl, now),
+            )
+            self._conn.execute(
+                """
+                DELETE FROM discord_dm_messages
+                WHERE user_id = ? AND msg_key NOT IN (
+                    SELECT msg_key FROM discord_dm_messages
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 100
+                )
+                """,
+                (uid, uid),
+            )
+            self.upsert_discord_dm_thread(
+                uid,
+                thread_name,
+                avatar_url=peer_avatar_url,
+                last_preview=preview,
+            )
+
+    def list_discord_dm_messages(self, user_id: str, limit: int = 80) -> list[dict]:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT msg_key, author_id, author_name, is_self, is_bot, content, timestamp, date_label
+                FROM discord_dm_messages
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (uid, max(1, int(limit))),
+            ).fetchall()
+            out: list[dict] = []
+            for r in reversed(rows):
+                mk = str(r["msg_key"])
+                raw_id = mk.split(":", 1)[1] if ":" in mk else mk
+                out.append(
+                    {
+                        "id": raw_id,
+                        "author_id": str(r["author_id"] or ""),
+                        "author_name": str(r["author_name"] or "Usuario"),
+                        "is_self": bool(r["is_self"]),
+                        "is_bot": bool(r["is_bot"]),
+                        "content": str(r["content"] or ""),
+                        "attachments": [],
+                        "timestamp": str(r["timestamp"] or ""),
+                        "date_label": str(r["date_label"] or ""),
+                    }
+                )
+            return out
+
     def count_music_history(self) -> int:
         with self._lock:
             row = self._conn.execute(
@@ -546,3 +877,154 @@ class LocalLibrary:
                 )
                 for r in rows
             ]
+
+    # --- Mensajes Directos de Discord persistentes ---
+
+    def upsert_discord_dm_thread(
+        self,
+        user_id: str,
+        user_name: str,
+        avatar_url: str = "",
+        last_preview: str = "",
+    ) -> None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+        uname = str(user_name or uid).strip() or uid
+        av = str(avatar_url or "").strip()
+        prev = str(last_preview or "").strip()[:120]
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO discord_dm_threads (user_id, user_name, avatar_url, last_preview, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    user_name=CASE WHEN excluded.user_name != '' THEN excluded.user_name ELSE discord_dm_threads.user_name END,
+                    avatar_url=CASE WHEN excluded.avatar_url != '' THEN excluded.avatar_url ELSE discord_dm_threads.avatar_url END,
+                    last_preview=CASE WHEN excluded.last_preview != '' THEN excluded.last_preview ELSE discord_dm_threads.last_preview END,
+                    updated_at=excluded.updated_at
+                """,
+                (uid, uname, av, prev, now),
+            )
+
+    def list_discord_dm_threads(self, limit: int = 30) -> list[dict[str, str]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT user_id, user_name, avatar_url, last_preview
+                FROM discord_dm_threads
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [
+                {
+                    "user_id": str(r["user_id"]),
+                    "user_name": str(r["user_name"]),
+                    "avatar_url": str(r["avatar_url"] or ""),
+                    "last_preview": str(r["last_preview"] or ""),
+                }
+                for r in rows
+            ]
+
+    def remove_discord_dm_thread(self, user_id: str) -> None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM discord_dm_messages WHERE user_id = ?", (uid,))
+            self._conn.execute("DELETE FROM discord_dm_threads WHERE user_id = ?", (uid,))
+
+    def save_discord_dm_message(
+        self,
+        user_id: str,
+        msg: dict,
+        peer_name: str = "",
+        peer_avatar_url: str = "",
+    ) -> None:
+        uid = str(user_id or "").strip()
+        if not uid or not isinstance(msg, dict):
+            return
+        raw_id = str(msg.get("id") or "").strip()
+        content = str(msg.get("content") or "")
+        ts = str(msg.get("timestamp") or "")
+        date_lbl = str(msg.get("date_label") or "")
+        author_id = str(msg.get("author_id") or "")
+        author_name = str(msg.get("author_name") or "Usuario")
+        is_self = 1 if msg.get("is_self", False) else 0
+        is_bot = 1 if msg.get("is_bot", False) else 0
+        if not raw_id:
+            raw_id = f"local_{uid}_{int(time.time() * 1000)}_{hash(content) & 0xFFFF}"
+        msg_key = f"{uid}:{raw_id}"
+        now = time.time()
+        thread_name = str(peer_name or (author_name if not is_self else uid)).strip() or uid
+        preview = (content or ("[adjunto]" if msg.get("attachments") else "")).strip()[:120]
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO discord_dm_messages (
+                    msg_key, user_id, author_id, author_name, is_self, is_bot,
+                    content, timestamp, date_label, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(msg_key) DO UPDATE SET
+                    content=excluded.content,
+                    timestamp=excluded.timestamp,
+                    date_label=excluded.date_label
+                """,
+                (msg_key, uid, author_id, author_name, is_self, is_bot, content, ts, date_lbl, now),
+            )
+            self._conn.execute(
+                """
+                DELETE FROM discord_dm_messages
+                WHERE user_id = ? AND msg_key NOT IN (
+                    SELECT msg_key FROM discord_dm_messages
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 100
+                )
+                """,
+                (uid, uid),
+            )
+            self.upsert_discord_dm_thread(
+                uid,
+                thread_name,
+                avatar_url=peer_avatar_url,
+                last_preview=preview,
+            )
+
+    def list_discord_dm_messages(self, user_id: str, limit: int = 80) -> list[dict]:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT msg_key, author_id, author_name, is_self, is_bot, content, timestamp, date_label
+                FROM discord_dm_messages
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (uid, max(1, int(limit))),
+            ).fetchall()
+            out: list[dict] = []
+            for r in reversed(rows):
+                mk = str(r["msg_key"])
+                raw_id = mk.split(":", 1)[1] if ":" in mk else mk
+                out.append(
+                    {
+                        "id": raw_id,
+                        "author_id": str(r["author_id"] or ""),
+                        "author_name": str(r["author_name"] or "Usuario"),
+                        "is_self": bool(r["is_self"]),
+                        "is_bot": bool(r["is_bot"]),
+                        "content": str(r["content"] or ""),
+                        "attachments": [],
+                        "timestamp": str(r["timestamp"] or ""),
+                        "date_label": str(r["date_label"] or ""),
+                    }
+                )
+            return out
