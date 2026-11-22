@@ -7,11 +7,19 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from swiftplay.paths import CONFIG_PATH
+from swiftplay.sound_effects import (
+    DEFAULT_SOUND_VOLUMES,
+    SOUND_EVENTS,
+    VALID_SOUND_PACKS,
+)
 
 VALID_SPEEDS: tuple[float, ...] = (1.0, 1.5, 2.0, 2.5)
 VALID_QUALITIES: tuple[str, ...] = ("360p", "480p", "720p", "1080p")
 VALID_THEMES: tuple[str, ...] = ("matte_silver",)
 VALID_DISCORD_NS: tuple[str, ...] = ("off", "webrtc", "ai", "ai_max")
+VALID_DISCORD_OVERLAY_MODES: tuple[str, ...] = ("off", "status", "full")
+VALID_DISCORD_SOUND_PACKS: tuple[str, ...] = VALID_SOUND_PACKS
+DEFAULT_DISCORD_SOUND_VOLUMES: dict[str, int] = dict(DEFAULT_SOUND_VOLUMES)
 LEGACY_DISCORD_NS_MAP: dict[str, str] = {
     "low": "webrtc",
     "moderate": "webrtc",
@@ -76,11 +84,17 @@ class AppConfig:
     discord_hotkey_mute_priority: bool = True
     discord_show_locked_channels: bool = False
     discord_overlay_enabled: bool = True
+    discord_overlay_mode: str = "status"
     discord_overlay_opacity: int = 25
     discord_notify_chat_enabled: bool = True
     discord_notify_channels: list[str] = field(default_factory=list)
     discord_hidden_channels: list[str] = field(default_factory=list)
     discord_hidden_channel_names: dict[str, str] = field(default_factory=dict)
+    discord_sounds_enabled: bool = True
+    discord_sound_pack: str = "soft"
+    discord_sound_volumes: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_DISCORD_SOUND_VOLUMES)
+    )
 
     def __post_init__(self) -> None:
         self.theme = validate_theme(self.theme)
@@ -114,8 +128,26 @@ class AppConfig:
         self.discord_hotkey_hangup = str(self.discord_hotkey_hangup or "").strip()
         self.discord_hotkey_mute_priority = bool(self.discord_hotkey_mute_priority)
         self.discord_show_locked_channels = bool(self.discord_show_locked_channels)
-        self.discord_overlay_enabled = bool(self.discord_overlay_enabled)
+        ov_mode = str(self.discord_overlay_mode or "status").strip().lower()
+        if ov_mode not in VALID_DISCORD_OVERLAY_MODES:
+            ov_mode = "status"
+        if not bool(self.discord_overlay_enabled):
+            ov_mode = "off"
+        self.discord_overlay_mode = ov_mode
+        self.discord_overlay_enabled = ov_mode != "off"
         self.discord_overlay_opacity = max(10, min(100, int(self.discord_overlay_opacity)))
+        self.discord_sounds_enabled = bool(self.discord_sounds_enabled)
+        s_pack = str(self.discord_sound_pack or "soft").strip().lower()
+        self.discord_sound_pack = s_pack if s_pack in VALID_DISCORD_SOUND_PACKS else "soft"
+        clean_vols: dict[str, int] = dict(DEFAULT_DISCORD_SOUND_VOLUMES)
+        raw_vols = self.discord_sound_volumes if isinstance(self.discord_sound_volumes, dict) else {}
+        for ev_key, _, _ in SOUND_EVENTS:
+            if ev_key in raw_vols:
+                try:
+                    clean_vols[ev_key] = max(0, min(100, int(raw_vols[ev_key])))
+                except (TypeError, ValueError):
+                    pass
+        self.discord_sound_volumes = clean_vols
         self.discord_notify_chat_enabled = bool(self.discord_notify_chat_enabled)
         seen_chs: list[str] = []
         for raw_cid in (self.discord_notify_channels or []):
@@ -160,6 +192,10 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
             filtered["video_volume"] = filtered["volume"]
         if "music_volume" not in filtered:
             filtered["music_volume"] = filtered["volume"]
+    if "discord_overlay_mode" not in filtered and "discord_overlay_enabled" in filtered:
+        filtered["discord_overlay_mode"] = (
+            "status" if filtered["discord_overlay_enabled"] else "off"
+        )
     return AppConfig(**filtered)
 
 

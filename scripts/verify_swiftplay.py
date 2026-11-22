@@ -472,6 +472,7 @@ def test_gui_and_libmpv_smoke(
         temp_state_path = Path(tmp_sess) / "session_state.json"
         temp_ram_log = Path(tmp_sess) / "ram_log.txt"
         win = MainWindow(session_state_path=temp_state_path, ram_log_path=temp_ram_log)
+        win.sound_fx.set_output_enabled(False)
         if sys.platform == "win32":
             assert apply_window_taskbar_properties(int(win.winId())), "Falló SHGetPropertyStoreForWindow"
         win.show()
@@ -855,7 +856,34 @@ def test_gui_and_libmpv_smoke(
         assert win.resource_card is not None
         win._refresh_resource_monitor()
         assert win.res_ram_lbl.text().endswith(" MB")
+        assert win.res_ram_total_lbl.text().endswith(" MB")
         assert "%" in win.res_cpu_lbl.text() and "%" in win.res_gpu_lbl.text()
+        app_mb = int(win.res_ram_lbl.text().split()[0])
+        win._on_discord_worker_ram_updated(95.0, 490.0)
+        assert int(win.res_ram_total_lbl.text().split()[0]) >= app_mb + 94, (
+            "TOTAL (+DS) debe sumar la RAM del worker de Discord"
+        )
+        win._on_discord_worker_ram_updated(0.0, 0.0)
+        assert win.res_ram_total_lbl.text() == win.res_ram_lbl.text(), (
+            "TOTAL (+DS) debe igualar RAM APP cuando Discord está desconectado"
+        )
+        prev_size = win.size()
+        prev_mini_vis = not win.discord_mini_card.isHidden()
+        try:
+            win.discord_mini_card.setVisible(True)
+            win.resize(860, 560)
+            app.processEvents()
+            assert win.resource_card.height() >= win.resource_card.sizeHint().height(), (
+                f"resource_card aplastada en modo compacto: {win.resource_card.height()} < {win.resource_card.sizeHint().height()}"
+            )
+            for lbl in (win.res_ram_lbl, win.res_ram_total_lbl, win.res_cpu_lbl, win.res_gpu_lbl):
+                assert lbl.height() >= lbl.fontMetrics().height(), (
+                    f"Etiqueta de recursos recortada: {lbl.height()} < {lbl.fontMetrics().height()}"
+                )
+        finally:
+            win.discord_mini_card.setVisible(prev_mini_vis)
+            win.resize(prev_size)
+            app.processEvents()
 
         # Verificar aislamiento lazy y ausencia de fugas Qt tras navegar incluyendo Discord
         assert not win.discord_service.is_worker_running, (
@@ -912,7 +940,11 @@ def test_gui_and_libmpv_smoke(
         assert win.cfg.discord_show_locked_channels is False
         orig_locked_cfg = win.cfg.discord_show_locked_channels
         orig_overlay_cfg = win.cfg.discord_overlay_enabled
+        orig_overlay_mode = win.cfg.discord_overlay_mode
         orig_overlay_op = win.cfg.discord_overlay_opacity
+        orig_sounds_en = win.cfg.discord_sounds_enabled
+        orig_sound_pack = win.cfg.discord_sound_pack
+        orig_sound_vols = dict(win.cfg.discord_sound_volumes)
         orig_notify_en = win.cfg.discord_notify_chat_enabled
         orig_notify_chs = list(win.cfg.discord_notify_channels)
         orig_hidden_chs = list(win.cfg.discord_hidden_channels)
@@ -1138,6 +1170,125 @@ def test_gui_and_libmpv_smoke(
             app.processEvents()
             assert win.discord_overlay.isHidden()
 
+            # Overlay total (compacto, sin recuadro extra, nombre <= 10 chars, preview Voz 1 / Voz 2)
+            from swiftplay.ui.discord_overlay import format_overlay_name
+
+            assert format_overlay_name("NoiseRed") == "NoiseRed"
+            long_ov = format_overlay_name("NombreMuyLargo123")
+            assert len(long_ov) <= 10 and long_ov.endswith("…"), long_ov
+
+            win.discord_overlay.update_state(
+                overlay_mode="full",
+                active=True,
+                in_voice=False,
+                muted=True,
+                deafened=False,
+                opacity_pct=45,
+                participants=[],
+            )
+            win.discord_overlay.preview(45, duration_ms=400, overlay_mode="full")
+            prev_parts, _ = win.discord_overlay._visible_participants()
+            assert [p["name"] for p in prev_parts] == ["Voz 1", "Voz 2"], prev_parts
+            win.discord_overlay._end_preview()
+
+            win.discord_overlay.update_state(
+                overlay_mode="full",
+                active=True,
+                in_voice=True,
+                muted=True,
+                deafened=False,
+                opacity_pct=45,
+                participants=[
+                    {"id": "1", "name": "TuBot", "is_self": True, "muted": True, "deafened": False, "avatar_url": ""},
+                    {"id": "2", "name": "NombreLarguísimo", "is_self": False, "muted": False, "deafened": False, "avatar_url": ""},
+                ],
+                speaking={"local": False, "2": True},
+            )
+            app.processEvents()
+            assert not win.discord_overlay.isHidden()
+            assert win.discord_overlay._mode == "", "Overlay total no debe duplicar el cuadro de estado"
+            assert 100 <= win.discord_overlay.width() <= 186 and win.discord_overlay.height() >= 56
+            win.discord_overlay.update_state(
+                overlay_mode="off",
+                active=True,
+                in_voice=True,
+                muted=True,
+                deafened=True,
+                opacity_pct=45,
+            )
+            app.processEvents()
+            assert win.discord_overlay.isHidden()
+
+            # Rutas de eventos de sonido + supresión al estar ensordecido
+            win.sound_fx._played_history.clear()
+            win.cfg.discord_sounds_enabled = True
+            dp._muted = False
+            dp._deafened = False
+            dp._toggle_mute()
+            dp._toggle_mute()
+            dp._on_voice_state_updated(
+                {
+                    "in_voice": True,
+                    "channel_id": "201",
+                    "channel_name": "General",
+                    "guild_name": "Guild Demo",
+                    "participants": [{"id": "1", "name": "TuBot", "is_self": True, "muted": False, "deafened": False}],
+                }
+            )
+            dp._on_voice_state_updated(
+                {
+                    "in_voice": True,
+                    "channel_id": "201",
+                    "channel_name": "General",
+                    "guild_name": "Guild Demo",
+                    "participants": [
+                        {"id": "1", "name": "TuBot", "is_self": True, "muted": False, "deafened": False},
+                        {"id": "9", "name": "Amigo", "is_self": False, "muted": False, "deafened": False},
+                    ],
+                }
+            )
+            dp._on_voice_state_updated(
+                {
+                    "in_voice": True,
+                    "channel_id": "201",
+                    "channel_name": "General",
+                    "guild_name": "Guild Demo",
+                    "participants": [{"id": "1", "name": "TuBot", "is_self": True, "muted": False, "deafened": False}],
+                }
+            )
+            dp._on_dm_incoming({"user_id": "u777", "author_name": "AmigoTest", "preview": "Hola"})
+            dp._toggle_deaf()
+            win.play_discord_sound("user_join")
+            win.play_discord_sound("message")
+            dp._toggle_deaf()
+            dp._on_voice_state_updated({"in_voice": False, "channel_id": "", "participants": []})
+            expected_hist = [
+                "mute_on",
+                "mute_off",
+                "self_join",
+                "user_join",
+                "user_leave",
+                "message",
+                "deafen_on",
+                "deafen_off",
+                "self_leave",
+            ]
+            assert win.sound_fx._played_history == expected_hist, (
+                f"Historial de sonidos inesperado: {win.sound_fx._played_history!r}"
+            )
+
+            # Verificar SettingsDialog (combo overlay 3 modos + acordeón colapsable de 9 sonidos)
+            sd_check = SettingsDialog(win.cfg, win.yt, parent=win)
+            assert sd_check.discord_overlay_mode_combo.count() == 3
+            assert sd_check.discord_sounds_body.isHidden()
+            sd_check.discord_sounds_toggle_btn.click()
+            app.processEvents()
+            assert not sd_check.discord_sounds_body.isHidden()
+            assert len(sd_check.discord_sound_sliders) == 9
+            sd_check.close()
+            sd_check.deleteLater()
+            app.processEvents()
+
             # DMs persistentes desde clic derecho / lista Mensajes Directos
             dp._open_dm_with_user("u777", "AmigoTest")
             dp._on_chat_message_received(
@@ -1191,8 +1342,15 @@ def test_gui_and_libmpv_smoke(
             dp._refresh_mute_deaf_buttons()
             win.cfg.discord_show_locked_channels = orig_locked_cfg
             win.cfg.discord_overlay_enabled = orig_overlay_cfg
+            win.cfg.discord_overlay_mode = orig_overlay_mode
             win.cfg.discord_overlay_opacity = orig_overlay_op
+            win.cfg.discord_sounds_enabled = orig_sounds_en
+            win.cfg.discord_sound_pack = orig_sound_pack
+            win.cfg.discord_sound_volumes = orig_sound_vols
             win.cfg.discord_notify_chat_enabled = orig_notify_en
+            win._discord_in_voice = False
+            win._discord_participants = []
+            win._discord_speaking = {}
             win.cfg.discord_notify_channels = orig_notify_chs
             win.cfg.discord_hidden_channels = orig_hidden_chs
             win.cfg.discord_hidden_channel_names = orig_hidden_names
@@ -1320,6 +1478,7 @@ def test_gui_and_libmpv_smoke(
             session_state_path=restore_path,
             ram_log_path=Path(tmp_sess) / "ram_log2.txt",
         )
+        win2.sound_fx.set_output_enabled(False)
         win2.show()
         app.processEvents()
         assert win2.video_player._mpv is None, "Sesión restaurada no debe cargar libmpv todavía"
@@ -1398,6 +1557,48 @@ def test_discord_voice_bridge() -> None:
         assert cfg2.discord_notify_channels == ["201", "202"]
         assert AppConfig(discord_overlay_opacity=2).discord_overlay_opacity == 10
         assert AppConfig(discord_overlay_opacity=250).discord_overlay_opacity == 100
+
+        cfg_full = AppConfig(
+            discord_overlay_mode="full",
+            discord_sounds_enabled=True,
+            discord_sound_pack="minimal",
+            discord_sound_volumes={"message": 35, "mute_on": 0, "user_join": 140},
+        )
+        cfg_full_p = Path(tmp) / "config_full.json"
+        save_config(cfg_full, cfg_full_p)
+        cfg_full2 = load_config(cfg_full_p)
+        assert cfg_full2.discord_overlay_mode == "full" and cfg_full2.discord_overlay_enabled is True
+        assert cfg_full2.discord_sound_pack == "minimal"
+        assert cfg_full2.discord_sound_volumes["message"] == 35
+        assert cfg_full2.discord_sound_volumes["mute_on"] == 0
+        assert cfg_full2.discord_sound_volumes["user_join"] == 100
+
+        from swiftplay.sound_effects import (
+            SOUND_EVENTS,
+            SOUND_PACKS,
+            SoundEffectPlayer,
+            synthesize_sound_wav,
+        )
+
+        for ev_id, _, _ in SOUND_EVENTS:
+            assert synthesize_sound_wav(ev_id, "soft", 0) == b""
+            for pk, _ in SOUND_PACKS:
+                wav_data = synthesize_sound_wav(ev_id, pk, 60)
+                assert wav_data.startswith(b"RIFF") and len(wav_data) > 1000, (ev_id, pk)
+
+        if sys.platform == "win32":
+            import io
+            import wave
+
+            s_buf = io.BytesIO()
+            with wave.open(s_buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000)
+                wf.writeframes(b"\x00\x00" * 480)
+            sfx = SoundEffectPlayer()
+            assert sfx.play_raw_wav(s_buf.getvalue()) is True, "winmm.PlaySoundW debe reproducir desde memoria"
+            sfx.stop()
 
         from swiftplay.media_keys import GlobalMediaKeyFilter, parse_hotkey_string
 

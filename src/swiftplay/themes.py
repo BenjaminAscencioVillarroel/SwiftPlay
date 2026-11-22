@@ -86,7 +86,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         font-size: 10px;
         font-weight: 700;
         letter-spacing: 1.3px;
-        padding: 12px 10px 4px 10px;
+        padding: 8px 10px 2px 10px;
     }}
 
     QLabel#ViewTitle {{
@@ -118,7 +118,7 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         border: 1px solid transparent;
         border-radius: 10px;
         text-align: left;
-        padding: 8px 12px;
+        padding: 6px 12px;
         font-size: 13px;
         font-weight: 500;
     }}
@@ -549,6 +549,13 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QScrollArea {{
         border: none;
         background-color: {p.base};
+    }}
+
+    QScrollArea#SidebarScroll,
+    QScrollArea#SidebarScroll > QWidget > QWidget,
+    QWidget#SidebarNavContainer {{
+        background-color: transparent;
+        border: none;
     }}
 
     QScrollBar:vertical {{

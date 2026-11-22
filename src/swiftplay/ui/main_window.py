@@ -42,12 +42,14 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMenu,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -63,6 +65,7 @@ from swiftplay.player import MediaPlayer
 from swiftplay.ram_logger import RamLogger
 from swiftplay.security import has_discord_token, has_saved_session, load_account_profile
 from swiftplay.session_state import SessionState, load_session_state, save_session_state
+from swiftplay.sound_effects import SoundEffectPlayer
 from swiftplay.storage import LocalLibrary
 from swiftplay.themes import (
     ThemePalette,
@@ -170,6 +173,8 @@ class MainWindow(QMainWindow):
         self._ram_logger = RamLogger(ram_log_path if ram_log_path is not None else RAM_LOG_PATH)
         self._discord_ws_mb: float = 0.0
         self._discord_priv_mb: float = 0.0
+        self._last_gui_ws_mb: float = 0.0
+        self.sound_fx = SoundEffectPlayer()
         self._was_discord_connected: bool = False
         self._was_discord_in_voice: bool = False
         self._discord_bot_name: str = ""
@@ -319,10 +324,16 @@ class MainWindow(QMainWindow):
         )
         self.vol_hud = VolumeHudOverlay(palette=self.palette)
         self.action_hud = PlaybackFeedbackHud(palette=self.palette)
-        self.discord_overlay = DiscordStatusOverlay(palette=self.palette)
+        self.discord_overlay = DiscordStatusOverlay(
+            palette=self.palette,
+            thumb_cache=self.thumb_cache,
+        )
         self._discord_voice_active = False
+        self._discord_in_voice = False
         self._discord_muted = False
         self._discord_deafened = False
+        self._discord_participants: list[dict] = []
+        self._discord_speaking: dict[str, bool] = {}
 
         self._connect_player_signals()
         self._connect_video_panel_signals()
@@ -336,6 +347,7 @@ class MainWindow(QMainWindow):
         )
         self._connect_minibar_signals()
         self.discord_service.voice_state_updated.connect(self._on_discord_voice_state_changed)
+        self.discord_service.speaking_updated.connect(self._on_discord_speaking_updated)
         self.discord_service.worker_ram_updated.connect(self._on_discord_worker_ram_updated)
         self.discord_service.state_changed.connect(self._on_discord_state_changed_for_log)
 
@@ -397,10 +409,11 @@ class MainWindow(QMainWindow):
         self.sidebar.setObjectName("Sidebar")
         self.sidebar.setFixedWidth(220)
         sb_lay = QVBoxLayout(self.sidebar)
-        sb_lay.setContentsMargins(12, 14, 12, 12)
-        sb_lay.setSpacing(4)
+        sb_lay.setContentsMargins(10, 12, 10, 10)
+        sb_lay.setSpacing(6)
 
         brand_row = QHBoxLayout()
+        brand_row.setContentsMargins(2, 0, 2, 2)
         brand_row.setSpacing(9)
         logo_lbl = QLabel()
         logo_lbl.setFixedSize(26, 26)
@@ -416,9 +429,24 @@ class MainWindow(QMainWindow):
         brand_row.addStretch()
         sb_lay.addLayout(brand_row)
 
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setObjectName("SidebarScroll")
+        self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.sidebar_scroll.viewport().setAutoFillBackground(False)
+        self.sidebar_scroll.viewport().setStyleSheet("background: transparent;")
+
+        nav_container = QWidget()
+        nav_container.setObjectName("SidebarNavContainer")
+        nav_lay = QVBoxLayout(nav_container)
+        nav_lay.setContentsMargins(0, 0, 0, 0)
+        nav_lay.setSpacing(2)
+
         vid_sec = QLabel("VIDEO")
         vid_sec.setObjectName("SectionHeader")
-        sb_lay.addWidget(vid_sec)
+        nav_lay.addWidget(vid_sec)
 
         self.nav_yt = self._make_nav_btn(
             "YouTube",
@@ -435,13 +463,13 @@ class MainWindow(QMainWindow):
             lambda: self._switch_page(self.PAGE_HISTORY),
             tooltip="Videos vistos recientemente y minuto exacto donde quedaste",
         )
-        sb_lay.addWidget(self.nav_yt)
-        sb_lay.addWidget(self.nav_wl)
-        sb_lay.addWidget(self.nav_history)
+        nav_lay.addWidget(self.nav_yt)
+        nav_lay.addWidget(self.nav_wl)
+        nav_lay.addWidget(self.nav_history)
 
         mus_sec = QLabel("MÚSICA")
         mus_sec.setObjectName("SectionHeader")
-        sb_lay.addWidget(mus_sec)
+        nav_lay.addWidget(mus_sec)
 
         self.nav_ytm = self._make_nav_btn(
             "YT Music",
@@ -458,82 +486,94 @@ class MainWindow(QMainWindow):
             lambda: self._switch_page(self.PAGE_MUSIC_HISTORY),
             tooltip="Canciones escuchadas recientemente",
         )
-        sb_lay.addWidget(self.nav_ytm)
-        sb_lay.addWidget(self.nav_mymusic)
-        sb_lay.addWidget(self.nav_music_history)
+        nav_lay.addWidget(self.nav_ytm)
+        nav_lay.addWidget(self.nav_mymusic)
+        nav_lay.addWidget(self.nav_music_history)
 
         live_sec = QLabel("DIRECTOS")
         live_sec.setObjectName("SectionHeader")
-        sb_lay.addWidget(live_sec)
+        nav_lay.addWidget(live_sec)
 
         self.nav_twitch = self._make_nav_btn(
             "Twitch",
             lambda: self._switch_page(self.PAGE_TWITCH),
             tooltip="Directos de Twitch (invitado, sin chat) [Tab]",
         )
-        sb_lay.addWidget(self.nav_twitch)
+        nav_lay.addWidget(self.nav_twitch)
 
         voice_sec = QLabel("VOZ")
         voice_sec.setObjectName("SectionHeader")
-        sb_lay.addWidget(voice_sec)
+        nav_lay.addWidget(voice_sec)
 
         self.nav_discord = self._make_nav_btn(
             "Discord",
             lambda: self._switch_page(self.PAGE_DISCORD),
             tooltip="Canales de voz de Discord (Bot ultraliviano, 0 MB en reposo) [Tab]",
         )
-        sb_lay.addWidget(self.nav_discord)
+        nav_lay.addWidget(self.nav_discord)
 
-        sb_lay.addStretch()
+        nav_lay.addStretch(1)
 
         self.minibar_btn = QPushButton(" Mini-barra")
         self.minibar_btn.setObjectName("NavBtn")
         self.minibar_btn.setToolTip("Abrir mini-barra flotante")
         self.minibar_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.minibar_btn.clicked.connect(self.toggle_mini_bar)
-        sb_lay.addWidget(self.minibar_btn)
+        nav_lay.addWidget(self.minibar_btn)
 
         self.shortcuts_btn = QPushButton(" Atajos [?]")
         self.shortcuts_btn.setObjectName("NavBtn")
         self.shortcuts_btn.setToolTip("Ver todos los atajos de teclado [?]")
         self.shortcuts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.shortcuts_btn.clicked.connect(self.open_shortcuts_dialog)
-        sb_lay.addWidget(self.shortcuts_btn)
+        nav_lay.addWidget(self.shortcuts_btn)
 
         self.settings_btn = QPushButton(" Ajustes")
         self.settings_btn.setObjectName("NavBtn")
         self.settings_btn.setToolTip("Configuración de reproductor dual, descargas y cuenta")
         self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.settings_btn.clicked.connect(lambda: self.open_settings(account_tab=False))
-        sb_lay.addWidget(self.settings_btn)
+        nav_lay.addWidget(self.settings_btn)
+
+        self.sidebar_scroll.setWidget(nav_container)
+        sb_lay.addWidget(self.sidebar_scroll, 1)
 
         self.resource_card = QFrame()
         self.resource_card.setObjectName("ResourceMonitorCard")
-        self.resource_card.setToolTip("Consumo en vivo de SwiftPlay (RAM, CPU y GPU)")
+        self.resource_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.resource_card.setToolTip("Consumo en vivo de SwiftPlay (RAM física, CPU y GPU)")
         res_lay = QGridLayout(self.resource_card)
-        res_lay.setContentsMargins(10, 6, 10, 6)
+        res_lay.setContentsMargins(10, 7, 10, 7)
         res_lay.setHorizontalSpacing(6)
-        res_lay.setVerticalSpacing(2)
+        res_lay.setVerticalSpacing(3)
         res_lay.setColumnStretch(0, 1)
+        res_lay.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         def _make_res_row(row_idx: int, label_key: str, init_val: str) -> QLabel:
             k_lbl = QLabel(label_key)
             k_lbl.setObjectName("MutedLabel")
-            k_lbl.setStyleSheet("font-size: 10px; font-weight: 700; letter-spacing: 0.6px;")
+            k_lbl.setMinimumHeight(15)
+            k_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            k_lbl.setStyleSheet("font-size: 10px; font-weight: 700; letter-spacing: 0.5px;")
             v_lbl = QLabel(init_val)
+            v_lbl.setMinimumHeight(15)
+            v_lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
             v_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            v_lbl.setStyleSheet("font-size: 10.5px; font-weight: 600; color: #E2E7F0;")
+            v_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #E2E7F0;")
             res_lay.addWidget(k_lbl, row_idx, 0)
             res_lay.addWidget(v_lbl, row_idx, 1)
             return v_lbl
 
-        self.res_ram_lbl = _make_res_row(0, "RAM", "-- MB")
-        self.res_cpu_lbl = _make_res_row(1, "CPU", "0.0%")
-        self.res_gpu_lbl = _make_res_row(2, "GPU", "0.0%")
+        self.res_ram_lbl = _make_res_row(0, "RAM APP", "-- MB")
+        self.res_ram_total_lbl = _make_res_row(1, "TOTAL (+DS)", "-- MB")
+        self.res_cpu_lbl = _make_res_row(2, "CPU", "0.0%")
+        self.res_gpu_lbl = _make_res_row(3, "GPU", "0.0%")
         sb_lay.addWidget(self.resource_card)
 
         self.discord_mini_card = QFrame()
         self.discord_mini_card.setObjectName("DiscordSidebarMiniCard")
+        self.discord_mini_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.discord_mini_card.setMinimumHeight(42)
         self.discord_mini_card.setVisible(False)
         dm_lay = QHBoxLayout(self.discord_mini_card)
         dm_lay.setContentsMargins(8, 6, 8, 6)
@@ -854,6 +894,7 @@ class MainWindow(QMainWindow):
         )
         self.discord_panel.voice_status_changed.connect(self._on_discord_voice_status_changed)
         self.discord_panel.channel_alert_requested.connect(self._on_discord_channel_alert)
+        self.discord_panel.sound_event_requested.connect(self.play_discord_sound)
         self.discord_panel.toast_requested.connect(self.show_toast)
         self.stack.addWidget(self.discord_panel)
 
@@ -1370,22 +1411,23 @@ class MainWindow(QMainWindow):
         )
         return dict(self._discord_hotkey_statuses)
 
-    def _play_voice_cue(self, high: bool) -> None:
-        if sys.platform != "win32" or not self.discord_service.is_in_voice:
-            return
-        import threading
-
-        freq = 880 if high else 520
-
-        def _beep() -> None:
-            try:
-                import winsound
-
-                winsound.Beep(freq, 65)
-            except Exception:
-                pass
-
-        threading.Thread(target=_beep, daemon=True, name="discord-cue").start()
+    def play_discord_sound(self, event_id: str, *, force: bool = False) -> bool:
+        if not force and not self.cfg.discord_sounds_enabled:
+            return False
+        if (
+            not force
+            and self._discord_deafened
+            and event_id in ("user_join", "user_leave", "message")
+        ):
+            return False
+        vol = int(self.cfg.discord_sound_volumes.get(event_id, 60))
+        return self.sound_fx.play(
+            event_id,
+            pack=self.cfg.discord_sound_pack,
+            volume_pct=vol,
+            enabled=True,
+            force=force,
+        )
 
     def _on_global_discord_mute(self) -> None:
         muted = self.discord_panel.toggle_mute_from_hotkey()
@@ -1393,7 +1435,6 @@ class MainWindow(QMainWindow):
             self.show_toast(
                 "Discord: Micrófono silenciado" if muted else "Discord: Micrófono activo"
             )
-        self._play_voice_cue(not muted)
 
     def _on_global_discord_deafen(self) -> None:
         deaf = self.discord_panel.toggle_deafen_from_hotkey()
@@ -1401,13 +1442,11 @@ class MainWindow(QMainWindow):
             self.show_toast(
                 "Discord: Audio ensordecido" if deaf else "Discord: Audio activo"
             )
-        self._play_voice_cue(not deaf)
 
     def _on_global_discord_hangup(self) -> None:
         if self.discord_panel.hangup_from_hotkey():
             if self.isVisible() and self.isActiveWindow():
                 self.show_toast("Discord: Saliste del canal de voz")
-            self._play_voice_cue(False)
 
     def _stop_all(self) -> None:
         self._save_current_video_progress(force=True)
@@ -1679,8 +1718,10 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_discord_worker_ram_updated(self, ws_mb: float, priv_mb: float) -> None:
-        self._discord_ws_mb = float(ws_mb)
-        self._discord_priv_mb = float(priv_mb)
+        self._discord_ws_mb = max(0.0, float(ws_mb))
+        self._discord_priv_mb = max(0.0, float(priv_mb))
+        if hasattr(self, "res_ram_total_lbl") and self._last_gui_ws_mb > 0.0:
+            self.res_ram_total_lbl.setText(f"{(self._last_gui_ws_mb + self._discord_ws_mb):.0f} MB")
 
     def _on_discord_state_changed_for_log(self, state: str, data: dict) -> None:
         if state == "connected":
@@ -1694,12 +1735,20 @@ class MainWindow(QMainWindow):
                 self._was_discord_connected = True
                 self._log_ram_sample("discord_connected")
         elif state in ("disconnected", "error"):
+            was_in_voice = self._was_discord_in_voice or self._discord_in_voice
             self._discord_ws_mb = 0.0
             self._discord_priv_mb = 0.0
+            if hasattr(self, "res_ram_total_lbl") and self._last_gui_ws_mb > 0.0:
+                self.res_ram_total_lbl.setText(f"{self._last_gui_ws_mb:.0f} MB")
             self._discord_bot_name = ""
             self._discord_bot_avatar_url = ""
             self._discord_voice_active = False
+            self._discord_in_voice = False
+            self._discord_participants = []
+            self._discord_speaking = {}
             self._sync_discord_overlay()
+            if was_in_voice:
+                self.play_discord_sound("self_leave")
             if self._was_discord_connected:
                 self._was_discord_connected = False
                 self._was_discord_in_voice = False
@@ -1709,6 +1758,10 @@ class MainWindow(QMainWindow):
     def _on_discord_voice_state_changed(self, state: dict) -> None:
         in_voice = bool(state.get("in_voice", False))
         ch = str(state.get("channel_name") or "").strip()
+        self._discord_in_voice = in_voice
+        self._discord_participants = list(state.get("participants") or []) if in_voice else []
+        if not in_voice:
+            self._discord_speaking = {}
         if in_voice:
             self.nav_discord.setText("  Discord · Voz")
             self.nav_discord.setToolTip(f"Conectado en canal de voz: {ch}")
@@ -1725,7 +1778,12 @@ class MainWindow(QMainWindow):
             if self._was_discord_in_voice:
                 self._was_discord_in_voice = False
                 self._log_ram_sample("discord_voice_leave")
+        self._sync_discord_overlay()
         self._sync_discord_sidebar_card()
+
+    def _on_discord_speaking_updated(self, speaking_map: dict) -> None:
+        self._discord_speaking = dict(speaking_map)
+        self.discord_overlay.update_speaking(self._discord_speaking)
 
     def _on_discord_token_changed(self) -> None:
         self.discord_panel.refresh_token_state()
@@ -1812,11 +1870,14 @@ class MainWindow(QMainWindow):
 
     def _sync_discord_overlay(self) -> None:
         self.discord_overlay.update_state(
-            enabled=self.cfg.discord_overlay_enabled,
+            overlay_mode=self.cfg.discord_overlay_mode,
             active=self._discord_voice_active,
+            in_voice=self._discord_in_voice,
             muted=self._discord_muted,
             deafened=self._discord_deafened,
             opacity_pct=self.cfg.discord_overlay_opacity,
+            participants=self._discord_participants,
+            speaking=self._discord_speaking,
         )
 
     def _on_discord_ui_settings_changed(self) -> None:
@@ -1840,6 +1901,7 @@ class MainWindow(QMainWindow):
         ch_name = str(data.get("channel_name") or "canal")
         author = str(data.get("author_name") or "Discord")
         preview = str(data.get("preview") or "").strip() or "Nuevo mensaje"
+        self.play_discord_sound("message")
         if self.isVisible():
             flash_window_taskbar(int(self.winId()), count=3)
         elif self.tray_icon.isVisible():
@@ -4283,7 +4345,12 @@ class MainWindow(QMainWindow):
         )
         dlg.discord_ui_settings_changed.connect(self._on_discord_ui_settings_changed)
         dlg.discord_overlay_settings_changed.connect(self._sync_discord_overlay)
-        dlg.discord_overlay_preview_requested.connect(self.discord_overlay.preview)
+        dlg.discord_overlay_preview_requested.connect(
+            lambda op: self.discord_overlay.preview(op, overlay_mode=self.cfg.discord_overlay_mode)
+        )
+        dlg.discord_sound_preview_requested.connect(
+            lambda ev: self.play_discord_sound(ev, force=True)
+        )
         dlg.update_discord_hotkey_statuses(self._apply_discord_hotkeys())
         dlg.trim_memory_requested.connect(self.free_memory_now)
         try:
@@ -4445,12 +4512,19 @@ class MainWindow(QMainWindow):
             return
         self._res_sampled_once = True
         snap = self._resource_monitor.sample()
-        ram_mb = snap.priv_mb if snap.priv_mb > 0 else snap.ws_mb
-        self.res_ram_lbl.setText(f"{ram_mb:.0f} MB")
+        gui_ws = snap.ws_mb if snap.ws_mb > 0 else snap.priv_mb
+        self._last_gui_ws_mb = gui_ws
+        ds_ws = max(0.0, float(self._discord_ws_mb))
+        ds_priv = max(0.0, float(self._discord_priv_mb))
+        total_ws = gui_ws + ds_ws
+        self.res_ram_lbl.setText(f"{gui_ws:.0f} MB")
+        self.res_ram_total_lbl.setText(f"{total_ws:.0f} MB")
         self.res_cpu_lbl.setText(f"{snap.app_cpu_pct:.1f}%")
         self.res_gpu_lbl.setText(f"{snap.app_gpu_pct:.1f}%")
         self.resource_card.setToolTip(
-            f"SwiftPlay: RAM {snap.priv_mb:.1f} MB (WS {snap.ws_mb:.1f} MB)\n"
+            f"RAM física App (WS): {gui_ws:.1f} MB  ·  Confirmada (Priv): {snap.priv_mb:.1f} MB\n"
+            f"RAM física Discord (WS): {ds_ws:.1f} MB  ·  Confirmada (Priv): {ds_priv:.1f} MB\n"
+            f"Total físico (App + Discord): {total_ws:.1f} MB\n"
             f"CPU app: {snap.app_cpu_pct:.1f}%  ·  CPU sistema: {snap.sys_cpu_pct:.1f}%\n"
             f"GPU app: {snap.app_gpu_pct:.1f}%  ·  GPU sistema: {snap.sys_gpu_pct:.1f}%"
         )
@@ -4459,6 +4533,14 @@ class MainWindow(QMainWindow):
         if self._cleaned_up:
             return
         self._cleaned_up = True
+        try:
+            self.sound_fx.stop()
+        except Exception:
+            pass
+        try:
+            self.discord_overlay.close()
+        except Exception:
+            pass
         try:
             self._ram_log_timer.stop()
         except Exception:

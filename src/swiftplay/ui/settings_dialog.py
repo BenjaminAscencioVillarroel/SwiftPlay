@@ -30,10 +30,11 @@ from PySide6.QtWidgets import (
 )
 
 from swiftplay.browser_auth import login_with_browser
-from swiftplay.config import AppConfig, save_config
+from swiftplay.config import AppConfig, DEFAULT_DISCORD_SOUND_VOLUMES, save_config
 from swiftplay.media_keys import parse_hotkey_string
 from swiftplay.paths import RAM_LOG_PATH
 from swiftplay.ram_logger import RamLogger
+from swiftplay.sound_effects import SOUND_EVENTS, SOUND_PACKS
 from swiftplay.security import (
     clear_credentials,
     clear_discord_token,
@@ -236,6 +237,7 @@ class SettingsDialog(QDialog):
     discord_ui_settings_changed = Signal()
     discord_overlay_settings_changed = Signal()
     discord_overlay_preview_requested = Signal(int)
+    discord_sound_preview_requested = Signal(str)
     hotkey_recording_changed = Signal(bool)
     trim_memory_requested = Signal()
 
@@ -781,12 +783,21 @@ class SettingsDialog(QDialog):
         self.discord_show_locked_check.toggled.connect(self._on_show_locked_channels_toggled)
         ui_lay.addWidget(self.discord_show_locked_check)
 
-        self.discord_overlay_check = QCheckBox(
-            "Mostrar overlay flotante de silencio/ensordecido (arriba a la izquierda)"
+        ov_row = QHBoxLayout()
+        ov_row.setSpacing(10)
+        ov_lbl = QLabel("Overlay flotante (arriba a la izquierda):")
+        ov_row.addWidget(ov_lbl)
+        self.discord_overlay_mode_combo = QComboBox()
+        self.discord_overlay_mode_combo.addItem("Sin overlay", "off")
+        self.discord_overlay_mode_combo.addItem("Overlay de estado (mute / ensordecido)", "status")
+        self.discord_overlay_mode_combo.addItem("Overlay total (personas + estado)", "full")
+        ov_idx = self.discord_overlay_mode_combo.findData(self.cfg.discord_overlay_mode)
+        self.discord_overlay_mode_combo.setCurrentIndex(max(0, ov_idx))
+        self.discord_overlay_mode_combo.currentIndexChanged.connect(
+            self._on_discord_overlay_mode_changed
         )
-        self.discord_overlay_check.setChecked(self.cfg.discord_overlay_enabled)
-        self.discord_overlay_check.toggled.connect(self._on_discord_overlay_toggled)
-        ui_lay.addWidget(self.discord_overlay_check)
+        ov_row.addWidget(self.discord_overlay_mode_combo, 1)
+        ui_lay.addLayout(ov_row)
 
         op_row = QHBoxLayout()
         op_row.setSpacing(10)
@@ -799,7 +810,7 @@ class SettingsDialog(QDialog):
         self.discord_overlay_opacity_slider.setSingleStep(5)
         self.discord_overlay_opacity_slider.setPageStep(10)
         self.discord_overlay_opacity_slider.setValue(self.cfg.discord_overlay_opacity)
-        self.discord_overlay_opacity_slider.setEnabled(self.cfg.discord_overlay_enabled)
+        self.discord_overlay_opacity_slider.setEnabled(self.cfg.discord_overlay_mode != "off")
         self.discord_overlay_opacity_slider.valueChanged.connect(
             self._on_discord_overlay_opacity_changed
         )
@@ -834,6 +845,112 @@ class SettingsDialog(QDialog):
         notify_row.addWidget(self.discord_mute_all_ch_btn)
         ui_lay.addLayout(notify_row)
         lay.addWidget(ui_card)
+
+        # Lista cerrada / colapsable de sonidos personalizables de Discord
+        sounds_card = QFrame()
+        sounds_card.setObjectName("MediaCard")
+        sc_lay = QVBoxLayout(sounds_card)
+        sc_lay.setContentsMargins(14, 10, 14, 10)
+        sc_lay.setSpacing(8)
+
+        self._discord_sounds_expanded = False
+        self.discord_sounds_toggle_btn = QPushButton()
+        self.discord_sounds_toggle_btn.setObjectName("NavBtn")
+        self.discord_sounds_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_sounds_toggle_btn.setToolTip(
+            "Expandir o contraer el volumen individual de cada sonido de Discord"
+        )
+        self.discord_sounds_toggle_btn.clicked.connect(self._toggle_discord_sounds_section)
+        sc_lay.addWidget(self.discord_sounds_toggle_btn)
+
+        self.discord_sounds_body = QWidget()
+        self.discord_sounds_body.setVisible(False)
+        sb_lay = QVBoxLayout(self.discord_sounds_body)
+        sb_lay.setContentsMargins(4, 2, 4, 2)
+        sb_lay.setSpacing(7)
+
+        self.discord_sounds_enabled_check = QCheckBox(
+            "Activar sonidos de Discord (voz y notificaciones)"
+        )
+        self.discord_sounds_enabled_check.setChecked(self.cfg.discord_sounds_enabled)
+        self.discord_sounds_enabled_check.toggled.connect(
+            self._on_discord_sounds_enabled_toggled
+        )
+        sb_lay.addWidget(self.discord_sounds_enabled_check)
+
+        pack_row = QHBoxLayout()
+        pack_row.setSpacing(10)
+        pack_lbl = QLabel("Estilo de sonido:")
+        pack_lbl.setObjectName("MutedLabel")
+        pack_row.addWidget(pack_lbl)
+        self.discord_sound_pack_combo = QComboBox()
+        for pack_id, pack_label in SOUND_PACKS:
+            self.discord_sound_pack_combo.addItem(pack_label, pack_id)
+        pk_idx = self.discord_sound_pack_combo.findData(self.cfg.discord_sound_pack)
+        self.discord_sound_pack_combo.setCurrentIndex(max(0, pk_idx))
+        self.discord_sound_pack_combo.currentIndexChanged.connect(
+            self._on_discord_sound_pack_changed
+        )
+        pack_row.addWidget(self.discord_sound_pack_combo, 1)
+        sb_lay.addLayout(pack_row)
+
+        hint_lbl = QLabel("Ajusta cada evento (0% lo silencia) · Pulsa reproducir para probar:")
+        hint_lbl.setObjectName("MutedLabel")
+        sb_lay.addWidget(hint_lbl)
+
+        self.discord_sound_sliders: dict[str, QSlider] = {}
+        self.discord_sound_val_lbls: dict[str, QLabel] = {}
+        self.discord_sound_test_btns: dict[str, QPushButton] = {}
+        for ev_id, ev_label, ev_def in SOUND_EVENTS:
+            vol_val = int(self.cfg.discord_sound_volumes.get(ev_id, ev_def))
+            ev_row = QHBoxLayout()
+            ev_row.setSpacing(8)
+            nm_lbl = QLabel(ev_label)
+            nm_lbl.setFixedWidth(165)
+            ev_row.addWidget(nm_lbl)
+
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(0, 100)
+            sl.setSingleStep(5)
+            sl.setPageStep(10)
+            sl.setValue(vol_val)
+            sl.setEnabled(self.cfg.discord_sounds_enabled)
+            sl.valueChanged.connect(
+                lambda val, k=ev_id: self._on_discord_sound_volume_changed(k, val)
+            )
+            ev_row.addWidget(sl, 1)
+
+            val_lbl = QLabel("Off" if vol_val == 0 else f"{vol_val}%")
+            val_lbl.setFixedWidth(38)
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            ev_row.addWidget(val_lbl)
+
+            test_btn = QPushButton()
+            test_btn.setObjectName("IconBtn")
+            test_btn.setFixedSize(26, 26)
+            test_btn.setIcon(render_icon("play", "#F1F3F6", 11))
+            test_btn.setToolTip(f"Probar sonido: {ev_label}")
+            test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            test_btn.clicked.connect(lambda _c=False, k=ev_id: self._on_test_discord_sound(k))
+            ev_row.addWidget(test_btn)
+
+            sb_lay.addLayout(ev_row)
+            self.discord_sound_sliders[ev_id] = sl
+            self.discord_sound_val_lbls[ev_id] = val_lbl
+            self.discord_sound_test_btns[ev_id] = test_btn
+
+        reset_row = QHBoxLayout()
+        reset_row.addStretch()
+        self.discord_sounds_reset_btn = QPushButton("Restablecer volúmenes")
+        self.discord_sounds_reset_btn.setObjectName("PillBtn")
+        self.discord_sounds_reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_sounds_reset_btn.clicked.connect(self._on_reset_discord_sounds)
+        reset_row.addWidget(self.discord_sounds_reset_btn)
+        sb_lay.addLayout(reset_row)
+
+        sc_lay.addWidget(self.discord_sounds_body)
+        self._refresh_sounds_toggle_header()
+        lay.addWidget(sounds_card)
 
         # Canales ocultos permanentemente (voz y texto)
         hidden_card = QFrame()
@@ -1091,11 +1208,17 @@ class SettingsDialog(QDialog):
         save_config(self.cfg)
         self.discord_ui_settings_changed.emit()
 
-    def _on_discord_overlay_toggled(self, checked: bool) -> None:
-        self.cfg.discord_overlay_enabled = bool(checked)
-        self.discord_overlay_opacity_slider.setEnabled(bool(checked))
+    def _on_discord_overlay_mode_changed(self, _idx: int) -> None:
+        mode = str(self.discord_overlay_mode_combo.currentData() or "status")
+        if mode not in ("off", "status", "full"):
+            mode = "status"
+        self.cfg.discord_overlay_mode = mode
+        self.cfg.discord_overlay_enabled = mode != "off"
+        self.discord_overlay_opacity_slider.setEnabled(mode != "off")
         save_config(self.cfg)
         self.discord_overlay_settings_changed.emit()
+        if mode != "off":
+            self.discord_overlay_preview_requested.emit(self.cfg.discord_overlay_opacity)
 
     def _on_discord_overlay_opacity_changed(self, value: int) -> None:
         val = max(10, min(100, int(value)))
@@ -1104,6 +1227,53 @@ class SettingsDialog(QDialog):
         save_config(self.cfg)
         self.discord_overlay_settings_changed.emit()
         self.discord_overlay_preview_requested.emit(val)
+
+    def _refresh_sounds_toggle_header(self) -> None:
+        arrow = "▾" if self._discord_sounds_expanded else "▸"
+        state = "Activos" if self.cfg.discord_sounds_enabled else "Desactivados"
+        pack_label = "Ultra-sutil" if self.cfg.discord_sound_pack == "minimal" else "Suave"
+        self.discord_sounds_toggle_btn.setText(
+            f"{arrow}  Sonidos de Discord · {state} ({pack_label})"
+        )
+
+    def _toggle_discord_sounds_section(self) -> None:
+        self._discord_sounds_expanded = not self._discord_sounds_expanded
+        self.discord_sounds_body.setVisible(self._discord_sounds_expanded)
+        self._refresh_sounds_toggle_header()
+
+    def _on_discord_sounds_enabled_toggled(self, checked: bool) -> None:
+        on = bool(checked)
+        self.cfg.discord_sounds_enabled = on
+        for sl in self.discord_sound_sliders.values():
+            sl.setEnabled(on)
+        save_config(self.cfg)
+        self._refresh_sounds_toggle_header()
+
+    def _on_discord_sound_pack_changed(self, _idx: int) -> None:
+        pack = str(self.discord_sound_pack_combo.currentData() or "soft")
+        self.cfg.discord_sound_pack = pack if pack in ("soft", "minimal") else "soft"
+        save_config(self.cfg)
+        self._refresh_sounds_toggle_header()
+
+    def _on_discord_sound_volume_changed(self, event_id: str, value: int) -> None:
+        val = max(0, min(100, int(value)))
+        lbl = self.discord_sound_val_lbls.get(event_id)
+        if lbl is not None:
+            lbl.setText("Off" if val == 0 else f"{val}%")
+        self.cfg.discord_sound_volumes[event_id] = val
+        save_config(self.cfg)
+
+    def _on_test_discord_sound(self, event_id: str) -> None:
+        self.discord_sound_preview_requested.emit(event_id)
+
+    def _on_reset_discord_sounds(self) -> None:
+        for ev_id, def_val in DEFAULT_DISCORD_SOUND_VOLUMES.items():
+            sl = self.discord_sound_sliders.get(ev_id)
+            if sl is not None:
+                sl.setValue(def_val)
+            else:
+                self.cfg.discord_sound_volumes[ev_id] = def_val
+        save_config(self.cfg)
 
     def _refresh_notify_summary(self) -> None:
         cnt = len(self.cfg.discord_notify_channels)

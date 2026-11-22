@@ -462,6 +462,7 @@ class DiscordVoicePanel(QWidget):
     open_shortcuts_settings_requested = Signal()
     voice_status_changed = Signal(bool, bool, bool)  # active, muted, deafened
     channel_alert_requested = Signal(dict)
+    sound_event_requested = Signal(str)
     toast_requested = Signal(str)
 
     _LIST_AVATAR_SIZE = QSize(28, 28)
@@ -2417,6 +2418,7 @@ class DiscordVoicePanel(QWidget):
         self._render_dm_threads()
         msg = f"DM de {author}: {preview}" if preview else f"Nuevo mensaje directo de {author}"
         self.toast_requested.emit(msg)
+        self.sound_event_requested.emit("message")
 
     def _on_send_chat_clicked(self) -> None:
         if not self._active_chat_kind or not self._active_chat_id or not self._active_chat_can_send:
@@ -2538,10 +2540,17 @@ class DiscordVoicePanel(QWidget):
 
     def _on_voice_state_updated(self, state: dict[str, Any]) -> None:
         prev_in_voice = bool(self._voice_state.get("in_voice", False))
+        prev_ch_id = str(self._voice_state.get("channel_id") or "")
         prev_parts = self._voice_state.get("participants") or []
+        prev_other_ids = {
+            str(p.get("id") or "")
+            for p in prev_parts
+            if str(p.get("id") or "") and not p.get("is_self")
+        }
         self._voice_state = state
         self._joining_channel_id = str(state.get("joining_channel_id") or "")
         in_voice = bool(state.get("in_voice", False))
+        new_ch_id = str(state.get("channel_id") or "")
         self.hangup_btn.setVisible(in_voice)
 
         if in_voice:
@@ -2560,6 +2569,23 @@ class DiscordVoicePanel(QWidget):
         self._render_channels()
         self._render_participants()
         new_parts = state.get("participants") or []
+        new_other_ids = {
+            str(p.get("id") or "")
+            for p in new_parts
+            if str(p.get("id") or "") and not p.get("is_self")
+        }
+        if not prev_in_voice and in_voice:
+            self.sound_event_requested.emit("self_join")
+        elif prev_in_voice and not in_voice:
+            self.sound_event_requested.emit("self_leave")
+        elif prev_in_voice and in_voice:
+            if new_ch_id and prev_ch_id and new_ch_id != prev_ch_id:
+                self.sound_event_requested.emit("self_join")
+            elif new_other_ids - prev_other_ids:
+                self.sound_event_requested.emit("user_join")
+            elif prev_other_ids - new_other_ids:
+                self.sound_event_requested.emit("user_leave")
+
         if in_voice != prev_in_voice or [p.get("id") for p in new_parts] != [p.get("id") for p in prev_parts]:
             self._refresh_members_list()
         self._emit_voice_status()
@@ -2706,12 +2732,14 @@ class DiscordVoicePanel(QWidget):
         self._refresh_mute_deaf_buttons()
         self.svc.set_mute(self._muted)
         self._emit_voice_status()
+        self.sound_event_requested.emit("mute_on" if self._muted else "mute_off")
 
     def _toggle_deaf(self) -> None:
         self._deafened = not self._deafened
         self._refresh_mute_deaf_buttons()
         self.svc.set_deaf(self._deafened)
         self._emit_voice_status()
+        self.sound_event_requested.emit("deafen_on" if self._deafened else "deafen_off")
 
     def _on_out_vol_changed(self, value: int) -> None:
         self.out_vol_val.setText(f"{value}%")
