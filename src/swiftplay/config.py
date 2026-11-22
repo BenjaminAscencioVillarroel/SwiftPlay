@@ -19,6 +19,15 @@ VALID_THEMES: tuple[str, ...] = ("matte_silver",)
 VALID_DISCORD_NS: tuple[str, ...] = ("off", "webrtc", "ai", "ai_max")
 VALID_DISCORD_OVERLAY_MODES: tuple[str, ...] = ("off", "status", "full")
 VALID_DISCORD_SOUND_PACKS: tuple[str, ...] = VALID_SOUND_PACKS
+VALID_NOTIFY_COLORS: tuple[str, ...] = (
+    "purple",
+    "indigo",
+    "blue",
+    "pink",
+    "emerald",
+    "amber",
+    "silver",
+)
 DEFAULT_DISCORD_SOUND_VOLUMES: dict[str, int] = dict(DEFAULT_SOUND_VOLUMES)
 LEGACY_DISCORD_NS_MAP: dict[str, str] = {
     "low": "webrtc",
@@ -86,7 +95,10 @@ class AppConfig:
     discord_overlay_enabled: bool = True
     discord_overlay_mode: str = "status"
     discord_overlay_opacity: int = 25
+    discord_overlay_x: int | None = None
+    discord_overlay_y: int | None = None
     discord_notify_chat_enabled: bool = True
+    discord_notify_color: str = "purple"
     discord_notify_channels: list[str] = field(default_factory=list)
     discord_hidden_channels: list[str] = field(default_factory=list)
     discord_hidden_channel_names: dict[str, str] = field(default_factory=dict)
@@ -136,6 +148,17 @@ class AppConfig:
         self.discord_overlay_mode = ov_mode
         self.discord_overlay_enabled = ov_mode != "off"
         self.discord_overlay_opacity = max(10, min(100, int(self.discord_overlay_opacity)))
+
+        def _norm_overlay_coord(raw_val: object) -> int | None:
+            if raw_val is None or raw_val == "":
+                return None
+            try:
+                return max(-10000, min(10000, int(raw_val)))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+
+        self.discord_overlay_x = _norm_overlay_coord(self.discord_overlay_x)
+        self.discord_overlay_y = _norm_overlay_coord(self.discord_overlay_y)
         self.discord_sounds_enabled = bool(self.discord_sounds_enabled)
         s_pack = str(self.discord_sound_pack or "soft").strip().lower()
         self.discord_sound_pack = s_pack if s_pack in VALID_DISCORD_SOUND_PACKS else "soft"
@@ -149,6 +172,8 @@ class AppConfig:
                     pass
         self.discord_sound_volumes = clean_vols
         self.discord_notify_chat_enabled = bool(self.discord_notify_chat_enabled)
+        ncol = str(self.discord_notify_color or "purple").strip().lower()
+        self.discord_notify_color = ncol if ncol in VALID_NOTIFY_COLORS else "purple"
         seen_chs: list[str] = []
         for raw_cid in (self.discord_notify_channels or []):
             cid = str(raw_cid or "").strip()

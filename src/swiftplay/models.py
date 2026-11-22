@@ -152,3 +152,5 @@ class ResolvedStream:
     author: str = ""
     thumb_url: str = ""
     video_enabled: bool = True
+    is_live: bool = False
+    live_start_ts: float = 0.0

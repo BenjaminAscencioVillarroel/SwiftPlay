@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from swiftplay.paths import APP_ROOT, BIN_DIR
+from swiftplay.windows_os import (
+    assign_process_to_child_job,
+    resolve_worker_python_and_env,
+    set_process_app_user_model_id,
+)
 
 _IDLE_TIMEOUT_SEC = 45.0
 _MAX_WORKER_REQUESTS = 15
@@ -69,7 +74,8 @@ class YtdlpWorkerClient:
         return env
 
     def _spawn(self, oneshot: bool = False) -> subprocess.Popen[str]:
-        cmd = [_get_worker_python(), "-u", "-m", "swiftplay.ytdlp_worker"]
+        worker_exe, worker_env = resolve_worker_python_and_env(APP_ROOT)
+        cmd = [worker_exe, "-u", "-m", "swiftplay.ytdlp_worker"]
         if oneshot:
             cmd.append("--oneshot")
         else:
@@ -81,7 +87,7 @@ class YtdlpWorkerClient:
                     str(self._max_requests),
                 ]
             )
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -91,9 +97,11 @@ class YtdlpWorkerClient:
             errors="replace",
             bufsize=1,
             cwd=str(APP_ROOT),
-            env=self._build_env(),
+            env=worker_env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        assign_process_to_child_job(proc)
+        return proc
 
     def _terminate_proc(self, proc: subprocess.Popen[str] | None) -> None:
         if proc is None:
@@ -381,6 +389,7 @@ def _handle_resolve_youtube(req: dict[str, Any]) -> dict[str, Any]:
         if not primary_url:
             raise RuntimeError("yt-dlp no devolvió una URL reproducible.")
 
+        is_live = bool(info.get("is_live") or info.get("live_status") == "is_live")
         return {
             "video_id": video_id,
             "primary_url": primary_url,
@@ -391,6 +400,10 @@ def _handle_resolve_youtube(req: dict[str, Any]) -> dict[str, Any]:
             "author": str(info.get("channel") or info.get("uploader") or ""),
             "thumb_url": _pick_best_thumb(info.get("thumbnails"), video_id),
             "video_enabled": not audio_only,
+            "is_live": is_live,
+            "live_start_ts": (
+                float(info.get("release_timestamp") or 0.0) if is_live else 0.0
+            ),
         }
     finally:
         gc.collect()
@@ -614,12 +627,19 @@ def _write_json_line(proto_out: Any, obj: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import locale
+    import site
+
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    venv_env = os.environ.get("VIRTUAL_ENV")
+    if venv_env:
+        site_dir = os.path.join(venv_env, "Lib", "site-packages")
+        if os.path.isdir(site_dir):
+            site.addsitedir(site_dir)
+    set_process_app_user_model_id()
 
     proto_out = sys.stdout
-    if sys.stderr is not None:
-        sys.stdout = sys.stderr
-    else:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = sys.stderr
 
     try:
         locale.setlocale(locale.LC_NUMERIC, "C")

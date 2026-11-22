@@ -207,6 +207,11 @@ class _WebRtcMicDsp:
                 except Exception:
                     pass
 
+    def close(self) -> None:
+        with self._lock:
+            self._ns = None
+            self._ns_mode = None
+
     def process_20ms(self, raw_mono: bytes) -> tuple[bytes, float]:
         if len(raw_mono) != MONO_FRAME_BYTES:
             return raw_mono, 1.0
@@ -272,6 +277,12 @@ class _SileroVoiceGate:
                 self._vad.reset()
             except Exception:
                 pass
+
+    def close(self) -> None:
+        self._buf.clear()
+        self._last_prob = 0.0
+        self._vad = None
+        self._np = None
 
     def process_20ms(self, pcm_48k_bytes: bytes) -> float | None:
         if not self._ensure_loaded():
@@ -420,7 +431,7 @@ class _DeepFilterMicDsp:
     def close(self) -> None:
         with self._lock:
             self._free_locked()
-            self._silero.reset()
+            self._silero.close()
 
     def __del__(self) -> None:
         try:
@@ -520,10 +531,16 @@ class MicProcessor:
             df_dsp.warmup()
 
     def close(self) -> None:
+        self.release_dsp()
+
+    def release_dsp(self) -> None:
         with self._lock:
             df_dsp = self._df_dsp
+            webrtc_dsp = self._webrtc_dsp
         if df_dsp is not None:
             df_dsp.close()
+        if webrtc_dsp is not None:
+            webrtc_dsp.close()
 
     def configure(
         self,
@@ -1486,7 +1503,7 @@ class AudioEngine:
         return bool(self._mic_proc._vad_threshold <= 0)
 
     def warmup_async(self) -> None:
-        """Precalienta DeepFilterNet3 y Silero VAD en segundo plano tras conectar el bot."""
+        """Precalienta DeepFilterNet3 y Silero VAD en segundo plano al entrar en voz."""
         with self._warmup_lock:
             if self._warmup_started:
                 return
@@ -1495,6 +1512,12 @@ class AudioEngine:
         def _run() -> None:
             try:
                 self._mic_proc.warmup()
+                try:
+                    from swiftplay.windows_os import trim_process_memory
+
+                    trim_process_memory(collect_gc=True)
+                except Exception:
+                    pass
             except Exception:
                 with self._warmup_lock:
                     self._warmup_started = False
@@ -1504,6 +1527,15 @@ class AudioEngine:
             daemon=True,
             name="discord-audio-warmup",
         ).start()
+
+    def release_dsp_idle(self) -> None:
+        """Libera buffers de DSP neuronal cuando no hay llamada de voz activa."""
+        with self._warmup_lock:
+            self._warmup_started = False
+        try:
+            self._mic_proc.release_dsp()
+        except Exception:
+            pass
 
     def start(self) -> None:
         with self._lock:
@@ -2260,20 +2292,57 @@ def _serialize_chat_message(msg: Any, bot_id: int = 0) -> dict[str, Any]:
     is_self = bool(bot_id and author_id == int(bot_id))
     content = str(getattr(msg, "content", "") or "")[:2000]
 
-    attachments: list[dict[str, str]] = []
-    for att in list(getattr(msg, "attachments", None) or ())[:4]:
+    attachments: list[dict[str, Any]] = []
+    for att in list(getattr(msg, "attachments", None) or ())[:8]:
         attachments.append(
             {
-                "name": str(getattr(att, "filename", "") or "archivo")[:80],
+                "name": str(getattr(att, "filename", "") or "archivo")[:120],
                 "url": str(getattr(att, "url", "") or ""),
+                "proxy_url": str(getattr(att, "proxy_url", "") or ""),
+                "content_type": str(getattr(att, "content_type", "") or ""),
+                "size": _safe_int(getattr(att, "size", 0)),
+                "width": _safe_int(getattr(att, "width", 0)),
+                "height": _safe_int(getattr(att, "height", 0)),
             }
         )
 
+    reply_to: dict[str, str] | None = None
+    ref = getattr(msg, "reference", None)
+    if ref is not None:
+        ref_id = str(getattr(ref, "message_id", "") or "")
+        resolved = getattr(ref, "resolved", None)
+        if resolved is not None and hasattr(resolved, "author"):
+            r_author = getattr(resolved, "author", None)
+            r_author_name = str(
+                getattr(r_author, "display_name", "")
+                or getattr(r_author, "name", "")
+                or getattr(r_author, "id", "")
+                or "Usuario"
+            )
+            r_content = str(getattr(resolved, "content", "") or "").strip()[:120]
+            if not r_content:
+                r_atts = list(getattr(resolved, "attachments", None) or ())
+                if r_atts:
+                    r_content = f"📎 {str(getattr(r_atts[0], 'filename', '') or 'archivo')[:60]}"
+            reply_to = {
+                "id": ref_id,
+                "author_name": r_author_name,
+                "content": r_content,
+            }
+        elif ref_id:
+            reply_to = {
+                "id": ref_id,
+                "author_name": "",
+                "content": "",
+            }
+
     ts_str = ""
     date_label = ""
+    created_ts = 0.0
     created = getattr(msg, "created_at", None)
     if created is not None:
         try:
+            created_ts = float(created.timestamp())
             local_dt = created.astimezone() if getattr(created, "tzinfo", None) is not None else created
             ts_str = local_dt.strftime("%H:%M")
             msg_date = local_dt.date()
@@ -2296,9 +2365,12 @@ def _serialize_chat_message(msg: Any, bot_id: int = 0) -> dict[str, Any]:
         "is_self": is_self,
         "is_bot": is_bot,
         "content": content,
+        "edited": bool(getattr(msg, "edited_at", None) is not None),
+        "reply_to": reply_to,
         "attachments": attachments,
         "timestamp": ts_str,
         "date_label": date_label,
+        "created_ts": created_ts,
     }
 
 
@@ -2691,7 +2763,9 @@ class DiscordWorkerApp:
             if self._active_guild_id:
                 await self._select_guild(self._active_guild_id)
             try:
-                self._ensure_audio_engine().warmup_async()
+                from swiftplay.windows_os import trim_process_memory
+
+                trim_process_memory(collect_gc=True)
             except Exception:
                 pass
 
@@ -2769,7 +2843,7 @@ class DiscordWorkerApp:
                     )
                 if not payload["is_self"] and ch_id in self._notify_channel_ids:
                     preview = payload["content"] or (
-                        "[adjunto]" if payload["attachments"] else ""
+                        f"📎 {payload['attachments'][0]['name']}" if payload["attachments"] else ""
                     )
                     self.emit_event(
                         "channel_message_incoming",
@@ -2779,6 +2853,7 @@ class DiscordWorkerApp:
                             "channel_id": str(ch_id),
                             "channel_name": str(getattr(ch, "name", "") or "canal"),
                             "author_name": payload["author_name"],
+                            "author_avatar_url": str(payload.get("author_avatar_url") or ""),
                             "preview": preview[:80],
                         },
                     )
@@ -2816,21 +2891,65 @@ class DiscordWorkerApp:
                         "message": payload,
                     },
                 )
-            elif not payload["is_self"]:
+            if not payload["is_self"]:
                 preview = payload["content"] or (
-                    "[adjunto]" if payload["attachments"] else ""
+                    f"📎 {payload['attachments'][0]['name']}" if payload["attachments"] else ""
                 )
                 self.emit_event(
                     "dm_incoming",
                     {
                         "user_id": str(peer_id),
                         "author_name": payload["author_name"],
+                        "author_avatar_url": str(
+                            payload.get("author_avatar_url") or peer_avatar or ""
+                        ),
                         "peer_name": peer_name,
                         "peer_avatar_url": peer_avatar,
                         "preview": preview[:80],
                         "message": payload,
                     },
                 )
+
+        @client.event
+        async def on_raw_message_edit(raw_payload: Any) -> None:
+            raw_data = getattr(raw_payload, "data", None)
+            if not isinstance(raw_data, dict) or "content" not in raw_data:
+                return
+            ch_id = _safe_int(getattr(raw_payload, "channel_id", 0))
+            msg_id = str(getattr(raw_payload, "message_id", "") or "")
+            if not ch_id or not msg_id:
+                return
+            new_content = str(raw_data.get("content") or "")[:2000]
+            guild_id = _safe_int(getattr(raw_payload, "guild_id", 0))
+            if guild_id:
+                kind = "channel"
+                tid = ch_id
+                if self._active_chat_kind != "channel" or tid != self._active_chat_id:
+                    return
+            else:
+                kind = "dm"
+                tid = 0
+                for uid_k, mapped_cid in self._dm_channels.items():
+                    if mapped_cid == ch_id:
+                        tid = uid_k
+                        break
+                if not tid:
+                    recip = getattr(client.get_channel(ch_id), "recipient", None)
+                    tid = _safe_int(getattr(recip, "id", 0))
+                    if tid:
+                        self._dm_channels[tid] = ch_id
+                if not tid:
+                    return
+            self.emit_event(
+                "chat_message_edited",
+                {
+                    "kind": kind,
+                    "target_id": str(tid),
+                    "message_id": msg_id,
+                    "content": new_content,
+                    "edited": True,
+                },
+            )
 
     async def _connect_bot(self) -> None:
         import discord
@@ -2932,6 +3051,14 @@ class DiscordWorkerApp:
         self._joining_channel_id = ""
         self._dave_active = False
         self._dave_code = ""
+        if self._audio is not None:
+            self._audio.release_dsp_idle()
+        try:
+            from swiftplay.windows_os import trim_process_memory
+
+            trim_process_memory(collect_gc=True)
+        except Exception:
+            pass
         self._emit_snapshots()
 
     async def _disconnect_bot(self) -> None:
@@ -2997,6 +3124,11 @@ class DiscordWorkerApp:
         perms = ch.permissions_for(guild.me) if guild.me is not None else None
         can_read = bool(getattr(perms, "read_message_history", True)) if perms is not None else True
         can_send = bool(getattr(perms, "send_messages", True)) if perms is not None else True
+        can_attach = (
+            bool(can_send and getattr(perms, "attach_files", True))
+            if perms is not None
+            else can_send
+        )
 
         self._active_chat_kind = "channel"
         self._active_chat_id = cid
@@ -3020,6 +3152,7 @@ class DiscordWorkerApp:
                 "title": f"#{ch.name}",
                 "can_read": can_read,
                 "can_send": can_send,
+                "can_attach": can_attach,
                 "messages": msgs,
                 "channel_members": ch_members,
                 "channel_online_count": ch_online,
@@ -3076,11 +3209,110 @@ class DiscordWorkerApp:
                 "peer_avatar_url": _member_avatar_url(user),
                 "can_read": True,
                 "can_send": True,
+                "can_attach": True,
                 "messages": msgs,
             },
         )
 
-    async def _send_chat_message(self, kind: str, target_id: int, content: str) -> None:
+    async def _send_chat_message(
+        self,
+        kind: str,
+        target_id: int,
+        content: str,
+        file_paths: list[str] | None = None,
+        cleanup_paths: list[str] | None = None,
+        reply_to_id: int = 0,
+    ) -> None:
+        from pathlib import Path
+        import discord
+        from swiftplay.paths import USER_DATA_DIR
+
+        client = self._client
+        if client is None or not client.is_ready():
+            raise RuntimeError("El bot no está conectado a Discord.")
+        text = str(content or "").strip()
+        if len(text) > 2000:
+            text = text[:2000]
+
+        valid_paths = [
+            str(p) for p in (file_paths or []) if str(p or "").strip() and os.path.isfile(str(p))
+        ][:10]
+        if not text and not valid_paths:
+            return
+
+        max_bytes = 25 * 1024 * 1024
+        for fp in valid_paths:
+            if os.path.getsize(fp) > max_bytes:
+                raise RuntimeError(
+                    f"El archivo '{os.path.basename(fp)}' supera el límite de 25 MB."
+                )
+
+        tid = _safe_int(target_id)
+        if kind == "dm":
+            dm_cid = self._dm_channels.get(tid)
+            ch = client.get_channel(dm_cid) if dm_cid else None
+            if ch is None:
+                user = client.get_user(tid) or await client.fetch_user(tid)
+                ch = getattr(user, "dm_channel", None) or await user.create_dm()
+                self._dm_channels[tid] = int(ch.id)
+        else:
+            ch = client.get_channel(tid)
+            if ch is None:
+                for g in client.guilds:
+                    ch = g.get_channel(tid)
+                    if ch is not None:
+                        break
+        if ch is None:
+            raise RuntimeError("Canal de chat no disponible.")
+
+        discord_files: list[Any] = []
+        try:
+            for fp in valid_paths:
+                discord_files.append(discord.File(fp, filename=os.path.basename(fp)))
+            send_kwargs: dict[str, Any] = {}
+            if reply_to_id > 0:
+                send_kwargs["reference"] = discord.MessageReference(
+                    message_id=int(reply_to_id),
+                    channel_id=int(ch.id),
+                    fail_if_not_exists=False,
+                )
+                send_kwargs["mention_author"] = False
+            if discord_files:
+                await ch.send(content=text or None, files=discord_files, **send_kwargs)
+            else:
+                await ch.send(text, **send_kwargs)
+        except discord.Forbidden as exc:
+            raise RuntimeError(
+                "El bot no tiene permiso para enviar mensajes o adjuntar archivos aquí."
+            ) from exc
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 413:
+                raise RuntimeError(
+                    "El archivo supera el límite permitido por Discord (10 MB en servidores sin boost)."
+                ) from exc
+            raise
+        finally:
+            for df in discord_files:
+                try:
+                    df.close()
+                except Exception:
+                    pass
+            tmp_dir = (USER_DATA_DIR / "tmp_uploads").resolve()
+            for cp in cleanup_paths or []:
+                try:
+                    resolved = Path(str(cp)).resolve()
+                    if resolved.is_relative_to(tmp_dir) and resolved.is_file():
+                        resolved.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    async def _edit_chat_message(
+        self,
+        kind: str,
+        target_id: int,
+        message_id: int,
+        content: str,
+    ) -> None:
         import discord
 
         client = self._client
@@ -3088,9 +3320,12 @@ class DiscordWorkerApp:
             raise RuntimeError("El bot no está conectado a Discord.")
         text = str(content or "").strip()
         if not text:
-            return
+            raise RuntimeError("El mensaje editado no puede quedar vacío.")
         if len(text) > 2000:
             text = text[:2000]
+        mid = _safe_int(message_id)
+        if not mid:
+            raise RuntimeError("Mensaje inválido para editar.")
 
         tid = _safe_int(target_id)
         if kind == "dm":
@@ -3111,9 +3346,26 @@ class DiscordWorkerApp:
             raise RuntimeError("Canal de chat no disponible.")
 
         try:
-            await ch.send(text)
+            edited_msg = await ch.get_partial_message(mid).edit(content=text)
         except discord.Forbidden as exc:
-            raise RuntimeError("El bot no tiene permiso para enviar mensajes aquí.") from exc
+            raise RuntimeError("Solo se pueden editar mensajes enviados por el propio bot.") from exc
+        except discord.NotFound as exc:
+            raise RuntimeError("El mensaje ya no existe en Discord.") from exc
+
+        bot_id = int(client.user.id) if client.user else 0
+        payload = _serialize_chat_message(edited_msg, bot_id=bot_id)
+        payload["edited"] = True
+        self.emit_event(
+            "chat_message_edited",
+            {
+                "kind": str(kind),
+                "target_id": str(tid),
+                "message_id": str(mid),
+                "content": payload["content"],
+                "edited": True,
+                "message": payload,
+            },
+        )
 
     async def _join_channel(self, guild_id: int, channel_id: int) -> None:
         async with self._voice_lock:
@@ -3205,6 +3457,7 @@ class DiscordWorkerApp:
             engine = self._ensure_audio_engine()
             engine.configure(muted=self._muted)
             engine.start()
+            engine.warmup_async()
             vc = self._vc
             if vc is not None and vc.is_connected():
                 already_dave = bool(vc._connection.can_encrypt)
@@ -3236,9 +3489,10 @@ class DiscordWorkerApp:
         self._emit_snapshots()
 
     async def _housekeeping_loop(self) -> None:
-        from swiftplay.windows_os import get_process_memory_mb
+        from swiftplay.windows_os import get_process_memory_mb, trim_process_memory
 
         ram_tick = 0.0
+        trim_tick = time.monotonic()
         while self._stop_event is not None and not self._stop_event.is_set():
             await asyncio.sleep(0.25)
             now = time.monotonic()
@@ -3296,6 +3550,12 @@ class DiscordWorkerApp:
                 if self._vc is not None and self._vc.is_connected():
                     self.emit_event("voice_state", self._build_voice_state_dict())
 
+            in_call = self._vc is not None and self._vc.is_connected()
+            trim_interval = 120.0 if in_call else 60.0
+            if (now - trim_tick) >= trim_interval:
+                trim_tick = now
+                trim_process_memory(collect_gc=not in_call)
+
     async def handle_command(self, req: dict[str, Any]) -> None:
         req_id = req.get("id")
         cmd = str(req.get("cmd") or "")
@@ -3340,6 +3600,16 @@ class DiscordWorkerApp:
                 await self._send_chat_message(
                     str(req.get("kind") or "channel"),
                     _safe_int(req.get("target_id")),
+                    str(req.get("content") or ""),
+                    file_paths=list(req.get("file_paths") or []),
+                    cleanup_paths=list(req.get("cleanup_paths") or []),
+                    reply_to_id=_safe_int(req.get("reply_to_id")),
+                )
+            elif cmd == "edit_chat_message":
+                await self._edit_chat_message(
+                    str(req.get("kind") or "channel"),
+                    _safe_int(req.get("target_id")),
+                    _safe_int(req.get("message_id")),
                     str(req.get("content") or ""),
                 )
             elif cmd == "join_channel":
@@ -3479,12 +3749,24 @@ class DiscordWorkerApp:
 
 def main() -> int:
     import locale
+    import site
+
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    venv_env = os.environ.get("VIRTUAL_ENV")
+    if venv_env:
+        site_dir = os.path.join(venv_env, "Lib", "site-packages")
+        if os.path.isdir(site_dir):
+            site.addsitedir(site_dir)
+    try:
+        from swiftplay.windows_os import set_process_app_user_model_id
+
+        set_process_app_user_model_id()
+    except Exception:
+        pass
 
     proto_out = sys.stdout
-    if sys.stderr is not None:
-        sys.stdout = sys.stderr
-    else:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = sys.stderr
 
     try:
         locale.setlocale(locale.LC_NUMERIC, "C")

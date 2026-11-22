@@ -14,7 +14,69 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
-## 2026-11-21 — Documentación IA, Monitor RAM Dual, Sonidos Discord y Overlay Total
+## 2026-11-22 — Chat Nativo Agrupado Estilo Discord, Voz Clic-Directo, Fix Superposición Feed y Video Azul D3D11
+- **Files:** `src/swiftplay/ui/icons.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/widgets.py`, `src/swiftplay/player.py`, `src/swiftplay/ui/video_surface.py`, `src/swiftplay/ui/main_window.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/storage.py`, `src/swiftplay/themes.py`, `scripts/verify_swiftplay.py`
+- **Voice Click-to-Join:** `_VoiceChannelRowFrame` reemplaza el botón redundante `"Entrar"` en canales de voz; clic izquierdo directo sobre la fila conecta al canal (sin botones `"Salir"` / `"Entrar"` / `"Bloq."`), conservando `"En Voz"`, `"Conectando..."` o `"Bloq."` como etiquetas limpias.
+- **Native Discord Chat UI & Grouping:** `_ChatMessagesView` / `_ChatMessageRow` / `_ChatHoverToolbar` reemplazan `QTextBrowser` HTML: avatar circular izquierdo, cabecera superior (nombre + `APP` + hora), agrupación de mensajes consecutivos del mismo autor (`_should_group_message`, <= 5 min sin `reply_to` con hora solo en hover), resaltado de fila y barra flotante única superior derecha (`reply`, `edit` propio del Bot, `copy`, `paste`), además de `created_ts` serializado desde `discord_worker.py` y `storage.py`.
+- **Feed Card Spacing Fix:** `VideoGridCard.set_tile_width()` recalcula la altura real tras ajustar la miniatura (`max(h + 100, lay.sizeHint().height())`) y `ElidedLabel.paintEvent()` alinea el texto desde arriba (`y0 = 0`), evitando que título y avatar invadan el borde inferior de la miniatura.
+- **Solid-Blue Video Fix:** `MediaPlayer` desactiva `d3d11_flip` y `gpu_dumb_mode` usando `hwdec="d3d11va-copy"`, agrega `refresh_video_output()` y `VideoSurface.force_native_redraw()` fuerza `WM_SIZE` / `RedrawWindow` sobre el HWND nativo y su ventana hija al abrir o volver al reproductor.
+
+## 2026-11-22 — Lightbox In-Window de Chat, Responder/Copiar/Editar/Drag&Drop en Discord, Colgar junto a Ensordecer, Notis Siempre Activas Fuera de Chat y Cambio de Pestañas Instantáneo
+- **Files:** `src/swiftplay/storage.py`, `src/swiftplay/themes.py`, `src/swiftplay/discord_service.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Discord Chat Media Lightbox & Safe Selection:** Set `chat_browser.setOpenLinks(False)` (preventing `QTextBrowser` document blanking when clicking image thumbnails), replaced `_ChatImagePreviewDialog` with the in-window dark translucent `_ImageLightboxOverlay` (scales oversized images automatically with `KeepAspectRatio`, closes on `Esc` or outside backdrop click), and removed all external browser/Chrome `Abrir` links.
+  - **Selectable Chat Text, Context Menu, Reply & Edit + Drag-and-Drop:** Switched message rendering to clean `<div>` blocks tracking `_chat_msg_ranges`, added highlighted `QTextBrowser` selection CSS, right-click menu (`Copiar texto seleccionado`, `Copiar mensaje`, `Responder`, `Editar mensaje`, `Copiar imagen`, `Guardar imagen como...`) plus subtle inline message links, `discord_worker` support for `reply_to` (`discord.MessageReference`) and `edit_chat_message` / `on_raw_message_edit` on Bot own messages, and drag-and-drop file/image attachment support across the chat pane/input.
+  - **Voice Hangup & Notification Accuracy:** Removed the `"Salir"` button from voice channel rows in favor of `MainWindow.discord_mini_hangup_btn` (`phone_off` icon placed to the right of `discord_mini_deaf_btn`). Fixed `discord_worker.on_message` (`elif` -> `if`) and GUI focus/pane guards (`_is_window_actively_focused`, `is_viewing_channel`, `is_viewing_dm`, `WindowActivate`) so DM/channel alerts and unread badges trigger whenever the chat pane is closed or SwiftPlay is unfocused.
+  - **Instant Main Tab Switching:** Removed full-page `QGraphicsOpacityEffect` reveal transitions, stopped destroying hidden browse grids/lists on `_switch_page` by tracking dirty flags with batched SQLite ID-set lookups (`list_watch_later_ids`, `list_my_music_ids`, `list_twitch_favorite_ids`) and a 90s Twitch feed cache (`_twitch_feed_cache`), while releasing hidden browse pages cleanly on `free_memory_now()` and minimize-to-tray.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+---
+
+## 2026-11-22 — Barra Inferior Contextual, Sidebar Instantáneo, Popover de Audio Discord, Overlay Movible, Marca SwiftPlay en Notis y Adjuntos en Chat
+- **Files:** `src/swiftplay/config.py`, `src/swiftplay/thumb_cache.py`, `src/swiftplay/discord_service.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/ui/icons.py`, `src/swiftplay/ui/discord_notification.py`, `src/swiftplay/ui/discord_overlay.py`, `src/swiftplay/ui/settings_dialog.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - Prioritized context-appropriate deck in `MainWindow._get_bottom_bar_deck()` so video/Twitch pages show the loaded video deck even while background music plays, and saved `prev_idx` on `PAGE_VIDEO_PLAYER` transitions in `_switch_page` / `_on_video_panel_back()` so "Volver" returns to the exact previous view rather than getting stuck on History.
+  - Replaced laggy sidebar width animation with instant toggle in `toggle_sidebar()` while keeping `_BottomBarContainer` animation intact.
+  - Updated `DiscordMessageToast` branding (`APP_NAME` `"SwiftPlay"` + `swiftplay.png` icon).
+  - Removed the inline `DiscordDeckCard` from `DiscordVoicePanel`, moving device/volume/VAD/AI-suppression/Colgar controls into a floating `audio_popup` opened via a new settings gear icon (`discord_mini_audio_btn`) left of the mic button on `discord_mini_card`, accompanied by the live `Mic %` VU meter bar.
+  - Added free drag-and-drop overlay positioning (`DiscordStatusOverlay.set_edit_mode`, companion `_OverlayEditBar`, multi-monitor clamping) persisted via `AppConfig.discord_overlay_x` / `discord_overlay_y` and launched from `SettingsDialog` (`Mover posición` / `Restablecer posición`).
+  - Added file & image attachment support in Discord chat (`discord_worker` `files=`, `can_attach`, extended attachment serialization; `ThumbnailCache(..., crop=False)` fit mode; inline chat image thumbnails, `_ChatImagePreviewDialog`, Save As download, paperclip picker, and `Ctrl+V` clipboard image/file paste under `%LOCALAPPDATA%\SwiftPlay\tmp_uploads`).
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+---
+
+## 2026-11-22 — Live YT Elapsed Time & Refresh, DXGI VideoSurface Redraw, Smooth Animations & Instant Discord Chat Switch
+- **Files:** `src/swiftplay/models.py`, `src/swiftplay/ytdlp_worker.py`, `src/swiftplay/youtube_service.py`, `src/swiftplay/storage.py`, `src/swiftplay/ui/widgets.py`, `src/swiftplay/ui/video_surface.py`, `src/swiftplay/ui/video_overlays.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - Extracted `release_timestamp` (`live_start_ts`) in `ytdlp_worker.py` -> `ResolvedStream.live_start_ts` so long YouTube Live streams display full elapsed duration (e.g. `5:00:00`) via `_live_display_offset` while keeping seek bars aligned to `libmpv`'s playable DVR window; refreshed stream `title`/`author`/`thumb_url`/`is_live` metadata in `_on_video_stream_resolved` and `LocalLibrary.update_play_metadata`.
+  - Fixed solid-color `VideoSurface` after returning from the bottom bar by removing Qt raster `setAutoFillBackground(True)` / `WA_OpaquePaintEvent` in favor of `WA_NoSystemBackground` + `WA_PaintOnScreen` + `paintEngine() -> None` + `force_native_redraw()`.
+  - Fixed 1–8 frame squashed YouTube grid transitions on minimize by enforcing `VideoGridCard.setMinimumHeight(h + 76)` and pre-rendering target grid pages with `hint_width` inside `stack.setUpdatesEnabled(False)` before switching page index.
+  - Added fixed-size clipping containers `_SidebarContainer` and `_BottomBarContainer` driven by `QVariantAnimation`, shared `LoadingShimmerBar` on feed/search pages, and a single reusable `QVariantAnimation` + transient `QGraphicsOpacityEffect` reveal for non-video pages only.
+  - Added in-place Discord channel/DM selection updates (`_sync_chat_selection_in_place`), LRU chat history cache, stale `_on_chat_history_loaded` response guard, and `_format_chat_placeholder` consistency across DMs and channels.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+---
+
+## 2026-11-22 — Agrupación de Procesos Windows, Vivo en Directos YT, No Leídos Discord y Selección Unificada
+- **Unified Windows Process Grouping & Job Lifecycle (`windows_os.py`, `discord_service.py`, `discord_worker.py`, `ytdlp_worker.py`):**
+  - Added `resolve_worker_python_and_env()` so isolated workers (`discord_worker`, `ytdlp_worker`) launch directly with the same `pythonw.exe` image as the GUI (eliminating separate `python.exe` background entries and duplicate `.venv` stub processes) while loading `.venv` site-packages cleanly via `PYTHONPATH` + `site.addsitedir`.
+  - Bound spawned worker processes to a Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` via `assign_process_to_child_job`) so closing or terminating the main SwiftPlay task cleans up all workers automatically.
+- **YouTube Live Mode & Clickable "Ir al vivo" Sync (`models.py`, `ytdlp_worker.py`, `youtube_service.py`, `player.py`, `video_surface.py`, `video_overlays.py`, `main_window.py`):**
+  - Added `ResolvedStream.is_live`, avoided stale stream cache reuse for live streams, upgraded `live_badge` (`● EN VIVO`) into a clickable button alongside an explicit `Ir al vivo` pill in both embedded and fullscreen bars, and wired `_reload_current_live_stream()` for YouTube Live & Twitch.
+  - Preserved DVR timeline seeking, duration/position labels, `speed_combo`, bottom-bar `bb_seek`, and arrow-key seek on YouTube Live (`allow_seek=True`, hiding timeline strictly on Twitch).
+- **Discord Unread Badges, Desktop Toast, Purple Palette, Stable DM Order & Unified Selection (`themes.py`, `config.py`, `storage.py`, `discord_notification.py`, `discord_worker.py`, `discord_panel.py`, `settings_dialog.py`, `main_window.py`):**
+  - Added frameless bottom-right `DiscordMessageToast` (`350x108`, non-focus-stealing, accented header badge + `×`, 48x48 circular sender avatar, author, preview, click-to-open target DM/channel) for DMs and bell-enabled text channels.
+  - Changed default unread/notification color from blue to purple (`#8B5CF6`, `NOTIFICATION_COLORS` 7-swatch picker + test button in `SettingsDialog`).
+  - Tracked unread counts per bell-enabled text channel and DM thread (`_unread_channels`, `_unread_dms`), added highlight + numeric `UnreadBadge` pills + section counters + main sidebar `Discord (N)` indicator, and fixed `is_viewing_channel()` / `showEvent()` / `_sync_center_panes()` auto-clear.
+  - Standardized `#2D3647` + `#CFD5DF` silver-bordered filled active style (`PillBtn[active="true"]`) across `NavBtn[active="true"]`, `IconBtn[active="true"]`, checked buttons, `QTabBar::tab:selected`, `QListWidget::item:selected`, and `QMenu::item:selected`; moved transparent container styling onto scoped `#SidebarViewport`, `#TransparentScroll`, and `#TransparentBox` selectors so descendant `NavBtn` backgrounds are never overridden.
+  - Enforced strictly one active chat selection across text channels and DMs, and added `touch_timestamp` control on DM thread persistence so opening an older DM preserves list order until a message is sent or received.
+- **Targeted RAM Optimization (`windows_os.py`, `sound_effects.py`, `player.py`, `discord_worker.py`, `main_window.py`):**
+  - Removed eager `warmup_async()` on Discord bot `on_ready()`, moved DSP warmup strictly to voice join (`_join_channel`), released DSP buffers on voice leave (`release_dsp_idle()`), and added periodic idle/voice working-set trimming (`trim_process_memory`).
+  - Capped `QPixmapCache` to `2048` KB, `ThumbnailCache` to `32` items, `synthesize_sound_wav` LRU to `24`, trimmed `libmpv` demuxer caches (`4MiB`/`512KiB` video & YT Live DVR, `2MiB`/`128KiB` Twitch, `2MiB`/`256KiB` audio), and scheduled post-stream cold-page trim.
+
+---
+
+## 2026-11-21 — Documentación IA, Monitor RAM Dual, Sonidos Discord y Overlay Total (`b5e3645`)
 - **Project Documentation & AI Workspace Context (`README.md`, `AGENTS.md`, `.agents/ARCHITECTURE.md`, `.agents/CHANGELOG.md`):**
   - Expanded user README with full module overview, DPAPI/`%LOCALAPPDATA%\SwiftPlay` privacy isolation, Discord bot setup, and updated repository tree.
   - Added `AGENTS.md` workspace guardrails (import isolation, DPAPI isolation, no Shorts, Win32 modal/ghost-window/QSS rules, PowerShell 5.1 protocol) plus `.agents/` deep architecture reference & changelog.

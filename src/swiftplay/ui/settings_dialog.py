@@ -44,7 +44,12 @@ from swiftplay.security import (
     save_cookies_encrypted,
     save_discord_token_encrypted,
 )
-from swiftplay.themes import apply_windows_dark_titlebar, get_theme
+from swiftplay.themes import (
+    NOTIFICATION_COLORS,
+    apply_windows_dark_titlebar,
+    get_notification_color,
+    get_theme,
+)
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
 from swiftplay.ui.shortcuts_dialog import OutsideClickDismissFilter
@@ -237,7 +242,10 @@ class SettingsDialog(QDialog):
     discord_ui_settings_changed = Signal()
     discord_overlay_settings_changed = Signal()
     discord_overlay_preview_requested = Signal(int)
+    discord_overlay_edit_requested = Signal()
     discord_sound_preview_requested = Signal(str)
+    discord_notify_color_changed = Signal(str)
+    discord_notify_preview_requested = Signal()
     hotkey_recording_changed = Signal(bool)
     trim_memory_requested = Signal()
 
@@ -785,7 +793,7 @@ class SettingsDialog(QDialog):
 
         ov_row = QHBoxLayout()
         ov_row.setSpacing(10)
-        ov_lbl = QLabel("Overlay flotante (arriba a la izquierda):")
+        ov_lbl = QLabel("Overlay flotante:")
         ov_row.addWidget(ov_lbl)
         self.discord_overlay_mode_combo = QComboBox()
         self.discord_overlay_mode_combo.addItem("Sin overlay", "off")
@@ -824,12 +832,64 @@ class SettingsDialog(QDialog):
         op_row.addWidget(self.discord_overlay_opacity_lbl)
         ui_lay.addLayout(op_row)
 
+        pos_row = QHBoxLayout()
+        pos_row.setSpacing(8)
+        pos_lbl = QLabel("Posición en pantalla:")
+        pos_lbl.setObjectName("MutedLabel")
+        pos_row.addWidget(pos_lbl)
+        pos_row.addStretch(1)
+
+        self.discord_overlay_move_btn = QPushButton("Mover posición")
+        self.discord_overlay_move_btn.setObjectName("PillBtn")
+        self.discord_overlay_move_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_overlay_move_btn.setEnabled(self.cfg.discord_overlay_mode != "off")
+        self.discord_overlay_move_btn.setToolTip(
+            "Cierra Ajustes temporalmente para arrastrar el overlay donde quieras en tu pantalla"
+        )
+        self.discord_overlay_move_btn.clicked.connect(self._on_discord_overlay_move_clicked)
+        pos_row.addWidget(self.discord_overlay_move_btn)
+
+        self.discord_overlay_reset_pos_btn = QPushButton("Restablecer posición")
+        self.discord_overlay_reset_pos_btn.setObjectName("PillBtn")
+        self.discord_overlay_reset_pos_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_overlay_reset_pos_btn.setEnabled(self.cfg.discord_overlay_mode != "off")
+        self.discord_overlay_reset_pos_btn.setToolTip("Volver a la esquina superior izquierda por defecto")
+        self.discord_overlay_reset_pos_btn.clicked.connect(self._on_discord_overlay_reset_pos_clicked)
+        pos_row.addWidget(self.discord_overlay_reset_pos_btn)
+        ui_lay.addLayout(pos_row)
+
         self.discord_notify_chat_check = QCheckBox(
-            "Avisar en la barra de tareas solo para los canales marcados con campana"
+            "Mostrar notificaciones estilo Discord y avisos para DMs y canales con campana"
         )
         self.discord_notify_chat_check.setChecked(self.cfg.discord_notify_chat_enabled)
         self.discord_notify_chat_check.toggled.connect(self._on_notify_chat_toggled)
         ui_lay.addWidget(self.discord_notify_chat_check)
+
+        color_row = QHBoxLayout()
+        color_row.setSpacing(8)
+        color_lbl = QLabel("Color de notificaciones:")
+        color_lbl.setObjectName("MutedLabel")
+        color_row.addWidget(color_lbl)
+
+        self.discord_notify_color_btns: dict[str, QPushButton] = {}
+        for ckey, cspec in NOTIFICATION_COLORS.items():
+            sw = QPushButton()
+            sw.setFixedSize(22, 22)
+            sw.setToolTip(cspec.name)
+            sw.setCursor(Qt.CursorShape.PointingHandCursor)
+            sw.clicked.connect(lambda _c=False, k=ckey: self._on_notify_color_selected(k))
+            self.discord_notify_color_btns[ckey] = sw
+            color_row.addWidget(sw)
+        self._refresh_notify_color_swatches()
+
+        color_row.addStretch()
+        self.discord_notify_preview_btn = QPushButton("Probar")
+        self.discord_notify_preview_btn.setObjectName("PillBtn")
+        self.discord_notify_preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_notify_preview_btn.setToolTip("Mostrar una notificación de prueba abajo a la derecha")
+        self.discord_notify_preview_btn.clicked.connect(self.discord_notify_preview_requested.emit)
+        color_row.addWidget(self.discord_notify_preview_btn)
+        ui_lay.addLayout(color_row)
 
         notify_row = QHBoxLayout()
         notify_row.setSpacing(8)
@@ -1214,10 +1274,25 @@ class SettingsDialog(QDialog):
             mode = "status"
         self.cfg.discord_overlay_mode = mode
         self.cfg.discord_overlay_enabled = mode != "off"
-        self.discord_overlay_opacity_slider.setEnabled(mode != "off")
+        enabled = mode != "off"
+        self.discord_overlay_opacity_slider.setEnabled(enabled)
+        self.discord_overlay_move_btn.setEnabled(enabled)
+        self.discord_overlay_reset_pos_btn.setEnabled(enabled)
         save_config(self.cfg)
         self.discord_overlay_settings_changed.emit()
-        if mode != "off":
+        if enabled:
+            self.discord_overlay_preview_requested.emit(self.cfg.discord_overlay_opacity)
+
+    def _on_discord_overlay_move_clicked(self) -> None:
+        self.discord_overlay_edit_requested.emit()
+        self.accept()
+
+    def _on_discord_overlay_reset_pos_clicked(self) -> None:
+        self.cfg.discord_overlay_x = None
+        self.cfg.discord_overlay_y = None
+        save_config(self.cfg)
+        self.discord_overlay_settings_changed.emit()
+        if self.cfg.discord_overlay_mode != "off":
             self.discord_overlay_preview_requested.emit(self.cfg.discord_overlay_opacity)
 
     def _on_discord_overlay_opacity_changed(self, value: int) -> None:
@@ -1286,6 +1361,25 @@ class SettingsDialog(QDialog):
         save_config(self.cfg)
         self.discord_ui_settings_changed.emit()
 
+    def _refresh_notify_color_swatches(self) -> None:
+        cur = get_notification_color(self.cfg.discord_notify_color).key
+        for ckey, btn in getattr(self, "discord_notify_color_btns", {}).items():
+            cspec = NOTIFICATION_COLORS[ckey]
+            is_sel = ckey == cur
+            border_css = "2px solid #F1F3F6" if is_sel else "1px solid rgba(255, 255, 255, 55)"
+            btn.setStyleSheet(
+                f"QPushButton {{ background-color: {cspec.badge_bg}; border: {border_css}; "
+                f"border-radius: 11px; padding: 0px; }}"
+                f"QPushButton:hover {{ border: 2px solid {cspec.hover_border}; }}"
+            )
+
+    def _on_notify_color_selected(self, color_key: str) -> None:
+        spec = get_notification_color(color_key)
+        self.cfg.discord_notify_color = spec.key
+        save_config(self.cfg)
+        self._refresh_notify_color_swatches()
+        self.discord_notify_color_changed.emit(spec.key)
+
     def _on_clear_notify_channels(self) -> None:
         self.cfg.discord_notify_channels = []
         save_config(self.cfg)
@@ -1299,6 +1393,7 @@ class SettingsDialog(QDialog):
             item = self.discord_hidden_list_lay.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
 

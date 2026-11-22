@@ -361,5 +361,61 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
         if name == "bell_off":
             p.drawLine(QPointF(s * 0.20, s * 0.20), QPointF(s * 0.80, s * 0.80))
 
+    elif name == "paperclip":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        path = QPainterPath()
+        path.moveTo(s * 0.64, s * 0.28)
+        path.lineTo(s * 0.34, s * 0.58)
+        path.quadTo(s * 0.20, s * 0.72, s * 0.34, s * 0.82)
+        path.quadTo(s * 0.44, s * 0.90, s * 0.58, s * 0.76)
+        path.lineTo(s * 0.80, s * 0.54)
+        path.quadTo(s * 0.90, s * 0.40, s * 0.78, s * 0.28)
+        path.quadTo(s * 0.66, s * 0.16, s * 0.52, s * 0.28)
+        path.lineTo(s * 0.28, s * 0.52)
+        p.drawPath(path)
+
+    elif name == "reply":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        path = QPainterPath()
+        path.moveTo(s * 0.44, s * 0.24)
+        path.lineTo(s * 0.18, s * 0.46)
+        path.lineTo(s * 0.44, s * 0.68)
+        p.drawPath(path)
+        arc = QPainterPath()
+        arc.moveTo(s * 0.20, s * 0.46)
+        arc.lineTo(s * 0.60, s * 0.46)
+        arc.quadTo(s * 0.82, s * 0.46, s * 0.82, s * 0.78)
+        p.drawPath(arc)
+
+    elif name == "edit":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        path = QPainterPath()
+        path.moveTo(s * 0.20, s * 0.80)
+        path.lineTo(s * 0.26, s * 0.58)
+        path.lineTo(s * 0.66, s * 0.18)
+        path.lineTo(s * 0.82, s * 0.34)
+        path.lineTo(s * 0.42, s * 0.74)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.drawLine(QPointF(s * 0.56, s * 0.28), QPointF(s * 0.72, s * 0.44))
+
+    elif name == "copy":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(s * 0.34, s * 0.34, s * 0.46, s * 0.48), 3, 3)
+        path = QPainterPath()
+        path.moveTo(s * 0.34, s * 0.64)
+        path.lineTo(s * 0.22, s * 0.64)
+        path.lineTo(s * 0.22, s * 0.20)
+        path.lineTo(s * 0.64, s * 0.20)
+        path.lineTo(s * 0.64, s * 0.34)
+        p.drawPath(path)
+
+    elif name == "paste":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(s * 0.22, s * 0.24, s * 0.56, s * 0.62), 3, 3)
+        p.drawRoundedRect(QRectF(s * 0.36, s * 0.15, s * 0.28, s * 0.16), 2, 2)
+        p.drawLine(QPointF(s * 0.34, s * 0.50), QPointF(s * 0.66, s * 0.50))
+        p.drawLine(QPointF(s * 0.34, s * 0.66), QPointF(s * 0.58, s * 0.66))
+
     p.end()
     return QIcon(pm)

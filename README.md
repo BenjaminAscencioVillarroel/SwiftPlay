@@ -9,7 +9,7 @@ Cliente nativo de escritorio ultraliviano para **YouTube**, **YouTube Music**, *
 ### YouTube
 - **Feed de Inicio sin Shorts:** carga hasta 36 videos paginados desde InnerTube (`FEwhat_to_watch`), filtrando `/shorts/`, `#shorts` y videos `<= 60s`.
 - **Duración, directos y anti-vistos:** muestra duración o insignia roja **`EN VIVO`** en las miniaturas, excluye videos ya reproducidos o marcados como vistos, y al refrescar trae videos nuevos continuando el feed.
-- **Reproductor GPU con `libmpv`:** velocidades `1x`–`2.5x`, calidades `360p`–`1080p`, **Modo Solo Audio** para ahorrar GPU/RAM, pantalla completa 100% con barra flotante y HUD de volumen, descarga local, *Ver más tarde*, historial con minuto exacto de reanudación y botón **`Cerrar video` / `Cerrar directo`** en la barra superior.
+- **Reproductor GPU con `libmpv`:** velocidades `1x`–`2.5x`, calidades `360p`–`1080p`, **Modo Solo Audio** para ahorrar GPU/RAM, pantalla completa 100% con barra flotante y HUD de volumen, descarga local, *Ver más tarde*, historial con minuto exacto de reanudación, botón **`Ir al vivo`** / **`● EN VIVO`** clicable en directos de YouTube y botón **`Cerrar video` / `Cerrar directo`** en la barra superior.
 
 ### YouTube Music
 - **Reproductor de audio independiente (lazy):** comparte barra inferior inteligente con YouTube sin cargar una instancia innecesaria cuando está en reposo.
@@ -137,7 +137,7 @@ uv run pythonw launch_swiftplay.pyw
 
 - **Voz en tiempo real (DAVE E2EE):** worker aislado que consume **0 MB en reposo** al desconectar el bot, con reconexión y resincronización automática de audio al entrar al canal.
 - **Supresión de ruido con IA (estilo Krisp):** `IA Máxima` (DeepFilterNet3 + Silero VAD v6), `IA`, `Estándar (WebRTC)` y `Desactivada`, además de ganancia de mic, auto-ganancia (AGC), VAD y volumen por persona.
-- **Estados, chat, DMs y privacidad:** paneles colapsables, lista de miembros por canal/servidor, clic derecho para abrir DMs guardados localmente en `MENSAJES DIRECTOS`, ocultación persistente de canales y campana de avisos por canal.
+- **Estados, chat, avisos sin leer y DMs:** paneles colapsables, lista de miembros por canal/servidor, clic derecho para abrir DMs guardados localmente en `MENSAJES DIRECTOS`, ocultación persistente de canales y marcado visual de mensajes sin leer (`UnreadBadge` + contador en barra lateral) tanto para canales con campana como para DMs.
 - **Overlay en 3 modos, sonidos, tarjeta fija y atajos:** mini-tarjeta fija del bot bajo los recursos del sistema, **9 sonidos personalizables** con sección colapsable en Ajustes, **overlay superior izquierdo en 3 modos** (*Sin overlay*, *Overlay de estado*, *Overlay total* compacto con participantes, nombres acotados, aro verde al hablar e íconos al lado derecho) con opacidad ajustable `10–100%`, y atajos globales (`Ctrl+Shift+M` con prioridad, `Ctrl+Shift+D`, `Ctrl+Shift+H`).
 
 ### Paso a paso para agregar el Bot

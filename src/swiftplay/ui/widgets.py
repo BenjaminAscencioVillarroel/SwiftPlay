@@ -18,6 +18,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QLinearGradient,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -49,6 +50,85 @@ from swiftplay.models import MediaItem, format_duration, upgrade_thumb_url
 from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
+
+
+class LoadingShimmerBar(QWidget):
+    """Barra fina animada para indicar carga asíncrona sin bloquear la UI."""
+
+    def __init__(self, accent: str = "#8B5CF6", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._accent = QColor(accent)
+        self._pos = -0.35
+        self._active = False
+        self.setFixedHeight(3)
+        self.setVisible(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(-0.35)
+        self._anim.setEndValue(1.35)
+        self._anim.setDuration(1050)
+        self._anim.setLoopCount(-1)
+        self._anim.valueChanged.connect(self._on_step)
+
+    def _on_step(self, val: object) -> None:
+        self._pos = float(val) if isinstance(val, (int, float)) else 0.0
+        self.update()
+
+    def set_accent(self, accent: str) -> None:
+        self._accent = QColor(accent)
+        self.update()
+
+    def set_active(self, active: bool) -> None:
+        want = bool(active)
+        if want == self._active:
+            return
+        self._active = want
+        if want:
+            self.setVisible(True)
+            if self._anim.state() != QVariantAnimation.State.Running:
+                self._anim.start()
+        else:
+            self._anim.stop()
+            self.setVisible(False)
+
+    def start(self) -> None:
+        self.set_active(True)
+
+    def stop(self) -> None:
+        self.set_active(False)
+
+    def hideEvent(self, event) -> None:
+        if self._anim.state() == QVariantAnimation.State.Running:
+            self._anim.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._active and self._anim.state() != QVariantAnimation.State.Running:
+            self._anim.start()
+
+    def paintEvent(self, _event) -> None:
+        if not self.isVisible():
+            return
+        w = float(max(1, self.width()))
+        h = float(max(1, self.height()))
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.fillRect(self.rect(), QColor(255, 255, 255, 16))
+        bar_w = max(48.0, w * 0.34)
+        cx = self._pos * w
+        x0 = cx - bar_w * 0.5
+        x1 = cx + bar_w * 0.5
+        grad = QLinearGradient(x0, 0.0, x1, 0.0)
+        edge = QColor(self._accent)
+        edge.setAlpha(0)
+        mid = QColor(self._accent)
+        mid.setAlpha(235)
+        grad.setColorAt(0.0, edge)
+        grad.setColorAt(0.5, mid)
+        grad.setColorAt(1.0, edge)
+        p.fillRect(QRectF(max(0.0, x0), 0.0, min(w, x1) - max(0.0, x0), h), grad)
+        p.end()
 
 
 class ClickableSlider(QSlider):
@@ -178,7 +258,7 @@ class ElidedLabel(QLabel):
 
         line_h = fm.lineSpacing()
         has_second = line2.isValid() and line1.textLength() < len(self._full_text)
-        y0 = 0 if has_second else max(0, (h - line_h) // 2)
+        y0 = 0
 
         if line1.isValid():
             start1 = line1.textStart()
@@ -640,6 +720,7 @@ class ResponsiveGridWidget(QWidget):
         self._spacing = max(8, int(spacing))
         self._widgets: list[QWidget] = []
         self._last_cols = 0
+        self._in_batch_layout = False
 
         self._grid = QGridLayout(self)
         self._grid.setContentsMargins(0, 4, 4, 16)
@@ -660,16 +741,27 @@ class ResponsiveGridWidget(QWidget):
         self._last_cols = 0
         self.updateGeometry()
 
-    def set_items_widgets(self, widgets: list[QWidget]) -> None:
-        self.clear_widgets()
-        self._widgets = list(widgets)
-        self.relayout(force_regrid=True)
+    def set_items_widgets(
+        self, widgets: list[QWidget], hint_width: int = 0
+    ) -> None:
+        self._in_batch_layout = True
+        self.setUpdatesEnabled(False)
+        try:
+            self.clear_widgets()
+            self._widgets = list(widgets)
+            self.relayout(force_regrid=True, hint_width=hint_width)
+            self._grid.activate()
+            self.adjustSize()
+        finally:
+            self._in_batch_layout = False
+            self.setUpdatesEnabled(True)
 
-    def relayout(self, force_regrid: bool = False) -> None:
+    def relayout(self, force_regrid: bool = False, hint_width: int = 0) -> None:
         if not self._widgets:
             return
         m = self._grid.contentsMargins()
-        avail_w = max(self.width(), self._min_col_width + m.left() + m.right())
+        ref_w = max(self.width(), int(hint_width or 0))
+        avail_w = max(ref_w, self._min_col_width + m.left() + m.right())
         inner_w = max(180, avail_w - m.left() - m.right() - 2)
         cols = max(
             1,
@@ -699,6 +791,10 @@ class ResponsiveGridWidget(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if self._in_batch_layout or not self.isVisible():
+            return
+        if event.size().width() == event.oldSize().width():
+            return
         self.relayout(force_regrid=False)
 
 
@@ -743,7 +839,7 @@ class VideoGridCard(QFrame):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(8)
+        root.setSpacing(10)
 
         ratio = 0.0
         if item.resume_pos >= 3.0 and item.duration_sec > 0:
@@ -760,7 +856,7 @@ class VideoGridCard(QFrame):
         root.addWidget(self.thumb_widget)
 
         meta_row = QHBoxLayout()
-        meta_row.setContentsMargins(0, 0, 0, 0)
+        meta_row.setContentsMargins(0, 2, 0, 0)
         meta_row.setSpacing(10)
 
         self.avatar_label = QLabel()
@@ -846,8 +942,16 @@ class VideoGridCard(QFrame):
     def set_tile_width(self, width: int) -> None:
         w = max(160, int(width))
         h = max(90, int(round(w * 9 / 16)))
-        self.setFixedWidth(w)
         self.thumb_widget.setFixedSize(w, h)
+        self.setFixedWidth(w)
+        lay = self.layout()
+        if lay is not None:
+            lay.invalidate()
+            hint_h = lay.sizeHint().height()
+        else:
+            hint_h = h + 100
+        self.setMinimumHeight(max(h + 100, hint_h))
+        self.updateGeometry()
 
     def _open_context_menu(self) -> None:
         menu = QMenu(self)

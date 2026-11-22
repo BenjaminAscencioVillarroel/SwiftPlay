@@ -145,6 +145,11 @@ class LocalLibrary:
             ).fetchone()
             return row is not None
 
+    def list_my_music_ids(self) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT video_id FROM my_music").fetchall()
+            return {str(r[0]) for r in rows if r[0]}
+
     def list_my_music(self) -> list[MediaItem]:
         with self._lock:
             rows = self._conn.execute(
@@ -212,6 +217,11 @@ class LocalLibrary:
                 "SELECT 1 FROM watch_later WHERE video_id = ?", (video_id,)
             ).fetchone()
             return row is not None
+
+    def list_watch_later_ids(self) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT video_id FROM watch_later").fetchall()
+            return {str(r[0]) for r in rows if r[0]}
 
     def list_watch_later(self) -> list[MediaItem]:
         with self._lock:
@@ -286,8 +296,11 @@ class LocalLibrary:
     def record_play(self, item: MediaItem, position: float | None = None) -> None:
         if not item.video_id:
             return
-        init_pos = max(0.0, float(position)) if position is not None else 0.0
-        update_pos = position is not None
+        is_live = bool(item.is_live) or str(item.duration or "").strip().upper() == "EN VIVO"
+        dur_text = "EN VIVO" if is_live else item.duration
+        dur_sec = 0 if is_live else int(item.duration_sec or 0)
+        init_pos = 0.0 if is_live else (max(0.0, float(position)) if position is not None else 0.0)
+        update_pos = is_live or (position is not None)
         with self._lock, self._conn:
             self._conn.execute(
                 """
@@ -305,7 +318,7 @@ class LocalLibrary:
                         ELSE play_history.duration
                     END,
                     duration_sec=CASE
-                        WHEN excluded.duration_sec > 0 THEN excluded.duration_sec
+                        WHEN excluded.duration_sec > 0 OR excluded.duration = 'EN VIVO' THEN excluded.duration_sec
                         ELSE play_history.duration_sec
                     END,
                     thumb_url=excluded.thumb_url,
@@ -325,8 +338,8 @@ class LocalLibrary:
                     item.kind,
                     item.title,
                     item.author,
-                    item.duration,
-                    int(item.duration_sec or 0),
+                    dur_text,
+                    dur_sec,
                     item.normalized_thumb(),
                     item.channel_avatar_url or "",
                     time.time(),
@@ -387,6 +400,39 @@ class LocalLibrary:
             ).fetchone()
             return float(row[0] or 0.0) if row else 0.0
 
+    def update_play_metadata(self, item: MediaItem) -> None:
+        if not item.video_id:
+            return
+        is_live = bool(item.is_live) or str(item.duration or "").strip().upper() == "EN VIVO"
+        dur_text = "EN VIVO" if is_live else item.duration
+        dur_sec = 0 if is_live else int(item.duration_sec or 0)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE play_history
+                SET title = CASE WHEN ? != '' THEN ? ELSE title END,
+                    author = CASE WHEN ? != '' THEN ? ELSE author END,
+                    duration = CASE WHEN ? != '' THEN ? ELSE duration END,
+                    duration_sec = CASE WHEN (? > 0 OR ? = 'EN VIVO') THEN ? ELSE duration_sec END,
+                    thumb_url = CASE WHEN ? != '' THEN ? ELSE thumb_url END
+                WHERE video_id = ?
+                """,
+                (
+                    item.title,
+                    item.title,
+                    item.author,
+                    item.author,
+                    dur_text,
+                    dur_text,
+                    dur_sec,
+                    dur_text,
+                    dur_sec,
+                    item.normalized_thumb(),
+                    item.normalized_thumb(),
+                    item.video_id,
+                ),
+            )
+
     def list_video_history(self, limit: int = 50) -> list[MediaItem]:
         with self._lock:
             rows = self._conn.execute(
@@ -410,6 +456,7 @@ class LocalLibrary:
                     thumb_url=r["thumb_url"],
                     kind="video",
                     channel_avatar_url=r["channel_avatar_url"] or "",
+                    is_live=(str(r["duration"] or "").strip().upper() == "EN VIVO"),
                     resume_pos=float(r["last_position"] or 0.0),
                 )
                 for r in rows
@@ -423,6 +470,8 @@ class LocalLibrary:
         user_name: str,
         avatar_url: str = "",
         last_preview: str = "",
+        *,
+        touch_timestamp: bool = True,
     ) -> None:
         uid = str(user_id or "").strip()
         if not uid:
@@ -431,16 +480,19 @@ class LocalLibrary:
         av = str(avatar_url or "").strip()
         prev = str(last_preview or "").strip()[:120]
         now = time.time()
+        ts_expr = (
+            "excluded.updated_at" if touch_timestamp else "discord_dm_threads.updated_at"
+        )
         with self._lock, self._conn:
             self._conn.execute(
-                """
+                f"""
                 INSERT INTO discord_dm_threads (user_id, user_name, avatar_url, last_preview, updated_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     user_name=CASE WHEN excluded.user_name != '' THEN excluded.user_name ELSE discord_dm_threads.user_name END,
                     avatar_url=CASE WHEN excluded.avatar_url != '' THEN excluded.avatar_url ELSE discord_dm_threads.avatar_url END,
                     last_preview=CASE WHEN excluded.last_preview != '' THEN excluded.last_preview ELSE discord_dm_threads.last_preview END,
-                    updated_at=excluded.updated_at
+                    updated_at={ts_expr}
                 """,
                 (uid, uname, av, prev, now),
             )
@@ -480,6 +532,8 @@ class LocalLibrary:
         msg: dict,
         peer_name: str = "",
         peer_avatar_url: str = "",
+        *,
+        touch_timestamp: bool = True,
     ) -> None:
         uid = str(user_id or "").strip()
         if not uid or not isinstance(msg, dict):
@@ -530,6 +584,7 @@ class LocalLibrary:
                 thread_name,
                 avatar_url=peer_avatar_url,
                 last_preview=preview,
+                touch_timestamp=touch_timestamp,
             )
 
     def list_discord_dm_messages(self, user_id: str, limit: int = 80) -> list[dict]:
@@ -539,7 +594,7 @@ class LocalLibrary:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT msg_key, author_id, author_name, is_self, is_bot, content, timestamp, date_label
+                SELECT msg_key, author_id, author_name, is_self, is_bot, content, timestamp, date_label, created_at
                 FROM discord_dm_messages
                 WHERE user_id = ?
                 ORDER BY created_at DESC
@@ -556,12 +611,14 @@ class LocalLibrary:
                         "id": raw_id,
                         "author_id": str(r["author_id"] or ""),
                         "author_name": str(r["author_name"] or "Usuario"),
+                        "author_avatar_url": "",
                         "is_self": bool(r["is_self"]),
                         "is_bot": bool(r["is_bot"]),
                         "content": str(r["content"] or ""),
                         "attachments": [],
                         "timestamp": str(r["timestamp"] or ""),
                         "date_label": str(r["date_label"] or ""),
+                        "created_ts": float(r["created_at"] or 0.0),
                     }
                 )
             return out
@@ -616,6 +673,11 @@ class LocalLibrary:
                 "SELECT 1 FROM twitch_favorites WHERE login = ?", (clean,)
             ).fetchone()
             return row is not None
+
+    def list_twitch_favorite_ids(self) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT login FROM twitch_favorites").fetchall()
+            return {str(r[0]).strip().lower() for r in rows if r[0]}
 
     def list_twitch_favorites(self) -> list[MediaItem]:
         with self._lock:
@@ -696,6 +758,8 @@ class LocalLibrary:
         user_name: str,
         avatar_url: str = "",
         last_preview: str = "",
+        *,
+        touch_timestamp: bool = True,
     ) -> None:
         uid = str(user_id or "").strip()
         if not uid:
@@ -704,16 +768,19 @@ class LocalLibrary:
         av = str(avatar_url or "").strip()
         prev = str(last_preview or "").strip()[:120]
         now = time.time()
+        ts_expr = (
+            "excluded.updated_at" if touch_timestamp else "discord_dm_threads.updated_at"
+        )
         with self._lock, self._conn:
             self._conn.execute(
-                """
+                f"""
                 INSERT INTO discord_dm_threads (user_id, user_name, avatar_url, last_preview, updated_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     user_name=CASE WHEN excluded.user_name != '' THEN excluded.user_name ELSE discord_dm_threads.user_name END,
                     avatar_url=CASE WHEN excluded.avatar_url != '' THEN excluded.avatar_url ELSE discord_dm_threads.avatar_url END,
                     last_preview=CASE WHEN excluded.last_preview != '' THEN excluded.last_preview ELSE discord_dm_threads.last_preview END,
-                    updated_at=excluded.updated_at
+                    updated_at={ts_expr}
                 """,
                 (uid, uname, av, prev, now),
             )
@@ -753,6 +820,8 @@ class LocalLibrary:
         msg: dict,
         peer_name: str = "",
         peer_avatar_url: str = "",
+        *,
+        touch_timestamp: bool = True,
     ) -> None:
         uid = str(user_id or "").strip()
         if not uid or not isinstance(msg, dict):
@@ -803,6 +872,7 @@ class LocalLibrary:
                 thread_name,
                 avatar_url=peer_avatar_url,
                 last_preview=preview,
+                touch_timestamp=touch_timestamp,
             )
 
     def list_discord_dm_messages(self, user_id: str, limit: int = 80) -> list[dict]:
@@ -812,7 +882,7 @@ class LocalLibrary:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT msg_key, author_id, author_name, is_self, is_bot, content, timestamp, date_label
+                SELECT msg_key, author_id, author_name, is_self, is_bot, content, timestamp, date_label, created_at
                 FROM discord_dm_messages
                 WHERE user_id = ?
                 ORDER BY created_at DESC
@@ -829,12 +899,14 @@ class LocalLibrary:
                         "id": raw_id,
                         "author_id": str(r["author_id"] or ""),
                         "author_name": str(r["author_name"] or "Usuario"),
+                        "author_avatar_url": "",
                         "is_self": bool(r["is_self"]),
                         "is_bot": bool(r["is_bot"]),
                         "content": str(r["content"] or ""),
                         "attachments": [],
                         "timestamp": str(r["timestamp"] or ""),
                         "date_label": str(r["date_label"] or ""),
+                        "created_ts": float(r["created_at"] or 0.0),
                     }
                 )
             return out
@@ -886,6 +958,8 @@ class LocalLibrary:
         user_name: str,
         avatar_url: str = "",
         last_preview: str = "",
+        *,
+        touch_timestamp: bool = True,
     ) -> None:
         uid = str(user_id or "").strip()
         if not uid:
@@ -894,16 +968,19 @@ class LocalLibrary:
         av = str(avatar_url or "").strip()
         prev = str(last_preview or "").strip()[:120]
         now = time.time()
+        ts_expr = (
+            "excluded.updated_at" if touch_timestamp else "discord_dm_threads.updated_at"
+        )
         with self._lock, self._conn:
             self._conn.execute(
-                """
+                f"""
                 INSERT INTO discord_dm_threads (user_id, user_name, avatar_url, last_preview, updated_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     user_name=CASE WHEN excluded.user_name != '' THEN excluded.user_name ELSE discord_dm_threads.user_name END,
                     avatar_url=CASE WHEN excluded.avatar_url != '' THEN excluded.avatar_url ELSE discord_dm_threads.avatar_url END,
                     last_preview=CASE WHEN excluded.last_preview != '' THEN excluded.last_preview ELSE discord_dm_threads.last_preview END,
-                    updated_at=excluded.updated_at
+                    updated_at={ts_expr}
                 """,
                 (uid, uname, av, prev, now),
             )
@@ -943,6 +1020,8 @@ class LocalLibrary:
         msg: dict,
         peer_name: str = "",
         peer_avatar_url: str = "",
+        *,
+        touch_timestamp: bool = True,
     ) -> None:
         uid = str(user_id or "").strip()
         if not uid or not isinstance(msg, dict):
@@ -993,6 +1072,7 @@ class LocalLibrary:
                 thread_name,
                 avatar_url=peer_avatar_url,
                 last_preview=preview,
+                touch_timestamp=touch_timestamp,
             )
 
     def list_discord_dm_messages(self, user_id: str, limit: int = 80) -> list[dict]:
@@ -1002,7 +1082,7 @@ class LocalLibrary:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT msg_key, author_id, author_name, is_self, is_bot, content, timestamp, date_label
+                SELECT msg_key, author_id, author_name, is_self, is_bot, content, timestamp, date_label, created_at
                 FROM discord_dm_messages
                 WHERE user_id = ?
                 ORDER BY created_at DESC
@@ -1019,12 +1099,14 @@ class LocalLibrary:
                         "id": raw_id,
                         "author_id": str(r["author_id"] or ""),
                         "author_name": str(r["author_name"] or "Usuario"),
+                        "author_avatar_url": "",
                         "is_self": bool(r["is_self"]),
                         "is_bot": bool(r["is_bot"]),
                         "content": str(r["content"] or ""),
                         "attachments": [],
                         "timestamp": str(r["timestamp"] or ""),
                         "date_label": str(r["date_label"] or ""),
+                        "created_ts": float(r["created_at"] or 0.0),
                     }
                 )
             return out

@@ -126,7 +126,7 @@ def _get_winmm_playsound() -> Any:
     return _winmm_play_fn
 
 
-@functools.lru_cache(maxsize=96)
+@functools.lru_cache(maxsize=24)
 def synthesize_sound_wav(event_id: str, pack: str = "soft", volume_pct: int = 60) -> bytes:
     """Genera un clip WAV PCM mono 16-bit en memoria con envolvente suave y filtro pasa-bajos."""
     vol = max(0, min(100, int(volume_pct)))

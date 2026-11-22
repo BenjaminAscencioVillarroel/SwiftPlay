@@ -81,6 +81,7 @@ class MediaPlayer(QObject):
         self._user_stopped = False
         self._has_media = False
         self._is_live = False
+        self._live_seekable = False
         self._last_was_live: bool | None = None
         self._streams_played = 0
         self._loading_generation = 0
@@ -145,7 +146,7 @@ class MediaPlayer(QObject):
                 audio_pitch_correction=True,
                 ytdl=False,
                 cache="yes",
-                cache_secs=4,
+                cache_secs=3,
                 cache_pause_initial="no",
                 vd_lavc_threads=2,
                 demuxer_lavf_probesize=1048576,
@@ -165,19 +166,19 @@ class MediaPlayer(QObject):
                 kwargs["wid"] = str(int(self._wid))
                 kwargs["vo"] = "gpu"
                 kwargs["gpu_api"] = "d3d11"
-                kwargs["gpu_dumb_mode"] = "yes"
-                kwargs["hwdec"] = "d3d11va"
+                kwargs["d3d11_flip"] = "no"
+                kwargs["hwdec"] = "d3d11va-copy"
                 kwargs["swapchain_depth"] = 2
                 kwargs["gpu_shader_cache"] = "no"
                 kwargs["icc_cache"] = "no"
-                kwargs["demuxer_max_bytes"] = "6MiB"
-                kwargs["demuxer_max_back_bytes"] = "1MiB"
+                kwargs["demuxer_max_bytes"] = "4MiB"
+                kwargs["demuxer_max_back_bytes"] = "512KiB"
                 kwargs["cursor_autohide"] = "no"
             else:
                 kwargs["vo"] = "null"
                 kwargs["vid"] = "no"
-                kwargs["demuxer_max_bytes"] = "3MiB"
-                kwargs["demuxer_max_back_bytes"] = "512KiB"
+                kwargs["demuxer_max_bytes"] = "2MiB"
+                kwargs["demuxer_max_back_bytes"] = "256KiB"
 
             try:
                 self._mpv = mpv_mod.MPV(**kwargs)
@@ -185,6 +186,7 @@ class MediaPlayer(QObject):
                 if self._wid is not None:
                     fallback_kwargs = dict(kwargs)
                     fallback_kwargs.pop("gpu_api", None)
+                    fallback_kwargs["d3d11_flip"] = "no"
                     fallback_kwargs["hwdec"] = "auto-safe"
                     self._mpv = mpv_mod.MPV(**fallback_kwargs)
                 else:
@@ -201,7 +203,12 @@ class MediaPlayer(QObject):
 
         @player.property_observer("time-pos")
         def _on_time_pos(_name, value):
-            if self._shutdown or self._unloading or value is None or self._is_live:
+            if (
+                self._shutdown
+                or self._unloading
+                or value is None
+                or (self._is_live and not self._live_seekable)
+            ):
                 return
             pos = float(value)
             now = time.monotonic()
@@ -329,9 +336,11 @@ class MediaPlayer(QObject):
         http_headers: dict[str, str] | None = None,
         start_pos: float = 0.0,
         is_live: bool = False,
+        allow_seek: bool = False,
     ) -> None:
         with self._lock:
             live_flag = bool(is_live)
+            live_seekable = bool(live_flag and allow_seek)
             if self._mpv is not None and (
                 self._streams_played >= self._recycle_after
                 or (self._last_was_live is not None and self._last_was_live != live_flag)
@@ -346,6 +355,7 @@ class MediaPlayer(QObject):
             self._user_stopped = False
             self._has_media = True
             self._is_live = live_flag
+            self._live_seekable = live_seekable
             self._last_pos_emit_ts = 0.0
             self._last_pos_emit_val = -10.0
 
@@ -354,19 +364,25 @@ class MediaPlayer(QObject):
             else:
                 player.vid = "auto" if video_enabled else "no"
 
-            if live_flag:
+            if live_flag and not live_seekable:
                 player["cache-secs"] = 2
-                player["demuxer-max-bytes"] = "3MiB"
-                player["demuxer-max-back-bytes"] = "256KiB"
+                player["demuxer-max-bytes"] = "2MiB"
+                player["demuxer-max-back-bytes"] = "128KiB"
                 player.start = "none"
                 player.speed = 1.0
+            elif live_flag and live_seekable:
+                player["cache-secs"] = 3
+                player["demuxer-max-bytes"] = "4MiB"
+                player["demuxer-max-back-bytes"] = "512KiB"
+                player.start = "none"
+                player.speed = self._speed
             else:
-                player["cache-secs"] = 4
+                player["cache-secs"] = 3
                 player["demuxer-max-bytes"] = (
-                    "3MiB" if self._is_audio_only_instance else "6MiB"
+                    "2MiB" if self._is_audio_only_instance else "4MiB"
                 )
                 player["demuxer-max-back-bytes"] = (
-                    "512KiB" if self._is_audio_only_instance else "1MiB"
+                    "256KiB" if self._is_audio_only_instance else "512KiB"
                 )
                 player.start = f"+{start_pos:.1f}" if start_pos > 0.5 else "none"
                 player.speed = self._speed
@@ -408,6 +424,7 @@ class MediaPlayer(QObject):
             self._user_stopped = True
             self._has_media = False
             self._is_live = False
+            self._live_seekable = False
             if not self._shutdown and self._mpv is not None:
                 try:
                     self._mpv["audio-files"] = []
@@ -425,6 +442,7 @@ class MediaPlayer(QObject):
             self._user_stopped = True
             self._has_media = False
             self._is_live = False
+            self._live_seekable = False
             self._last_was_live = None
             self._streams_played = 0
             self._applied_af = None
@@ -483,6 +501,22 @@ class MediaPlayer(QObject):
             ):
                 self._mpv.vid = "auto" if enabled else "no"
 
+    def refresh_video_output(self) -> None:
+        """Fuerza re-presentación del frame actual cuando el HWND vuelve de estar oculto."""
+        with self._lock:
+            if (
+                not self._shutdown
+                and not self._unloading
+                and not self._is_audio_only_instance
+                and self._mpv is not None
+                and self._has_media
+            ):
+                try:
+                    self._mpv.video_pan_x = 0.0001
+                    self._mpv.video_pan_x = 0.0
+                except Exception:
+                    pass
+
     def set_cursor_autohide(self, value: int | str) -> None:
         with self._lock:
             if (
@@ -500,6 +534,7 @@ class MediaPlayer(QObject):
             self._user_stopped = True
             self._has_media = False
             self._is_live = False
+            self._live_seekable = False
             self._last_was_live = None
             self._streams_played = 0
             self._applied_af = None

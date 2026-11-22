@@ -19,6 +19,7 @@ from PySide6.QtCore import QObject, Signal
 
 from swiftplay.config import AppConfig
 from swiftplay.paths import APP_ROOT
+from swiftplay.windows_os import assign_process_to_child_job, resolve_worker_python_and_env
 
 _ACTIVE_SERVICES: weakref.WeakSet[DiscordService] = weakref.WeakSet()
 
@@ -60,6 +61,7 @@ class DiscordService(QObject):
     guild_members_updated = Signal(dict)
     chat_history_loaded = Signal(dict)
     chat_message_received = Signal(dict)
+    chat_message_edited = Signal(dict)
     channel_message_incoming = Signal(dict)
     dm_incoming = Signal(dict)
     error_occurred = Signal(str)
@@ -122,7 +124,8 @@ class DiscordService(QObject):
                 raise RuntimeError("DiscordService cerrado.")
             if self._proc is not None and self._proc.poll() is None:
                 return self._proc
-            cmd = [_get_worker_python(), "-u", "-m", "swiftplay.discord_worker"]
+            worker_exe, worker_env = resolve_worker_python_and_env(APP_ROOT)
+            cmd = [worker_exe, "-u", "-m", "swiftplay.discord_worker"]
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -133,9 +136,10 @@ class DiscordService(QObject):
                 errors="replace",
                 bufsize=1,
                 cwd=str(APP_ROOT),
-                env=self._build_env(),
+                env=worker_env,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            assign_process_to_child_job(proc)
             self._proc = proc
             t = threading.Thread(
                 target=self._reader_loop,
@@ -247,6 +251,8 @@ class DiscordService(QObject):
                 self.chat_history_loaded.emit(data)
             elif event == "chat_message" and isinstance(data, dict):
                 self.chat_message_received.emit(data)
+            elif event == "chat_message_edited" and isinstance(data, dict):
+                self.chat_message_edited.emit(data)
             elif event == "channel_message_incoming" and isinstance(data, dict):
                 self.channel_message_incoming.emit(data)
             elif event == "dm_incoming" and isinstance(data, dict):
@@ -412,10 +418,47 @@ class DiscordService(QObject):
             spawn=False,
         )
 
-    def send_chat_message(self, kind: str, target_id: int | str, content: str) -> None:
+    def send_chat_message(
+        self,
+        kind: str,
+        target_id: int | str,
+        content: str,
+        file_paths: list[str] | None = None,
+        cleanup_paths: list[str] | None = None,
+        reply_to_id: int | str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "kind": str(kind),
+            "target_id": str(target_id),
+            "content": str(content),
+        }
+        if file_paths:
+            payload["file_paths"] = [str(p) for p in file_paths if str(p or "").strip()]
+        if cleanup_paths:
+            payload["cleanup_paths"] = [str(p) for p in cleanup_paths if str(p or "").strip()]
+        if reply_to_id is not None and str(reply_to_id).strip():
+            payload["reply_to_id"] = str(reply_to_id).strip()
         self._send_command(
             "send_chat_message",
-            {"kind": str(kind), "target_id": str(target_id), "content": str(content)},
+            payload,
+            spawn=False,
+        )
+
+    def edit_chat_message(
+        self,
+        kind: str,
+        target_id: int | str,
+        message_id: int | str,
+        content: str,
+    ) -> None:
+        self._send_command(
+            "edit_chat_message",
+            {
+                "kind": str(kind),
+                "target_id": str(target_id),
+                "message_id": str(message_id),
+                "content": str(content),
+            },
             spawn=False,
         )
 

@@ -6,9 +6,26 @@ import ctypes
 import sys
 from typing import Any
 
-from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap, QShowEvent
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QKeyEvent,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShowEvent,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QWidget,
+)
 
 from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
@@ -40,8 +57,87 @@ def format_overlay_name(name: str, max_chars: int = _MAX_NAME_CHARS) -> str:
     return clean[: max(1, max_chars - 1)].rstrip() + "…"
 
 
+class _OverlayEditBar(QFrame):
+    """Barra flotante compacta para posicionar libremente el overlay."""
+
+    def __init__(
+        self,
+        palette: ThemePalette,
+        *,
+        on_save,
+        on_reset,
+    ) -> None:
+        super().__init__(None)
+        self._palette = palette
+        self._on_save = on_save
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 8, 12, 8)
+        lay.setSpacing(10)
+
+        msg = QLabel("Arrastra el overlay donde quieras  ·  Esc / Enter para guardar")
+        msg.setStyleSheet(
+            f"background: transparent; color: {palette.text}; font-size: 12px; font-weight: 600;"
+        )
+        lay.addWidget(msg)
+
+        reset_btn = QPushButton("Restablecer")
+        reset_btn.setObjectName("PillBtn")
+        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_btn.clicked.connect(on_reset)
+        lay.addWidget(reset_btn)
+
+        save_btn = QPushButton("Guardar")
+        save_btn.setObjectName("AccentBtn")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.clicked.connect(on_save)
+        lay.addWidget(save_btn)
+
+        self._apply_theme(palette)
+        self.adjustSize()
+
+    def _apply_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.setStyleSheet(
+            f"QFrame {{ background-color: {palette.surface1}; border: 1.5px solid {palette.accent}; border-radius: 12px; }}"
+            f"QPushButton#PillBtn {{ background-color: {palette.surface2}; color: {palette.text}; border: 1px solid {palette.border_bright}; border-radius: 8px; padding: 5px 11px; font-weight: 600; }}"
+            f"QPushButton#PillBtn:hover {{ background-color: {palette.border_bright}; }}"
+            f"QPushButton#AccentBtn {{ background-color: {palette.accent}; color: {palette.accent_text}; border: none; border-radius: 8px; padding: 5px 13px; font-weight: 700; }}"
+            f"QPushButton#AccentBtn:hover {{ background-color: {palette.accent_hover}; }}"
+        )
+
+    def position_top_center(self) -> None:
+        self.adjustSize()
+        scr = QApplication.primaryScreen()
+        geo = scr.availableGeometry() if scr is not None else QRect(0, 0, 1280, 720)
+        x = geo.left() + max(12, (geo.width() - self.width()) // 2)
+        y = geo.top() + 18
+        self.move(x, y)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (
+            Qt.Key.Key_Escape,
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        ):
+            self._on_save()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class DiscordStatusOverlay(QWidget):
-    """Overlay minimalista global en la esquina superior izquierda (no roba foco ni clics)."""
+    """Overlay minimalista global movible (click-through en uso normal)."""
+
+    position_changed = Signal(int, int)
+    reset_position_requested = Signal()
+    edit_mode_changed = Signal(bool)
 
     def __init__(
         self,
@@ -65,6 +161,11 @@ class DiscordStatusOverlay(QWidget):
         self._speaking: dict[str, bool] = {}
         self._opacity_pct: int = 25
         self._previewing: bool = False
+        self._custom_pos: tuple[int, int] | None = None
+        self._edit_mode: bool = False
+        self._dragging: bool = False
+        self._drag_offset = QPoint()
+        self._edit_bar: _OverlayEditBar | None = None
 
         if self._thumb_cache is not None:
             self._thumb_cache.ready.connect(self._on_avatar_ready)
@@ -87,19 +188,58 @@ class DiscordStatusOverlay(QWidget):
         self._preview_timer.timeout.connect(self._end_preview)
 
         self.set_opacity_percent(self._opacity_pct)
-        self._position_top_left()
+        self._apply_position()
 
     def _on_avatar_ready(self, _url: str, _pix: QPixmap) -> None:
         if self.isVisible() and self._effective_overlay_mode() == "full":
             self.update()
 
-    def _position_top_left(self) -> None:
-        scr = QApplication.primaryScreen()
-        geo = scr.geometry() if scr is not None else None
-        if geo is not None:
-            self.move(geo.left() + 14, geo.top() + 14)
+    def set_custom_position(self, x: int | None, y: int | None) -> None:
+        if x is not None and y is not None:
+            self._custom_pos = (int(x), int(y))
         else:
-            self.move(14, 14)
+            self._custom_pos = None
+        self._apply_position()
+
+    def _clamp_pos_to_screens(self, x: int, y: int) -> tuple[int, int]:
+        screens = QApplication.screens()
+        if not screens:
+            return max(0, int(x)), max(0, int(y))
+        cx = int(x) + self.width() // 2
+        cy = int(y) + self.height() // 2
+        target_geo = None
+        for scr in screens:
+            g = scr.geometry()
+            if g.contains(cx, cy):
+                target_geo = g
+                break
+        if target_geo is None:
+            best_dist = None
+            for scr in screens:
+                g = scr.geometry()
+                dx = max(g.left() - cx, 0, cx - g.right())
+                dy = max(g.top() - cy, 0, cy - g.bottom())
+                dist = dx * dx + dy * dy
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    target_geo = g
+        if target_geo is None:
+            return int(x), int(y)
+        max_x = max(target_geo.left() + 4, target_geo.right() - self.width() - 4)
+        max_y = max(target_geo.top() + 4, target_geo.bottom() - self.height() - 4)
+        clamped_x = max(target_geo.left() + 4, min(max_x, int(x)))
+        clamped_y = max(target_geo.top() + 4, min(max_y, int(y)))
+        return clamped_x, clamped_y
+
+    def _apply_position(self) -> None:
+        if self._custom_pos is None:
+            scr = QApplication.primaryScreen()
+            geo = scr.geometry() if scr is not None else None
+            tx, ty = (geo.left() + 14, geo.top() + 14) if geo is not None else (14, 14)
+        else:
+            tx, ty = self._clamp_pos_to_screens(*self._custom_pos)
+        if self.pos() != QPoint(tx, ty):
+            self.move(tx, ty)
 
     def _apply_win32_flags(self, *, force_topmost: bool = False) -> None:
         if sys.platform != "win32":
@@ -117,13 +257,16 @@ class DiscordStatusOverlay(QWidget):
             set_long.restype = ctypes.c_ssize_t
 
             ex = int(get_long(ctypes.c_void_p(hwnd), _GWL_EXSTYLE))
-            target_ex = (
-                ex
-                | _WS_EX_LAYERED
-                | _WS_EX_TRANSPARENT
-                | _WS_EX_NOACTIVATE
-                | _WS_EX_TOOLWINDOW
-            )
+            if self._edit_mode:
+                target_ex = (ex & ~(_WS_EX_TRANSPARENT | _WS_EX_NOACTIVATE)) | _WS_EX_LAYERED | _WS_EX_TOOLWINDOW
+            else:
+                target_ex = (
+                    ex
+                    | _WS_EX_LAYERED
+                    | _WS_EX_TRANSPARENT
+                    | _WS_EX_NOACTIVATE
+                    | _WS_EX_TOOLWINDOW
+                )
             if target_ex != ex:
                 set_long(ctypes.c_void_p(hwnd), _GWL_EXSTYLE, target_ex)
 
@@ -142,18 +285,115 @@ class DiscordStatusOverlay(QWidget):
 
     def _show_no_activate(self) -> None:
         self._apply_win32_flags(force_topmost=False)
-        self._position_top_left()
+        self._apply_position()
         if not self.isVisible():
             self.show()
         self._apply_win32_flags(force_topmost=True)
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
-        self._position_top_left()
+        self._apply_position()
         self._apply_win32_flags(force_topmost=True)
+
+    def set_edit_mode(self, enabled: bool) -> None:
+        want = bool(enabled)
+        self._preview_timer.stop()
+        if want:
+            self._previewing = False
+            self._preview_mode_override = None
+            if not self._edit_mode:
+                self._edit_mode = True
+                self.setWindowFlags(
+                    Qt.WindowType.Tool
+                    | Qt.WindowType.FramelessWindowHint
+                    | Qt.WindowType.WindowStaysOnTopHint
+                )
+                self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+                self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            if self._edit_bar is None:
+                self._edit_bar = _OverlayEditBar(
+                    self._palette,
+                    on_save=lambda: self.set_edit_mode(False),
+                    on_reset=self.reset_position_requested.emit,
+                )
+            else:
+                self._edit_bar._apply_theme(self._palette)
+            self._edit_bar.position_top_center()
+            self._edit_bar.show()
+            self._edit_bar.raise_()
+            self._sync_visibility()
+            self.raise_()
+            self.activateWindow()
+            self.edit_mode_changed.emit(True)
+            return
+
+        was_edit = self._edit_mode
+        self._edit_mode = False
+        self._dragging = False
+        if self._edit_bar is not None:
+            self._edit_bar.hide()
+            self._edit_bar.deleteLater()
+            self._edit_bar = None
+        if was_edit:
+            self.setWindowFlags(
+                Qt.WindowType.Tool
+                | Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.WindowTransparentForInput
+                | Qt.WindowType.WindowDoesNotAcceptFocus
+            )
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.edit_mode_changed.emit(False)
+        self._sync_visibility()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._edit_mode and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._edit_mode and self._dragging:
+            raw_pt = event.globalPosition().toPoint() - self._drag_offset
+            nx, ny = self._clamp_pos_to_screens(raw_pt.x(), raw_pt.y())
+            self.move(nx, ny)
+            self._custom_pos = (nx, ny)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._edit_mode and self._dragging and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            pos = self.pos()
+            self._custom_pos = (pos.x(), pos.y())
+            self.position_changed.emit(pos.x(), pos.y())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self._edit_mode and event.key() in (
+            Qt.Key.Key_Escape,
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        ):
+            self.set_edit_mode(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
+        if self._edit_bar is not None:
+            self._edit_bar._apply_theme(palette)
         if self.isVisible():
             self.update()
 
@@ -173,6 +413,8 @@ class DiscordStatusOverlay(QWidget):
     def _effective_overlay_mode(self) -> str:
         if self._previewing and self._preview_mode_override in ("status", "full"):
             return self._preview_mode_override
+        if self._edit_mode and self._overlay_mode == "off":
+            return "status"
         return self._overlay_mode
 
     def _visible_participants(self) -> tuple[list[dict[str, Any]], int]:
@@ -182,7 +424,7 @@ class DiscordStatusOverlay(QWidget):
             visible = self._participants[:_MAX_VISIBLE_PARTICIPANTS]
             extra = max(0, len(self._participants) - _MAX_VISIBLE_PARTICIPANTS)
             return visible, extra
-        if self._previewing:
+        if self._previewing or self._edit_mode:
             return [
                 {
                     "id": "__prev_1",
@@ -255,16 +497,17 @@ class DiscordStatusOverlay(QWidget):
         # En "Overlay total" el estado se muestra inline en cada fila; no duplicar el cuadro aparte.
         status_mode = "" if eff_ov == "full" else self._resolve_mode(self._muted, self._deafened)
 
-        if self._previewing:
+        if self._previewing or self._edit_mode:
             if eff_ov != "full" and not status_mode:
                 status_mode = "both"
             self._mode = status_mode
             self._apply_size_for_state(status_mode, parts, extra)
-            self.set_opacity_percent(self._opacity_pct)
+            self.set_opacity_percent(max(85, self._opacity_pct) if self._edit_mode else self._opacity_pct)
             if not self.isVisible():
                 self._show_no_activate()
             else:
-                self._position_top_left()
+                self._apply_position()
+                self._apply_win32_flags(force_topmost=True)
                 self.update()
             return
 
@@ -276,7 +519,8 @@ class DiscordStatusOverlay(QWidget):
             if not self.isVisible():
                 self._show_no_activate()
             else:
-                self._position_top_left()
+                self._apply_position()
+                self._apply_win32_flags(force_topmost=True)
                 self.update()
         else:
             self._mode = ""
@@ -349,6 +593,12 @@ class DiscordStatusOverlay(QWidget):
         self._preview_timer.stop()
         self._previewing = False
         self._preview_mode_override = None
+        self._edit_mode = False
+        self._dragging = False
+        if self._edit_bar is not None:
+            self._edit_bar.hide()
+            self._edit_bar.deleteLater()
+            self._edit_bar = None
         if self._thumb_cache is not None and self._thumb_connected:
             self._thumb_connected = False
             try:
@@ -392,6 +642,14 @@ class DiscordStatusOverlay(QWidget):
 
         if not parts:
             self._paint_status_badge(painter, self.width(), self.height(), status_mode)
+            if self._edit_mode:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(self._palette.accent), 2.0, Qt.PenStyle.DashLine))
+                painter.drawRoundedRect(
+                    QRectF(1.0, 1.0, float(self.width()) - 2.0, float(self.height()) - 2.0),
+                    10.0,
+                    10.0,
+                )
             painter.end()
             return
 
@@ -508,6 +766,15 @@ class DiscordStatusOverlay(QWidget):
                 QRect(4, extra_y, self.width() - 8, 18),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 f"+{extra} más",
+            )
+
+        if self._edit_mode:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(self._palette.accent), 2.0, Qt.PenStyle.DashLine))
+            painter.drawRoundedRect(
+                QRectF(1.0, 1.0, float(self.width()) - 2.0, float(self.height()) - 2.0),
+                8.0,
+                8.0,
             )
 
         painter.end()

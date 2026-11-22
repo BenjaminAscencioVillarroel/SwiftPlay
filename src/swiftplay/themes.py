@@ -23,6 +23,18 @@ class ThemePalette:
     accent_text: str
 
 
+@dataclass(frozen=True)
+class NotifyColorSpec:
+    key: str
+    name: str
+    badge_bg: str
+    border: str
+    hover_border: str
+    tint_rgba: str
+    hover_tint_rgba: str
+    badge_text: str
+
+
 THEMES: dict[str, ThemePalette] = {
     "matte_silver": ThemePalette(
         key="matte_silver",
@@ -40,13 +52,93 @@ THEMES: dict[str, ThemePalette] = {
     ),
 }
 
+NOTIFICATION_COLORS: dict[str, NotifyColorSpec] = {
+    "purple": NotifyColorSpec(
+        key="purple",
+        name="Morado",
+        badge_bg="#8B5CF6",
+        border="#A78BFA",
+        hover_border="#C4B5FD",
+        tint_rgba="rgba(139, 92, 246, 40)",
+        hover_tint_rgba="rgba(139, 92, 246, 62)",
+        badge_text="#FFFFFF",
+    ),
+    "indigo": NotifyColorSpec(
+        key="indigo",
+        name="Índigo",
+        badge_bg="#6366F1",
+        border="#818CF8",
+        hover_border="#A5B4FC",
+        tint_rgba="rgba(99, 102, 241, 40)",
+        hover_tint_rgba="rgba(99, 102, 241, 62)",
+        badge_text="#FFFFFF",
+    ),
+    "blue": NotifyColorSpec(
+        key="blue",
+        name="Azul",
+        badge_bg="#3B82F6",
+        border="#60A5FA",
+        hover_border="#93C5FD",
+        tint_rgba="rgba(59, 130, 246, 36)",
+        hover_tint_rgba="rgba(59, 130, 246, 56)",
+        badge_text="#FFFFFF",
+    ),
+    "pink": NotifyColorSpec(
+        key="pink",
+        name="Rosa",
+        badge_bg="#EC4899",
+        border="#F472B6",
+        hover_border="#F9A8D4",
+        tint_rgba="rgba(236, 72, 153, 38)",
+        hover_tint_rgba="rgba(236, 72, 153, 58)",
+        badge_text="#FFFFFF",
+    ),
+    "emerald": NotifyColorSpec(
+        key="emerald",
+        name="Esmeralda",
+        badge_bg="#10B981",
+        border="#34D399",
+        hover_border="#6EE7B7",
+        tint_rgba="rgba(16, 185, 129, 36)",
+        hover_tint_rgba="rgba(16, 185, 129, 56)",
+        badge_text="#0B0C0E",
+    ),
+    "amber": NotifyColorSpec(
+        key="amber",
+        name="Ámbar",
+        badge_bg="#F59E0B",
+        border="#FBBF24",
+        hover_border="#FDE68A",
+        tint_rgba="rgba(245, 158, 11, 36)",
+        hover_tint_rgba="rgba(245, 158, 11, 56)",
+        badge_text="#0B0C0E",
+    ),
+    "silver": NotifyColorSpec(
+        key="silver",
+        name="Plateado",
+        badge_bg="#CFD5DF",
+        border="#E4E8EE",
+        hover_border="#FFFFFF",
+        tint_rgba="rgba(207, 213, 223, 32)",
+        hover_tint_rgba="rgba(207, 213, 223, 50)",
+        badge_text="#0B0C0E",
+    ),
+}
+
+
+def get_notification_color(color_key: str = "purple") -> NotifyColorSpec:
+    return NOTIFICATION_COLORS.get(
+        str(color_key or "").strip().lower(), NOTIFICATION_COLORS["purple"]
+    )
+
 
 def get_theme(theme_key: str = "matte_silver") -> ThemePalette:
     return THEMES.get(theme_key, THEMES["matte_silver"])
 
 
-def build_stylesheet(theme_key: str = "matte_silver") -> str:
+def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purple") -> str:
     p = get_theme(theme_key)
+    nc = get_notification_color(notify_color)
     return f"""
     QWidget {{
         background-color: {p.base};
@@ -61,6 +153,11 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: transparent;
     }}
 
+    QTextBrowser {{
+        selection-background-color: #3B4C6B;
+        selection-color: #FFFFFF;
+    }}
+
     QSlider {{
         background-color: transparent;
     }}
@@ -72,6 +169,15 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QFrame#Sidebar {{
         background-color: {p.surface1};
         border-right: 1px solid rgba(255, 255, 255, 14);
+    }}
+
+    QScrollArea#SidebarScroll,
+    QScrollArea#TransparentScroll,
+    QWidget#SidebarViewport,
+    QWidget#SidebarNavContainer,
+    QWidget#TransparentBox {{
+        background-color: transparent;
+        border: none;
     }}
 
     QLabel#BrandTitle {{
@@ -129,12 +235,41 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         border: 1px solid transparent;
     }}
 
-    QPushButton#NavBtn[active="true"] {{
-        background-color: #1F2532;
-        color: {p.text};
-        border: 1px solid rgba(207, 213, 223, 140);
+    QPushButton#NavBtn[unread="true"] {{
+        background-color: {nc.tint_rgba};
+        color: #FFFFFF;
+        border: 1px solid {nc.border};
         border-radius: 10px;
-        font-weight: 600;
+        font-weight: 700;
+    }}
+
+    QPushButton#NavBtn[unread="true"]:hover {{
+        background-color: {nc.hover_tint_rgba};
+        border-color: {nc.hover_border};
+    }}
+
+    QPushButton#NavBtn[active="true"] {{
+        background-color: #2D3647;
+        color: {p.text};
+        border: 1px solid {p.accent};
+        border-radius: 10px;
+        font-weight: 700;
+    }}
+
+    QPushButton#NavBtn[active="true"]:hover {{
+        background-color: #384358;
+        border-color: {p.accent_hover};
+    }}
+
+    QLabel#UnreadBadge {{
+        background-color: {nc.badge_bg};
+        color: {nc.badge_text};
+        border: none;
+        border-radius: 8px;
+        padding: 1px 6px;
+        min-width: 14px;
+        font-size: 10px;
+        font-weight: 700;
     }}
 
     QFrame#ResourceMonitorCard {{
@@ -214,6 +349,12 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         background-color: #2D3647;
         color: {p.text};
         border: 1px solid {p.accent};
+        font-weight: 700;
+    }}
+
+    QPushButton:checked:hover {{
+        background-color: #384358;
+        border-color: {p.accent_hover};
     }}
 
     QPushButton:disabled {{
@@ -286,9 +427,14 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     }}
 
     QPushButton#IconBtn[active="true"] {{
-        background-color: {p.surface2};
+        background-color: #2D3647;
         border: 1px solid {p.accent};
-        color: {p.accent};
+        color: {p.text};
+    }}
+
+    QPushButton#IconBtn[active="true"]:hover {{
+        background-color: #384358;
+        border-color: {p.accent_hover};
     }}
 
     QPushButton#PillBtn {{
@@ -603,10 +749,18 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     }}
 
     QTabBar::tab:selected {{
-        background-color: #2A3242;
+        background-color: #2D3647;
         color: {p.text};
         border: 1px solid {p.accent};
-        font-weight: 600;
+        font-weight: 700;
+    }}
+
+    QListWidget::item:selected {{
+        background-color: #2D3647;
+        color: {p.text};
+        border: 1px solid {p.accent};
+        border-radius: 7px;
+        font-weight: 700;
     }}
 
     QMenu {{
@@ -625,6 +779,8 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     QMenu::item:selected {{
         background-color: #2D3647;
         color: {p.text};
+        border: 1px solid rgba(207, 213, 223, 120);
+        font-weight: 600;
     }}
 
     QToolTip {{
@@ -644,14 +800,20 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
         font-weight: 500;
     }}
 
-    QLabel#LiveBadge {{
-        background-color: rgba(239, 68, 68, 28);
+    QLabel#LiveBadge, QPushButton#LiveBadge {{
+        background-color: rgba(239, 68, 68, 32);
         color: #F87171;
-        border: 1px solid rgba(239, 68, 68, 72);
+        border: 1px solid rgba(239, 68, 68, 95);
         border-radius: 10px;
-        padding: 2px 9px;
-        font-size: 10px;
+        padding: 3px 10px;
+        font-size: 10.5px;
         font-weight: 700;
+    }}
+
+    QPushButton#LiveBadge:hover {{
+        background-color: rgba(239, 68, 68, 56);
+        color: #FCA5A5;
+        border-color: #F87171;
     }}
 
     QFrame#DiscordVoiceHeader {{
@@ -729,6 +891,11 @@ def build_stylesheet(theme_key: str = "matte_silver") -> str:
     }}
 
     QFrame#DiscordChannelRow:hover {{
+        border-color: {p.border_bright};
+    }}
+
+    QFrame#DiscordChannelRow[clickable="true"]:hover {{
+        background-color: #202736;
         border-color: {p.border_bright};
     }}
 

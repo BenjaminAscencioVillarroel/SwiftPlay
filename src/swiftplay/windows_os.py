@@ -8,6 +8,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -429,9 +430,10 @@ def get_process_ram_mb() -> float:
     return get_process_memory_mb()[0]
 
 
-def trim_process_memory() -> None:
+def trim_process_memory(*, collect_gc: bool = True) -> None:
     """Libera objetos Python sin usar y compacta el working set del proceso en Windows."""
-    gc.collect()
+    if collect_gc:
+        gc.collect()
     if sys.platform != "win32":
         return
     try:
@@ -779,5 +781,162 @@ def is_win32_disabled_parent_click(message: object) -> bool:
         hit = int(msg.lParam) & 0xFFFF
         mouse_msg = (int(msg.lParam) >> 16) & 0xFFFF
         return hit == 0xFFFE and mouse_msg in (0x0201, 0x0204, 0x0207)
+    except Exception:
+        return False
+
+
+def _prepend_env_paths(env: dict[str, str], var_name: str, paths: list[str]) -> None:
+    cur = [p for p in env.get(var_name, "").split(os.pathsep) if p]
+    merged: list[str] = []
+    seen: set[str] = set()
+    for p in [*paths, *cur]:
+        norm = os.path.normcase(os.path.normpath(p))
+        if p and norm not in seen:
+            seen.add(norm)
+            merged.append(p)
+    if merged:
+        env[var_name] = os.pathsep.join(merged)
+
+
+def resolve_worker_python_and_env(app_root: Path = APP_ROOT) -> tuple[str, dict[str, str]]:
+    """Resuelve pythonw.exe unificado y entorno .venv para agrupar workers bajo la GUI en Windows."""
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+
+    src_dir = app_root / "src"
+    venv_dir: Path | None = None
+    for cand in (
+        Path(sys.executable).parent.parent,
+        Path(sys.executable).resolve().parent.parent,
+        app_root / ".venv",
+    ):
+        if (cand / "pyvenv.cfg").exists():
+            venv_dir = cand
+            break
+
+    py_paths: list[str] = [str(src_dir)]
+    has_site = False
+    if venv_dir is not None:
+        env["VIRTUAL_ENV"] = str(venv_dir)
+        scripts_dir = venv_dir / "Scripts"
+        if scripts_dir.exists():
+            _prepend_env_paths(env, "PATH", [str(scripts_dir)])
+        site_pkgs = venv_dir / "Lib" / "site-packages"
+        if site_pkgs.exists():
+            py_paths.append(str(site_pkgs))
+            has_site = True
+    _prepend_env_paths(env, "PYTHONPATH", py_paths)
+
+    if sys.platform != "win32":
+        return sys.executable, env
+
+    base_exe = Path(getattr(sys, "_base_executable", sys.executable))
+    candidates: list[Path] = []
+    if has_site or venv_dir is None:
+        candidates.append(base_exe.with_name("pythonw.exe"))
+    candidates.append(Path(sys.executable).with_name("pythonw.exe"))
+    for cand_pyw in candidates:
+        if cand_pyw.exists():
+            return str(cand_pyw), env
+    return sys.executable, env
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+_CHILD_JOB_LOCK = threading.Lock()
+_CHILD_JOB_HANDLE: int = 0
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+
+def _ensure_child_job_handle() -> int:
+    global _CHILD_JOB_HANDLE
+    if sys.platform != "win32":
+        return 0
+    with _CHILD_JOB_LOCK:
+        if _CHILD_JOB_HANDLE:
+            return _CHILD_JOB_HANDLE
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            k32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            k32.SetInformationJobObject.restype = wintypes.BOOL
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.CloseHandle.restype = wintypes.BOOL
+
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return 0
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(
+                job,
+                9,  # JobObjectExtendedLimitInformation
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            ):
+                k32.CloseHandle(job)
+                return 0
+            _CHILD_JOB_HANDLE = int(job)
+            return _CHILD_JOB_HANDLE
+        except Exception:
+            return 0
+
+
+def assign_process_to_child_job(proc: subprocess.Popen[Any]) -> bool:
+    """Vincula un subproceso al Job Object del padre (cierre automático al finalizar tarea)."""
+    if sys.platform != "win32" or proc is None:
+        return False
+    job = _ensure_child_job_handle()
+    if not job:
+        return False
+    handle = getattr(proc, "_handle", None)
+    if not handle:
+        return False
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        return bool(k32.AssignProcessToJobObject(wintypes.HANDLE(job), wintypes.HANDLE(int(handle))))
     except Exception:
         return False

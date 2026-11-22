@@ -16,7 +16,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPointF, QPropertyAnimation, QSize, Qt, QTimer  # noqa: E402
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPointF, QPropertyAnimation, QSize, Qt, QTimer, QUrl  # noqa: E402
 from PySide6.QtGui import QImage, QMouseEvent, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton  # noqa: E402
 
@@ -118,17 +118,21 @@ def test_storage_config_themes() -> None:
         assert cfg.auto_pause_other_player is True, "Auto-pausa (Modo A) debe iniciar en True"
         assert cfg.video_speed == 1.0
         assert cfg.theme == "matte_silver"
+        assert cfg.discord_notify_color == "purple"
 
         cfg.music_download_dir = str(Path(tmp) / "MiMusicaDL")
         cfg.video_download_dir = str(Path(tmp) / "MiVideoDL")
         cfg.discord_hidden_channels = [" 101 ", "101", "202"]
         cfg.discord_hidden_channel_names = {"101": "🔊 Sala", "999": "Ignorado"}
+        cfg.discord_overlay_x = 320
+        cfg.discord_overlay_y = 180
         save_config(cfg, cfg_path)
         cfg2 = load_config(cfg_path)
         assert cfg2.music_download_dir == cfg.music_download_dir
         assert cfg2.video_download_dir == cfg.video_download_dir
         assert cfg2.discord_hidden_channels == ["101", "202"]
         assert cfg2.discord_hidden_channel_names == {"101": "🔊 Sala"}
+        assert cfg2.discord_overlay_x == 320 and cfg2.discord_overlay_y == 180
 
         db = LocalLibrary(Path(tmp) / "library.db")
         v = MediaItem("vid1", "Video Test", "Canal Test", "5:10", 310, "", "video")
@@ -195,10 +199,13 @@ def test_storage_config_themes() -> None:
         assert tw_fav.normalized_thumb().startswith("https://static-cdn.jtvnw.net/")
         db.add_twitch_favorite(tw_fav)
         assert db.is_twitch_favorite("ibai")
+        assert "ibai" in db.list_twitch_favorite_ids()
         assert db.count_twitch_favorites() == 1
         assert [x.video_id for x in db.list_twitch_favorites()] == ["ibai"]
         db.remove_twitch_favorite("ibai")
         assert db.count_twitch_favorites() == 0
+        assert isinstance(db.list_watch_later_ids(), set)
+        assert isinstance(db.list_my_music_ids(), set)
 
         # Persistencia local de DMs de Discord
         db.upsert_discord_dm_thread("u99", "Carlos", "", "hola")
@@ -287,6 +294,9 @@ def test_storage_config_themes() -> None:
     assert "matte_silver" in THEMES
     qss = build_stylesheet("matte_silver")
     assert len(qss) > 500
+    assert "#8B5CF6" in qss, "Color de notificación por defecto debe ser morado (#8B5CF6)"
+    qss_pink = build_stylesheet("matte_silver", notify_color="pink")
+    assert "#EC4899" in qss_pink, "Paleta rosa de notificaciones debe reflejarse en QSS"
     assert "PlayAccentBtn" in qss, "Falta regla dedicada PlayAccentBtn en QSS"
     assert "QFrame#PlayerBar QWidget" not in qss, "No debe existir regla 'QFrame#PlayerBar QWidget' que rompa PlayAccentBtn"
     assert "border-left: 3px" not in qss, "NavBtn activo debe usar borde redondeado uniforme sin esquinas de 90 grados"
@@ -302,6 +312,12 @@ def test_storage_config_themes() -> None:
     assert "border-radius: 16px" in play_section, "PlayAccentBtn debe usar border-radius: 16px"
     pill_active_section = qss.split('QPushButton#PillBtn[active="true"] {')[1].split("}")[0]
     assert "#F1F3F6" in pill_active_section, "PillBtn activo debe usar texto claro (#F1F3F6) legible"
+    nav_active_section = qss.split('QPushButton#NavBtn[active="true"] {')[1].split("}")[0]
+    assert "#2D3647" in nav_active_section and "#F1F3F6" in nav_active_section
+    tab_active_section = qss.split("QTabBar::tab:selected {")[1].split("}")[0]
+    assert "#2D3647" in tab_active_section and "#F1F3F6" in tab_active_section
+    for extra_sel in ("QLabel#UnreadBadge", "QPushButton#LiveBadge", "QListWidget::item:selected"):
+        assert extra_sel in qss, f"Falta selector {extra_sel} en QSS"
     for hx in expected_tokens:
         assert hx in qss, f"Falta color {hx} en tema matte_silver"
 
@@ -489,19 +505,14 @@ def test_gui_and_libmpv_smoke(
         sub_val = win.video_player.get_property("sub")
         assert sub_val in ("no", False), f"Subtítulos deben estar desactivados (sub={sub_val!r})"
 
-        # Verificar modo teatro animado (ocultar/mostrar barra lateral) y restauración de tamaño tras fullscreen
+        # Verificar modo teatro instantáneo (ocultar/mostrar barra lateral) y restauración de tamaño tras fullscreen
+        assert not hasattr(win, "sidebar_wrap") and not hasattr(win, "_sidebar_anim")
         assert win.sidebar.isVisible() and not win.video_panel._is_theater
         win.toggle_sidebar()
-        deadline_sb = time.monotonic() + 1.0
-        while win.sidebar.isVisible() and time.monotonic() < deadline_sb:
-            app.processEvents()
-            time.sleep(0.01)
+        app.processEvents()
         assert not win.sidebar.isVisible() and win.video_panel._is_theater
         win.toggle_sidebar()
-        deadline_sb2 = time.monotonic() + 1.0
-        while not win.sidebar.isVisible() and time.monotonic() < deadline_sb2:
-            app.processEvents()
-            time.sleep(0.01)
+        app.processEvents()
         assert win.sidebar.isVisible() and not win.video_panel._is_theater
 
         win.resize(1040, 680)
@@ -713,6 +724,34 @@ def test_gui_and_libmpv_smoke(
         assert win.fs_overlay.dl_btn.isHidden()
         assert win.bb_deck_tag.text() == "EN VIVO"
         assert win.bb_seek.isHidden() and win.bb_dl.isHidden()
+        assert isinstance(win.video_panel.live_badge, QPushButton)
+        assert isinstance(win.fs_overlay.live_badge, QPushButton)
+        assert "Ir al vivo" in win.video_panel.reload_live_btn.text()
+        assert "Ir al vivo" in win.fs_overlay.reload_live_btn.text()
+
+        ytlive_demo = MediaItem("ytlive_demo", "YT Directo", "Canal", "EN VIVO", 0, "", "video", is_live=True)
+        win._video_item = ytlive_demo
+        win.video_panel.set_item(ytlive_demo, False)
+        win.video_panel.set_live_mode(True, is_twitch=False)
+        win.fs_overlay.set_item(ytlive_demo, False)
+        win.fs_overlay.set_live_mode(True, is_twitch=False)
+        win._sync_bottom_bar()
+        assert not win.video_panel.live_badge.isHidden()
+        assert not win.video_panel.reload_live_btn.isHidden()
+        assert not win.video_panel.seek_slider.isHidden()
+        assert not win.video_panel.pos_lbl.isHidden()
+        assert not win.video_panel.dur_lbl.isHidden()
+        assert not win.video_panel.speed_combo.isHidden()
+        assert win.video_panel.dl_btn.isHidden()
+        assert not win.fs_overlay.live_badge.isHidden()
+        assert not win.fs_overlay.reload_live_btn.isHidden()
+        assert not win.fs_overlay.seek_slider.isHidden()
+        assert not win.fs_overlay.speed_combo.isHidden()
+        assert win.fs_overlay.dl_btn.isHidden()
+        assert win.bb_deck_tag.text() == "EN VIVO"
+        assert not win.bb_seek.isHidden()
+        assert win.bb_dl.isHidden()
+        assert "Cerrar directo" in win.close_media_btn.text()
 
         vod_demo = MediaItem("vod_demo", "VOD Demo", "Canal", "3:00", 180, "", "video")
         win._video_item = vod_demo
@@ -732,6 +771,72 @@ def test_gui_and_libmpv_smoke(
         assert win.fs_overlay.play_btn.width() >= 34 and win.fs_overlay.play_btn.height() >= 34
         assert win.mini_bar.play_btn.width() >= 34 and win.mini_bar.play_btn.height() >= 34
 
+        # Directo YT con offset horario real (~5h transcurridas sobre DVR ~2h) + VideoSurface D3D11 + shimmers + containers fijos
+        live_5h = MediaItem("yt_live_5h", "Directo 5h", "Streamer", "EN VIVO", 0, "", "video", is_live=True)
+        win._video_item = live_5h
+        win._video_live_start_ts = time.time() - 18000.0
+        off_5h = win._compute_live_display_offset(7200.0)
+        assert 10790.0 <= off_5h <= 10815.0, f"Offset inesperado para directo 5h: {off_5h}"
+        win.video_panel.set_live_mode(True, is_twitch=False)
+        win.fs_overlay.set_live_mode(True, is_twitch=False)
+        win.video_panel.set_live_display_offset(off_5h)
+        win.fs_overlay.set_live_display_offset(off_5h)
+        win.video_panel.set_duration(7200.0)
+        win.fs_overlay.set_duration(7200.0)
+        win.video_panel.set_position(7198.0)
+        win.fs_overlay.set_position(7198.0)
+        assert win.video_panel.dur_lbl.text().startswith("5:00:"), win.video_panel.dur_lbl.text()
+        assert win.video_panel.pos_lbl.text().startswith("4:59:5"), win.video_panel.pos_lbl.text()
+        assert win.video_panel.seek_slider.value() >= 990
+        win._update_bb_position(7198.0, 7200.0)
+        assert win.bb_pos.text().startswith("4:59:5"), win.bb_pos.text()
+
+        vs = win.video_panel.video_surface
+        assert vs.testAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        assert vs.testAttribute(Qt.WidgetAttribute.WA_PaintOnScreen)
+        assert not vs.autoFillBackground()
+        assert vs.paintEngine() is None
+        assert hasattr(vs, "force_native_redraw")
+        assert win.sidebar.width() == 220 and win.bottom_bar.height() == 74
+        assert len(win._page_shimmers) >= 6 and all(not sh._active for sh in win._page_shimmers)
+
+        win._video_live_start_ts = 0.0
+        win._video_item = vod_demo
+        win.video_panel.set_live_mode(False, is_twitch=False)
+        win.fs_overlay.set_live_mode(False, is_twitch=False)
+        win._sync_bottom_bar()
+
+        # Verificar prioridad contextual de barra inferior (Video en páginas de video, Música en páginas de música)
+        prev_mus_item = win._music_item
+        prev_mus_paused = win._music_paused
+        win._music_item = MediaItem("mus_ctx", "Pista Activa", "Artista", "3:10", 190, "", "music")
+        win._music_paused = False
+        win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+        assert win._get_bottom_bar_deck() == "video", "En Inicio Video debe mostrarse el deck de Video en barra inferior"
+        win._switch_page(MainWindow.PAGE_MUSIC_SEARCH)
+        assert win._get_bottom_bar_deck() == "music", "En Música debe mostrarse el deck de Música en barra inferior"
+
+        # Verificar que 'Volver' en Video regrese a la pestaña real desde donde se entró (no anclado a Historial)
+        win._video_return_page = MainWindow.PAGE_HISTORY
+        win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+        win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
+        win._on_video_panel_back()
+        assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH, (
+            f"Volver de video debía regresar a Inicio (0), regresó a {win.stack.currentIndex()}"
+        )
+        win._switch_page(MainWindow.PAGE_WATCH_LATER)
+        win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
+        win._on_video_panel_back()
+        assert win.stack.currentIndex() == MainWindow.PAGE_WATCH_LATER
+        win._music_item = prev_mus_item
+        win._music_paused = prev_mus_paused
+        win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+        win._sync_bottom_bar()
+
+        # ThumbnailCache en modo sin recorte (crop=False) debe generar clave distinta *_fit
+        fit_key = win.thumb_cache._make_key("https://cdn.example/a.png", QSize(260, 200), False, radius=8, crop=False)
+        assert fit_key.endswith("|r8_fit"), fit_key
+
         card_norm = VideoGridCard(
             MediaItem("vnorm1", "Video Con Duración", "Autor", "12:34", 754, "", "video"),
             False,
@@ -744,8 +849,34 @@ def test_gui_and_libmpv_smoke(
             win.thumb_cache,
             win.palette,
         )
+        card_live.set_tile_width(300)
+        assert card_live.minimumHeight() >= int(round(300 * 9 / 16)) + 96
+        card_live.resize(300, card_live.minimumHeight())
+        if card_live.layout() is not None:
+            card_live.layout().activate()
+        from PySide6.QtCore import QPoint as _QP
+        from PySide6.QtWidgets import QWidget as _QW
+        thumb_bot = card_live.thumb_widget.geometry().bottom()
+        for cw in card_live.findChildren(_QW):
+            if (
+                not cw.isHidden()
+                and cw is not card_live.thumb_widget
+                and not card_live.thumb_widget.isAncestorOf(cw)
+                and not cw.isAncestorOf(card_live.thumb_widget)
+                and cw.height() > 0
+            ):
+                top_y = cw.mapTo(card_live, _QP(0, 0)).y()
+                assert top_y >= thumb_bot + 6, (
+                    f"Metadatos de tarjeta superpuestos a la miniatura ({top_y} < {thumb_bot + 6})"
+                )
+        grid_test = win.video_grid
+        grid_test.set_items_widgets([card_norm, card_live], hint_width=1000)
+        assert grid_test._last_cols >= 2
+        grid_test.clear_widgets()
         assert card_norm.thumb_widget._duration_text == "12:34"
         assert card_live.thumb_widget._duration_text == "EN VIVO"
+        assert hasattr(win.video_player, "refresh_video_output")
+        win.video_player.refresh_video_output()
         card_norm.release_resources()
         card_live.release_resources()
         card_norm.deleteLater()
@@ -902,7 +1033,10 @@ def test_gui_and_libmpv_smoke(
             "No debe existir botón de ajustes interno dentro de la interfaz de Discord"
         )
         assert dp.members_card.isHidden(), "El panel de miembros debe iniciar oculto por defecto"
-        assert dp.audio_advanced_box.isHidden(), "El cajón de audio avanzado debe iniciar oculto por defecto"
+        assert not hasattr(dp, "audio_toggle_btn") and not hasattr(dp, "mute_btn"), (
+            "La barra DiscordDeckCard inline debe haberse retirado de DiscordVoicePanel"
+        )
+        assert dp.audio_popup.isHidden(), "El popover flotante de audio debe iniciar oculto por defecto"
         assert not dp.left_card.isHidden(), "Los canales deben iniciar visibles"
         assert not dp.voice_pane.isHidden() and not dp.chat_pane.isHidden(), (
             "La vista dividida (Voz arriba + Chat abajo) debe iniciar activa por defecto"
@@ -914,10 +1048,10 @@ def test_gui_and_libmpv_smoke(
         assert not dp.members_card.isHidden()
         dp._toggle_members_panel()
         assert dp.members_card.isHidden()
-        dp._toggle_audio_drawer()
-        assert not dp.audio_advanced_box.isHidden()
-        dp._toggle_audio_drawer()
-        assert dp.audio_advanced_box.isHidden()
+        dp.toggle_audio_popover(win.discord_mini_card)
+        assert not dp.audio_popup.isHidden()
+        dp.close_audio_popover()
+        assert dp.audio_popup.isHidden()
         dp._toggle_text_channels_section()
         assert dp.text_channels_scroll.isHidden()
         dp._toggle_text_channels_section()
@@ -942,10 +1076,13 @@ def test_gui_and_libmpv_smoke(
         orig_overlay_cfg = win.cfg.discord_overlay_enabled
         orig_overlay_mode = win.cfg.discord_overlay_mode
         orig_overlay_op = win.cfg.discord_overlay_opacity
+        orig_overlay_x = win.cfg.discord_overlay_x
+        orig_overlay_y = win.cfg.discord_overlay_y
         orig_sounds_en = win.cfg.discord_sounds_enabled
         orig_sound_pack = win.cfg.discord_sound_pack
         orig_sound_vols = dict(win.cfg.discord_sound_volumes)
         orig_notify_en = win.cfg.discord_notify_chat_enabled
+        orig_notify_color = win.cfg.discord_notify_color
         orig_notify_chs = list(win.cfg.discord_notify_channels)
         orig_hidden_chs = list(win.cfg.discord_hidden_channels)
         orig_hidden_names = dict(win.cfg.discord_hidden_channel_names)
@@ -1046,6 +1183,25 @@ def test_gui_and_libmpv_smoke(
                 dp._render_participants(force=True)
                 dp._render_channels(force=True)
                 app.processEvents()
+                from PySide6.QtTest import QTest
+                from swiftplay.ui.discord_panel import _VoiceChannelRowFrame
+                vc_btns = [b.text().strip() for b in dp.vc_list_widget.findChildren(QPushButton)]
+                assert "Salir" not in vc_btns and "Entrar" not in vc_btns and "Bloq." not in vc_btns, (
+                    f"Los canales de voz no deben mostrar botones redundantes: {vc_btns}"
+                )
+                assert any(
+                    "En Voz" in lb.text() for lb in dp.vc_list_widget.findChildren(QLabel)
+                ), "El estado 'En Voz' debe seguir visible en el canal de voz conectado"
+                vc_row_hits: list[bool] = []
+                vc_row_ok = _VoiceChannelRowFrame(True)
+                vc_row_ok.join_requested.connect(lambda: vc_row_hits.append(True))
+                QTest.mouseClick(vc_row_ok, Qt.MouseButton.LeftButton)
+                vc_row_blk = _VoiceChannelRowFrame(False)
+                vc_row_blk.join_requested.connect(lambda: vc_row_hits.append(False))
+                QTest.mouseClick(vc_row_blk, Qt.MouseButton.LeftButton)
+                assert vc_row_hits == [True], f"Clic directo en canal de voz falló: {vc_row_hits}"
+                vc_row_ok.deleteLater()
+                vc_row_blk.deleteLater()
             finally:
                 app.removeEventFilter(d_watcher)
             assert not discord_popups, (
@@ -1219,6 +1375,38 @@ def test_gui_and_libmpv_smoke(
             app.processEvents()
             assert win.discord_overlay.isHidden()
 
+            # Cambio rápido de chats sin desincronizar ni sobreescribir el placeholder de DM
+            dp._active_chat_kind = "dm"
+            dp._active_chat_id = "u_fast"
+            dp._on_chat_history_loaded(
+                {
+                    "kind": "channel",
+                    "target_id": "201",
+                    "title": "#bots",
+                    "can_read": True,
+                    "can_send": True,
+                    "messages": [],
+                }
+            )
+            assert dp._active_chat_kind == "dm" and dp._active_chat_id == "u_fast", (
+                "Una respuesta tardía de otro canal no debe pisar el chat actualmente seleccionado"
+            )
+            dp._on_chat_history_loaded(
+                {
+                    "kind": "dm",
+                    "target_id": "u_fast",
+                    "title": "DM · gl0w_w",
+                    "peer_name": "gl0w_w",
+                    "can_read": True,
+                    "can_send": True,
+                    "messages": [],
+                }
+            )
+            assert dp.chat_input.placeholderText() == "Enviar mensaje directo a gl0w_w... [Enter]", (
+                dp.chat_input.placeholderText()
+            )
+            dp._remove_dm_thread_local("u_fast")
+
             # Rutas de eventos de sonido + supresión al estar ensordecido
             win.sound_fx._played_history.clear()
             win.cfg.discord_sounds_enabled = True
@@ -1277,9 +1465,14 @@ def test_gui_and_libmpv_smoke(
                 f"Historial de sonidos inesperado: {win.sound_fx._played_history!r}"
             )
 
-            # Verificar SettingsDialog (combo overlay 3 modos + acordeón colapsable de 9 sonidos)
+            # Verificar SettingsDialog (combo overlay 3 modos, paleta 7 colores y acordeón 9 sonidos)
             sd_check = SettingsDialog(win.cfg, win.yt, parent=win)
             assert sd_check.discord_overlay_mode_combo.count() == 3
+            assert len(sd_check.discord_notify_color_btns) == 7
+            sd_check._on_notify_color_selected("pink")
+            assert win.cfg.discord_notify_color == "pink"
+            sd_check._on_notify_color_selected("purple")
+            assert win.cfg.discord_notify_color == "purple"
             assert sd_check.discord_sounds_body.isHidden()
             sd_check.discord_sounds_toggle_btn.click()
             app.processEvents()
@@ -1316,6 +1509,99 @@ def test_gui_and_libmpv_smoke(
             dp._open_dm_with_user("u777", "AmigoTest")
             assert "DM guardado" in dp.chat_browser.toPlainText()
 
+            # Notificaciones visuales sin leer en canales de texto, DMs y barra lateral Discord
+            dp._unread_channels.clear()
+            dp._unread_dms.clear()
+            dp._emit_unread_count()
+            win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+            app.processEvents()
+            win.cfg.discord_notify_chat_enabled = True
+            win.cfg.discord_notify_channels = ["202"]
+            dp._on_channel_message_incoming(
+                {
+                    "guild_id": "10",
+                    "channel_id": "202",
+                    "channel_name": "offtopic",
+                    "author_name": "Socio",
+                    "preview": "Mensaje sin leer",
+                }
+            )
+            app.processEvents()
+            assert dp._unread_channels.get("202") == 1
+            assert len(dp.text_channels_scroll.findChildren(QLabel, "UnreadBadge")) >= 1
+            assert "(1)" in win.nav_discord.text()
+            assert win.nav_discord.property("unread") == "true"
+            assert bool(
+                win.discord_notif_toast.windowFlags() & Qt.WindowType.WindowDoesNotAcceptFocus
+            )
+            assert not win.discord_notif_toast.isHidden()
+            assert "SwiftPlay" in win.discord_notif_toast.header_lbl.text() and "#offtopic" in win.discord_notif_toast.header_lbl.text()
+            assert win.discord_notif_toast.author_lbl.text() == "Socio"
+
+            dp._on_dm_incoming({"user_id": "u888", "author_name": "Otro", "preview": "DM nuevo"})
+            app.processEvents()
+            assert dp._unread_dms.get("u888") == 1
+            assert "(2)" in win.nav_discord.text()
+            assert "● 1" in dp.tc_section_btn.text() and "● 1" in dp.dm_section_btn.text()
+            assert not win.discord_notif_toast.isHidden()
+            assert win.discord_notif_toast.header_lbl.text() == "SwiftPlay"
+            assert win.discord_notif_toast.author_lbl.text() == "Otro"
+            assert win.discord_notif_toast.preview_lbl.text() == "DM nuevo"
+            win._on_discord_notification_clicked(dict(win.discord_notif_toast._payload))
+            app.processEvents()
+            assert win.stack.currentIndex() == MainWindow.PAGE_DISCORD
+            assert dp._active_chat_kind == "dm" and dp._active_chat_id == "u888"
+
+            win._switch_page(MainWindow.PAGE_DISCORD)
+            dp._open_text_channel_clicked("10", "202", "offtopic")
+            dp._open_dm_with_user("u888", "Otro")
+            app.processEvents()
+            assert dp.total_unread_count() == 0
+            assert win._discord_unread_count == 0
+            assert win.nav_discord.property("unread") == "false"
+
+            # Sin estilos inline de background: transparent que anulen el relleno #2D3647
+            assert win.sidebar_scroll.viewport().styleSheet() == ""
+            assert win.sidebar_scroll.viewport().objectName() == "SidebarViewport"
+            assert dp.text_channels_scroll.styleSheet() == ""
+            assert dp.dm_channels_scroll.styleSheet() == ""
+
+            # Selección mutuamente excluyente entre Canales de Texto y Mensajes Directos (solo 1 activo)
+            active_tc = [
+                b for b in dp.text_channels_scroll.findChildren(QPushButton, "NavBtn")
+                if b.property("active") == "true"
+            ]
+            active_dm = [
+                b for b in dp.dm_channels_scroll.findChildren(QPushButton, "NavBtn")
+                if b.property("active") == "true"
+            ]
+            assert len(active_tc) == 0 and len(active_dm) == 1, (active_tc, active_dm)
+
+            dp._open_text_channel_clicked("10", "201", "bots")
+            app.processEvents()
+            active_tc2 = [
+                b for b in dp.text_channels_scroll.findChildren(QPushButton, "NavBtn")
+                if b.property("active") == "true"
+            ]
+            active_dm2 = [
+                b for b in dp.dm_channels_scroll.findChildren(QPushButton, "NavBtn")
+                if b.property("active") == "true"
+            ]
+            assert len(active_tc2) == 1 and len(active_dm2) == 0, (active_tc2, active_dm2)
+
+            # Orden de DMs estable al abrir un DM antiguo (solo sube al enviar/recibir nuevo mensaje)
+            dp._upsert_dm_thread_local("u_old", "OldUser", touch_timestamp=True)
+            time.sleep(0.02)
+            dp._upsert_dm_thread_local("u_new", "NewUser", touch_timestamp=True)
+            ids_before = [t["user_id"] for t in dp._load_dm_threads() if t["user_id"] in {"u_old", "u_new"}]
+            assert ids_before == ["u_new", "u_old"], ids_before
+            dp._open_dm_with_user("u_old", "OldUser")
+            ids_after_click = [t["user_id"] for t in dp._load_dm_threads() if t["user_id"] in {"u_old", "u_new"}]
+            assert ids_after_click == ["u_new", "u_old"], ids_after_click
+            dp._on_dm_incoming({"user_id": "u_old", "author_name": "OldUser", "preview": "Nuevo ping"})
+            ids_after_msg = [t["user_id"] for t in dp._load_dm_threads() if t["user_id"] in {"u_old", "u_new"}]
+            assert ids_after_msg == ["u_old", "u_new"], ids_after_msg
+
             # Tarjeta fija del bot Discord bajo RAM/CPU/GPU visible incluso en YouTube
             win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
             win._on_discord_state_changed_for_log(
@@ -1323,8 +1609,30 @@ def test_gui_and_libmpv_smoke(
             )
             app.processEvents()
             assert not win.discord_mini_card.isHidden() and win.discord_mini_name.text() == "TestBot"
+            assert hasattr(win, "discord_mini_audio_btn") and hasattr(win, "discord_mini_vu_bar")
+            assert hasattr(win, "discord_mini_hangup_btn")
+            assert win.discord_mini_hangup_btn.isHidden(), "Colgar solo debe mostrarse al estar en voz"
+            win._discord_in_voice = True
+            win._sync_discord_sidebar_card()
+            app.processEvents()
+            assert not win.discord_mini_hangup_btn.isHidden(), "Colgar debe mostrarse en voz"
+            assert (
+                win.discord_mini_hangup_btn.x() >= win.discord_mini_deaf_btn.x() + win.discord_mini_deaf_btn.width()
+            ), "El icono Colgar debe ubicarse a la derecha de Ensordecer"
+            win.resize(860, 560)
+            app.processEvents()
+            assert win.resource_card.height() >= win.resource_card.sizeHint().height(), (
+                "La tarjeta de recursos no debe aplastarse en 860x560 con discord_mini_card"
+            )
+            win.resize(1160, 750)
+            win._discord_in_voice = False
+            win._sync_discord_sidebar_card()
+            app.processEvents()
+            win._on_discord_mic_level_updated(65, True)
+            assert "65%" in win.discord_mini_vu_lbl.text() and win.discord_mini_vu_bar.value() == 65
             win.discord_mini_mute_btn.click()
             assert dp._muted is True
+            assert win.discord_mini_vu_bar.value() == 0
             win.discord_mini_deaf_btn.click()
             assert dp._deafened is True
             win.discord_mini_mute_btn.click()
@@ -1333,9 +1641,223 @@ def test_gui_and_libmpv_smoke(
             win._on_discord_state_changed_for_log("disconnected", {})
             app.processEvents()
             assert win.discord_mini_card.isHidden()
+
+            # Overlay movible + modo edición + adjuntos en chat Discord
+            win.discord_overlay.set_custom_position(320, 180)
+            win.discord_overlay.set_edit_mode(True)
+            app.processEvents()
+            assert win.discord_overlay._edit_mode is True
+            assert not bool(win.discord_overlay.windowFlags() & Qt.WindowType.WindowTransparentForInput)
+            assert win.discord_overlay._edit_bar is not None and win.discord_overlay._edit_bar.isVisible()
+            win.discord_overlay.set_edit_mode(False)
+            app.processEvents()
+            assert win.discord_overlay._edit_mode is False
+            assert bool(win.discord_overlay.windowFlags() & Qt.WindowType.WindowTransparentForInput)
+            assert win.discord_overlay._edit_bar is None
+            win.discord_overlay.set_custom_position(None, None)
+
+            with tempfile.TemporaryDirectory() as tmp_att:
+                sample_png = Path(tmp_att) / "test_clip.png"
+                sample_img = QImage(32, 32, QImage.Format.Format_RGBA8888)
+                sample_img.fill(0xFF8B5CF6)
+                assert sample_img.save(str(sample_png), "PNG")
+                dp._add_pending_attachments([str(sample_png)], is_temp=False)
+                assert len(dp._pending_attachments) == 1 and not dp.chat_pending_bar.isHidden()
+                dp._clear_pending_attachments(delete_temp=False)
+                assert len(dp._pending_attachments) == 0 and dp.chat_pending_bar.isHidden()
+
+            dp._chat_messages.clear()
+            dp._chat_messages.append(
+                {
+                    "id": "m_att",
+                    "author_id": "2",
+                    "author_name": "NuBa",
+                    "is_self": False,
+                    "is_bot": False,
+                    "content": "Mira esto",
+                    "attachments": [
+                        {
+                            "name": "captura.png",
+                            "url": "https://cdn.example/captura.png",
+                            "content_type": "image/png",
+                            "size": 4096,
+                        },
+                        {
+                            "name": "notas.pdf",
+                            "url": "https://cdn.example/notas.pdf",
+                            "content_type": "application/pdf",
+                            "size": 10240,
+                        },
+                    ],
+                    "timestamp": "03:00",
+                    "date_label": "Hoy",
+                }
+            )
+            dp._chat_messages.append(
+                {
+                    "id": "m_self",
+                    "author_id": "1",
+                    "author_name": "TuBot",
+                    "is_self": True,
+                    "is_bot": True,
+                    "content": "Texto original",
+                    "attachments": [],
+                    "timestamp": "03:01",
+                    "date_label": "Hoy",
+                }
+            )
+            dp._active_chat_kind = "dm"
+            dp._active_chat_id = "u_old"
+            dp._active_chat_can_send = True
+            dp._active_chat_can_attach = True
+            dp._render_chat_messages(can_read=True)
+            assert len(dp._chat_attachment_refs) == 2
+            plain_chat = dp.chat_browser.toPlainText()
+            assert "captura.png" in plain_chat and "notas.pdf" in plain_chat
+            assert not any(
+                "abrir" in b.text().lower() for b in dp.chat_browser.findChildren(QPushButton)
+            ), "No deben generarse botones 'Abrir' en navegador externo"
+
+            # UI nativa estilo Discord: agrupación consecutiva + barra flotante única por hover
+            chat_rows = dp.chat_browser.message_rows()
+            assert len(chat_rows) == 2 and chat_rows[0].grouped is False
+            dp.chat_browser.hover_row(chat_rows[0])
+            app.processEvents()
+            assert not dp.chat_browser._hover_bar.isHidden()
+            assert not dp.chat_browser._hover_bar.reply_btn.isHidden()
+            assert not dp.chat_browser._hover_bar.copy_btn.isHidden()
+            assert not dp.chat_browser._hover_bar.paste_btn.isHidden()
+            assert dp.chat_browser._hover_bar.edit_btn.isHidden(), "Solo los mensajes propios deben mostrar Editar"
+
+            dp.chat_browser.hover_row(chat_rows[1])
+            app.processEvents()
+            assert not dp.chat_browser._hover_bar.edit_btn.isHidden(), "Los mensajes propios deben mostrar Editar"
+            cb_prev = QApplication.clipboard().text()
+            try:
+                QApplication.clipboard().setText("pegado desde toolbar")
+                dp.chat_input.clear()
+                dp.chat_browser._hover_bar.paste_btn.click()
+                assert "pegado desde toolbar" in dp.chat_input.text()
+                dp.chat_input.clear()
+            finally:
+                if cb_prev:
+                    QApplication.clipboard().setText(cb_prev)
+                else:
+                    QApplication.clipboard().clear()
+            dp.chat_browser.clear_hover()
+            assert dp.chat_browser._hover_bar.isHidden()
+
+            orig_chat_msgs = [dict(m) for m in dp._chat_messages]
+            base_m0 = dict(orig_chat_msgs[0])
+            base_m0["created_ts"] = 1700000000.0
+            base_m1 = dict(orig_chat_msgs[1])
+            base_m1["created_ts"] = 1700000100.0
+            grp_msg = {
+                **base_m1,
+                "id": "m_grp_1",
+                "content": "Segundo seguido",
+                "created_ts": 1700000145.0,
+                "reply_to": None,
+            }
+            rep_msg = {
+                **base_m1,
+                "id": "m_grp_rep",
+                "content": "Con respuesta",
+                "created_ts": 1700000160.0,
+                "reply_to": {"id": "m_att", "author_name": base_m0.get("author_name", "Usuario"), "content": "Mira esto"},
+            }
+            late_msg = {
+                **base_m1,
+                "id": "m_grp_late",
+                "content": "Después de 5 min",
+                "created_ts": 1700000600.0,
+                "reply_to": None,
+            }
+            dp._chat_messages = [base_m0, base_m1, grp_msg, rep_msg, late_msg]
+            dp._render_chat_messages(can_read=True)
+            grp_flags = [r.grouped for r in dp.chat_browser.message_rows()]
+            assert grp_flags == [False, False, True, False, False], f"Agrupación inesperada: {grp_flags}"
+            dp._chat_messages = orig_chat_msgs
+            dp._render_chat_messages(can_read=True)
+            app.processEvents()
+
+            # Lightbox translúcido interno sin borrar el chat y cerrable con Esc
+            dp._open_image_lightbox(dp._chat_attachment_refs[0])
+            app.processEvents()
+            assert dp._image_lightbox is not None and not dp._image_lightbox.isHidden()
+            assert "Mira esto" in dp.chat_browser.toPlainText(), "Abrir foto no debe vaciar el chat"
+            assert not any(
+                "navegador" in b.text().lower() for b in dp._image_lightbox.findChildren(QPushButton)
+            ), "El visor de imagen no debe incluir opción de navegador"
+            win._shortcut_escape()
+            app.processEvents()
+            assert dp._image_lightbox is None, "Esc debe cerrar el visor de imagen"
+
+            # Selección de texto y acciones Responder / Editar en chat
+            chat_rows = dp.chat_browser.message_rows()
+            assert chat_rows[0].body_lbl is not None
+            chat_rows[0].body_lbl.setSelection(0, 4)
+            assert chat_rows[0].selected_text() == "Mira"
+            dp._start_reply_to(dp._chat_messages[0])
+            assert dp._reply_to_message is not None and dp._reply_to_message["id"] == "m_att"
+            assert not dp.chat_context_bar.isHidden()
+            dp._cancel_chat_compose_mode()
+            assert dp._reply_to_message is None and dp.chat_context_bar.isHidden()
+
+            dp._start_edit_message(dp._chat_messages[1])
+            assert dp._editing_message_id == "m_self" and dp.chat_send_btn.text() == "Guardar"
+            dp._cancel_chat_compose_mode()
+            dp._on_chat_message_edited(
+                {
+                    "kind": "dm",
+                    "target_id": "u_old",
+                    "message_id": "m_self",
+                    "content": "Texto editado",
+                    "edited": True,
+                }
+            )
+            assert "Texto editado" in dp.chat_browser.toPlainText()
+            assert "(editado)" in dp.chat_browser.toPlainText()
+
+            # Drag & drop al chat
+            with tempfile.TemporaryDirectory() as tmp_dd:
+                drop_png = Path(tmp_dd) / "drop_file.png"
+                drop_img = QImage(16, 16, QImage.Format.Format_RGBA8888)
+                drop_img.fill(0xFF38BDF8)
+                assert drop_img.save(str(drop_png), "PNG")
+                added_cnt = dp._handle_dropped_file_paths([str(drop_png)])
+                assert added_cnt == 1 and len(dp._pending_attachments) == 1
+                dp._clear_pending_attachments(delete_temp=False)
+
+            # Regla de avisos: chat cerrado o ventana sin foco deben notificar igualmente
+            win._switch_page(MainWindow.PAGE_DISCORD)
+            dp._unread_dms.clear()
+            dp._emit_unread_count()
+            dp._open_dm_with_user("u888", "Otro")
+            dp._set_pane_visible("chat", False)
+            win.discord_notif_toast.hide()
+            dp._on_dm_incoming({"user_id": "u888", "author_name": "Otro", "preview": "Chat cerrado"})
+            app.processEvents()
+            assert dp._unread_dms.get("u888") == 1 and not win.discord_notif_toast.isHidden(), (
+                "Debe avisar cuando el panel de chat está cerrado"
+            )
+            dp._set_pane_visible("chat", True)
+            dp._open_dm_with_user("u888", "Otro")
         finally:
+            dp.close_image_lightbox()
+            dp._cancel_chat_compose_mode()
+            dp.close_audio_popover()
+            dp._clear_pending_attachments(delete_temp=True)
+            win.discord_overlay.set_edit_mode(False)
             win.discord_overlay.hide()
+            win.discord_notif_toast._hide_timer.stop()
+            win.discord_notif_toast._opacity_anim.stop()
+            win.discord_notif_toast._pos_anim.stop()
+            win.discord_notif_toast.hide()
             win.db.remove_discord_dm_thread("u777")
+            win.db.remove_discord_dm_thread("u888")
+            win.db.remove_discord_dm_thread("u_old")
+            win.db.remove_discord_dm_thread("u_new")
             win._on_discord_state_changed_for_log("disconnected", {})
             dp._muted = False
             dp._deafened = False
@@ -1344,10 +1866,13 @@ def test_gui_and_libmpv_smoke(
             win.cfg.discord_overlay_enabled = orig_overlay_cfg
             win.cfg.discord_overlay_mode = orig_overlay_mode
             win.cfg.discord_overlay_opacity = orig_overlay_op
+            win.cfg.discord_overlay_x = orig_overlay_x
+            win.cfg.discord_overlay_y = orig_overlay_y
             win.cfg.discord_sounds_enabled = orig_sounds_en
             win.cfg.discord_sound_pack = orig_sound_pack
             win.cfg.discord_sound_volumes = orig_sound_vols
             win.cfg.discord_notify_chat_enabled = orig_notify_en
+            win.cfg.discord_notify_color = orig_notify_color
             win._discord_in_voice = False
             win._discord_participants = []
             win._discord_speaking = {}
@@ -1379,6 +1904,30 @@ def test_gui_and_libmpv_smoke(
             app.processEvents()
             win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
             app.processEvents()
+
+        # Verificar caché instantánea de pestañas y limpieza diferida en free_memory_now
+        win._render_video_cards(
+            [MediaItem("v_cache", "Video Caché", "Canal", "3:00", 180, "", "video")]
+        )
+        assert not win._video_page_dirty and len(win.video_grid._widgets) == 1
+        win._switch_page(MainWindow.PAGE_WATCH_LATER)
+        app.processEvents()
+        assert not win._wl_page_dirty
+        assert len(win.video_grid._widgets) == 1, "Los widgets ocultos no deben destruirse al cambiar de pestaña"
+        win._switch_page(MainWindow.PAGE_HISTORY)
+        app.processEvents()
+        assert not win._history_page_dirty
+        win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+        app.processEvents()
+        assert not win._video_page_dirty and len(win.video_grid._widgets) == 1
+        win._switch_page(MainWindow.PAGE_DISCORD)
+        app.processEvents()
+        win.free_memory_now()
+        assert win._video_page_dirty and len(win.video_grid._widgets) == 0, (
+            "free_memory_now debe liberar grillas ocultas y marcar dirty"
+        )
+        win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
+        app.processEvents()
 
         for _ in range(3):
             QTimer.singleShot(
@@ -1587,6 +2136,21 @@ def test_discord_voice_bridge() -> None:
                 assert wav_data.startswith(b"RIFF") and len(wav_data) > 1000, (ev_id, pk)
 
         if sys.platform == "win32":
+            from swiftplay.windows_os import assign_process_to_child_job, resolve_worker_python_and_env
+
+            w_exe, w_env = resolve_worker_python_and_env(ROOT)
+            assert Path(w_exe).name.lower() == "pythonw.exe", w_exe
+            assert str(ROOT / "src") in w_env.get("PYTHONPATH", "")
+            test_sub = subprocess.Popen(
+                [w_exe, "-c", "import sys"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=w_env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            assign_process_to_child_job(test_sub)
+            assert test_sub.wait(timeout=5) == 0
+
             import io
             import wave
 
@@ -1847,6 +2411,30 @@ async def _check_worker_join():
     await app._leave_channel_internal()
     assert stale_vc.disconnected is True
 
+    # Serialización de respuestas y mensajes editados en discord_worker
+    from datetime import datetime
+    from swiftplay.discord_worker import _serialize_chat_message
+
+    orig_ref_msg = SimpleNamespace(
+        id=9001,
+        author=SimpleNamespace(id=2, display_name="NuBa", name="NuBa", bot=False),
+        content="Mensaje previo de prueba",
+        attachments=[],
+    )
+    reply_msg = SimpleNamespace(
+        id=9002,
+        author=SimpleNamespace(id=1, display_name="TuBot", name="TuBot", bot=True),
+        content="Respuesta editada",
+        attachments=[],
+        created_at=datetime.now(),
+        edited_at=datetime.now(),
+        reference=SimpleNamespace(message_id=9001, resolved=orig_ref_msg),
+    )
+    ser = _serialize_chat_message(reply_msg, bot_id=1)
+    assert ser["is_self"] is True and ser["edited"] is True
+    assert ser["reply_to"] is not None and ser["reply_to"]["author_name"] == "NuBa"
+    assert float(ser.get("created_ts") or 0.0) > 0.0, "created_ts debe serializarse para agrupar mensajes"
+
 asyncio.run(_check_worker_join())
 
 # Caso E: Supresión neuronal estilo Krisp (DeepFilterNet3 + Silero VAD) y modo estándar WebRTC
@@ -1920,6 +2508,8 @@ assert click_speaking is False, "Clics de teclado y ruido ambiente no deben abri
 assert mean_proc_ms < 15.0, f"Tiempo medio por frame demasiado alto para tiempo real: {mean_proc_ms:.2f} ms"
 ws_ai, priv_ai = _get_mem_mb()
 print(f"DF_AI_OK mean_ms={mean_proc_ms:.2f} ws={ws_ai:.1f} priv={priv_ai:.1f}")
+ai_proc.release_dsp()
+assert ai_proc._df_dsp._df_state is None and ai_proc._df_dsp._silero._vad is None
 ai_proc.close()
 
 # Señal modulada de voz + ruido en modo ai
@@ -2010,12 +2600,24 @@ msg_obj = SimpleNamespace(
     id=9991,
     author=SimpleNamespace(id=55, display_name="Pablo", bot=False),
     content="Hola equipo",
-    attachments=[SimpleNamespace(filename="clip.png", url="https://cdn.example/clip.png")],
+    attachments=[
+        SimpleNamespace(
+            filename="clip.png",
+            url="https://cdn.example/clip.png",
+            proxy_url="https://media.example/clip.png",
+            content_type="image/png",
+            size=2048,
+            width=800,
+            height=600,
+        )
+    ],
     created_at=datetime.now(timezone.utc),
 )
 msg_dict = _serialize_chat_message(msg_obj, bot_id=55)
 assert msg_dict["is_self"] is True and msg_dict["author_name"] == "Pablo"
 assert msg_dict["attachments"][0]["name"] == "clip.png"
+assert msg_dict["attachments"][0]["content_type"] == "image/png"
+assert msg_dict["attachments"][0]["size"] == 2048
 assert len(msg_dict["timestamp"]) == 5 and ":" in msg_dict["timestamp"]
 assert msg_dict["date_label"] == "Hoy"
 assert "avatar_url" in serialized_members[0] and "author_avatar_url" in msg_dict

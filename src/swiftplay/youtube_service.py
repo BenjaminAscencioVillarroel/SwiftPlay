@@ -1109,6 +1109,14 @@ class YouTubeService:
         for k in expired:
             self._stream_cache.pop(k, None)
 
+    def invalidate_stream_cache(self, video_id: str) -> None:
+        if not video_id:
+            return
+        with self._stream_lock:
+            keys = [k for k in self._stream_cache if k[0] == video_id]
+            for k in keys:
+                self._stream_cache.pop(k, None)
+
     def has_cached_stream(
         self, video_id: str, audio_only: bool, quality: str = "720p"
     ) -> bool:
@@ -1198,15 +1206,18 @@ class YouTubeService:
                 author=str(data.get("author") or ""),
                 thumb_url=str(data.get("thumb_url") or ""),
                 video_enabled=bool(data.get("video_enabled", not audio_only)),
+                is_live=bool(data.get("is_live", False)),
+                live_start_ts=float(data.get("live_start_ts") or 0.0),
             )
             res_box[0] = resolved
-            now = time.monotonic()
-            with self._stream_lock:
-                self._prune_expired_streams_locked(now)
-                self._stream_cache[key] = (now, resolved)
-                self._stream_cache.move_to_end(key)
-                while len(self._stream_cache) > self._STREAM_CACHE_MAX:
-                    self._stream_cache.popitem(last=False)
+            if not resolved.is_live:
+                now = time.monotonic()
+                with self._stream_lock:
+                    self._prune_expired_streams_locked(now)
+                    self._stream_cache[key] = (now, resolved)
+                    self._stream_cache.move_to_end(key)
+                    while len(self._stream_cache) > self._STREAM_CACHE_MAX:
+                        self._stream_cache.popitem(last=False)
             return resolved
         except Exception as exc:
             err_box[0] = exc

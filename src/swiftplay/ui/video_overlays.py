@@ -265,6 +265,7 @@ class FullscreenOverlayBar(QWidget):
         super().__init__(parent)
         self._palette = palette
         self._duration = 0.0
+        self._live_display_offset = 0.0
         self._seeking = False
         self._is_paused = True
         self._in_watch_later = False
@@ -296,8 +297,11 @@ class FullscreenOverlayBar(QWidget):
         # Fila 1: Badge en vivo + Título + tiempo/viewers
         top_row = QHBoxLayout()
         top_row.setSpacing(10)
-        self.live_badge = QLabel("● EN VIVO")
+        self.live_badge = QPushButton("● EN VIVO")
         self.live_badge.setObjectName("LiveBadge")
+        self.live_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.live_badge.setToolTip("Ir al momento real del directo (En vivo)")
+        self.live_badge.clicked.connect(self.reload_live_requested.emit)
         self.live_badge.setVisible(False)
         top_row.addWidget(self.live_badge)
 
@@ -379,10 +383,9 @@ class FullscreenOverlayBar(QWidget):
         self.wl_btn.clicked.connect(self.watch_later_toggled.emit)
         btn_row.addWidget(self.wl_btn)
 
-        self.reload_live_btn = QPushButton()
-        self.reload_live_btn.setObjectName("IconBtn")
-        self.reload_live_btn.setFixedSize(30, 30)
-        self.reload_live_btn.setToolTip("Sincronizar con el directo")
+        self.reload_live_btn = QPushButton(" Ir al vivo")
+        self.reload_live_btn.setObjectName("PillBtn")
+        self.reload_live_btn.setToolTip("Ir al momento real del directo (En vivo)")
         self.reload_live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reload_live_btn.setVisible(False)
         self.reload_live_btn.clicked.connect(self.reload_live_requested.emit)
@@ -423,7 +426,7 @@ class FullscreenOverlayBar(QWidget):
 
     def reveal(self, screen_rect: QRect) -> None:
         w = min(max(660, screen_rect.width() - 80), 980)
-        h = 78 if self._is_live_mode else 98
+        h = 78 if (self._is_live_mode and self._is_twitch) else 98
         self.setFixedSize(w, h)
         x = screen_rect.center().x() - w // 2
         y = screen_rect.bottom() - self.height() - 22
@@ -550,8 +553,9 @@ class FullscreenOverlayBar(QWidget):
     def _on_seek_moved(self, val: int) -> None:
         if self._duration > 0:
             pos = (val / 1000.0) * self._duration
+            off = self._live_display_offset if (self._is_live_mode and not self._is_twitch) else 0.0
             self.time_lbl.setText(
-                f"{format_duration(pos) or '0:00'} / {format_duration(self._duration) or '0:00'}"
+                f"{format_duration(pos + off) or '0:00'} / {format_duration(self._duration + off) or '0:00'}"
             )
             if not self._seeking:
                 self.seek_requested.emit(pos)
@@ -593,19 +597,26 @@ class FullscreenOverlayBar(QWidget):
         self.title_lbl.setText(txt)
         self.set_watch_later(in_watch_later)
 
+    def set_live_display_offset(self, offset: float) -> None:
+        self._live_display_offset = max(0.0, float(offset or 0.0))
+
     def set_duration(self, duration: float) -> None:
         self._duration = max(0.0, duration)
-        self.time_lbl.setText(f"0:00 / {format_duration(self._duration) or '0:00'}")
+        off = self._live_display_offset if (self._is_live_mode and not self._is_twitch) else 0.0
+        self.time_lbl.setText(
+            f"{format_duration(off) or '0:00'} / {format_duration(self._duration + off) or '0:00'}"
+        )
 
     def set_position(self, pos: float) -> None:
         if self._seeking or self._duration <= 0:
             return
+        off = self._live_display_offset if (self._is_live_mode and not self._is_twitch) else 0.0
         ratio = max(0.0, min(1.0, pos / self._duration))
         self.seek_slider.blockSignals(True)
         self.seek_slider.setValue(int(ratio * 1000))
         self.seek_slider.blockSignals(False)
         self.time_lbl.setText(
-            f"{format_duration(pos) or '0:00'} / {format_duration(self._duration) or '0:00'}"
+            f"{format_duration(pos + off) or '0:00'} / {format_duration(self._duration + off) or '0:00'}"
         )
 
     def set_paused(self, paused: bool) -> None:
@@ -667,17 +678,25 @@ class FullscreenOverlayBar(QWidget):
     ) -> None:
         self._is_live_mode = bool(is_live)
         self._is_twitch = bool(is_twitch)
+        if not self._is_live_mode or self._is_twitch:
+            self._live_display_offset = 0.0
+        hide_timeline = self._is_live_mode and self._is_twitch
         self.live_badge.setVisible(self._is_live_mode)
-        self.seek_slider.setVisible(not self._is_live_mode)
-        self.speed_combo.setVisible(not self._is_live_mode)
+        self.seek_slider.setVisible(not hide_timeline)
+        self.speed_combo.setVisible(not hide_timeline)
         self.dl_btn.setVisible(not self._is_live_mode)
         self.reload_live_btn.setVisible(self._is_live_mode)
-        if self._is_live_mode:
+        if hide_timeline:
+            self._duration = 0.0
             self.time_lbl.setText(viewers_text)
             self.time_lbl.setVisible(bool(viewers_text))
         else:
-            self._duration = 0.0
-            self.time_lbl.setText("0:00 / 0:00")
+            if not self._is_live_mode:
+                self._duration = 0.0
+            off = self._live_display_offset if self._is_live_mode else 0.0
+            cur_txt = format_duration(off) or "0:00"
+            dur_txt = format_duration(self._duration + off) or "0:00"
+            self.time_lbl.setText(f"{cur_txt} / {dur_txt}")
             self.time_lbl.setVisible(True)
         self.set_watch_later(self._in_watch_later)
 

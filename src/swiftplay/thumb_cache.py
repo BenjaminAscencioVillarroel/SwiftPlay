@@ -10,7 +10,7 @@ from requests.adapters import HTTPAdapter
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, Signal
 from PySide6.QtGui import QImage, QPainter, QPainterPath, QPixmap
 
-_MAX_IMAGE_BYTES = 4 * 1024 * 1024
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024
 _http_local = threading.local()
 
 
@@ -40,6 +40,7 @@ class _ThumbFetchTask(QRunnable):
         is_current_fn=None,
         circular: bool = False,
         radius: int = 0,
+        crop: bool = True,
     ) -> None:
         super().__init__()
         self.key = key
@@ -49,6 +50,7 @@ class _ThumbFetchTask(QRunnable):
         self.is_current_fn = is_current_fn
         self.circular = circular
         self.radius = max(0, int(radius))
+        self.crop = bool(crop)
         self.signals = _ThumbSignals()
 
     def _still_current(self) -> bool:
@@ -90,24 +92,37 @@ class _ThumbFetchTask(QRunnable):
 
             img = QImage()
             if img.loadFromData(data):
-                scaled = img.scaled(
-                    self.target_size,
-                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                if (
-                    scaled.width() > self.target_size.width()
-                    or scaled.height() > self.target_size.height()
-                ):
-                    x = max(0, (scaled.width() - self.target_size.width()) // 2)
-                    y = max(0, (scaled.height() - self.target_size.height()) // 2)
-                    scaled = scaled.copy(
-                        x, y, self.target_size.width(), self.target_size.height()
+                if self.crop:
+                    scaled = img.scaled(
+                        self.target_size,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation,
                     )
+                    if (
+                        scaled.width() > self.target_size.width()
+                        or scaled.height() > self.target_size.height()
+                    ):
+                        x = max(0, (scaled.width() - self.target_size.width()) // 2)
+                        y = max(0, (scaled.height() - self.target_size.height()) // 2)
+                        scaled = scaled.copy(
+                            x, y, self.target_size.width(), self.target_size.height()
+                        )
+                else:
+                    if (
+                        img.width() > self.target_size.width()
+                        or img.height() > self.target_size.height()
+                    ):
+                        scaled = img.scaled(
+                            self.target_size,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    else:
+                        scaled = img
 
                 if self.circular:
-                    w = self.target_size.width()
-                    h = self.target_size.height()
+                    w = scaled.width() if not self.crop else self.target_size.width()
+                    h = scaled.height() if not self.crop else self.target_size.height()
                     circ = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
                     circ.fill(Qt.GlobalColor.transparent)
                     painter = QPainter(circ)
@@ -120,8 +135,8 @@ class _ThumbFetchTask(QRunnable):
                     painter.end()
                     scaled = circ
                 elif self.radius > 0:
-                    w = self.target_size.width()
-                    h = self.target_size.height()
+                    w = scaled.width() if not self.crop else self.target_size.width()
+                    h = scaled.height() if not self.crop else self.target_size.height()
                     rounded = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
                     rounded.fill(Qt.GlobalColor.transparent)
                     painter = QPainter(rounded)
@@ -166,7 +181,12 @@ class ThumbnailCache(QObject):
         self._pool.setExpiryTimeout(10000)
 
     def _make_key(
-        self, url: str, size: QSize, circular: bool, radius: int = 0
+        self,
+        url: str,
+        size: QSize,
+        circular: bool,
+        radius: int = 0,
+        crop: bool = True,
     ) -> str:
         if circular:
             mode = "c"
@@ -174,6 +194,8 @@ class ThumbnailCache(QObject):
             mode = f"r{radius}"
         else:
             mode = "r"
+        if not crop:
+            mode = f"{mode}_fit"
         return f"{url}|{size.width()}x{size.height()}|{mode}"
 
     def _is_generation_current(self, gen: int) -> bool:
@@ -185,10 +207,11 @@ class ThumbnailCache(QObject):
         size: QSize,
         circular: bool = False,
         radius: int = 0,
+        crop: bool = True,
     ) -> QPixmap | None:
         if not url:
             return None
-        key = self._make_key(url, size, circular, radius=radius)
+        key = self._make_key(url, size, circular, radius=radius, crop=crop)
         pix = self._cache.get(key)
         if pix is not None:
             self._cache.move_to_end(key)
@@ -207,6 +230,7 @@ class ThumbnailCache(QObject):
             is_current_fn=self._is_generation_current,
             circular=circular,
             radius=radius,
+            crop=crop,
         )
         sig = task.signals
         self._pending_signals.add(sig)

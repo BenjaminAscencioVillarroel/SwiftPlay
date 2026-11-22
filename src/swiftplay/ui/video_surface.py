@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QEvent, QRectF, QSize, Qt, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPalette, QPixmap, QWheelEvent
+import ctypes
+import sys
+
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
+from PySide6.QtGui import QMouseEvent, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -21,62 +24,12 @@ from swiftplay.models import MediaItem, format_duration
 from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
-from swiftplay.ui.widgets import ClickableSlider, ElidedLabel, RoundedThumbWidget
-
-
-class _LoadingShimmerBar(QWidget):
-    """Barra de carga animada ligera que solo consume CPU mientras está visible."""
-
-    def __init__(self, accent_color: str = "#CFD5DF", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._accent = QColor(accent_color)
-        self._pos = 0.0
-        self.setFixedHeight(4)
-        self._anim = QVariantAnimation(self)
-        self._anim.setDuration(950)
-        self._anim.setStartValue(0.0)
-        self._anim.setEndValue(1.0)
-        self._anim.setLoopCount(-1)
-        self._anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-        self._anim.valueChanged.connect(self._on_val)
-
-    def _on_val(self, val: object) -> None:
-        self._pos = float(val)
-        self.update()
-
-    def set_accent(self, color: str) -> None:
-        self._accent = QColor(color)
-        self.update()
-
-    def start(self) -> None:
-        if self._anim.state() != QVariantAnimation.State.Running:
-            self._anim.start()
-
-    def stop(self) -> None:
-        if self._anim.state() == QVariantAnimation.State.Running:
-            self._anim.stop()
-
-    def hideEvent(self, event) -> None:
-        self.stop()
-        super().hideEvent(event)
-
-    def paintEvent(self, _event) -> None:
-        w = self.width()
-        h = self.height()
-        if w <= 0 or h <= 0:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 28))
-        painter.drawRoundedRect(QRectF(0.0, 0.0, float(w), float(h)), 2.0, 2.0)
-
-        seg_w = max(48.0, w * 0.34)
-        x = -seg_w + (w + seg_w) * self._pos
-        painter.setClipRect(QRectF(0.0, 0.0, float(w), float(h)))
-        painter.setBrush(self._accent)
-        painter.drawRoundedRect(QRectF(x, 0.0, seg_w, float(h)), 2.0, 2.0)
-        painter.end()
+from swiftplay.ui.widgets import (
+    ClickableSlider,
+    ElidedLabel,
+    LoadingShimmerBar as _LoadingShimmerBar,
+    RoundedThumbWidget,
+)
 
 
 class VideoSurface(QWidget):
@@ -86,19 +39,53 @@ class VideoSurface(QWidget):
     double_clicked = Signal()
     wheel_scrolled = Signal(int)
     mouse_moved = Signal()
+    surface_shown = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_PaintOnScreen, True)
         self.setMouseTracking(True)
-        pal = self.palette()
-        pal.setColor(QPalette.ColorRole.Window, QColor("#000000"))
-        self.setPalette(pal)
-        self.setAutoFillBackground(True)
+        self.setAutoFillBackground(False)
         self.setMinimumHeight(240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def paintEngine(self):
+        return None
+
+    def paintEvent(self, _event) -> None:
+        # Qt no debe pintar fondo raster sobre el HWND ocupado por D3D11/libmpv.
+        return
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.surface_shown.emit()
+
+    def force_native_redraw(self) -> None:
+        if not self.isVisible() or self.width() <= 4 or self.height() <= 4:
+            return
+        w, h = self.width(), self.height()
+        if sys.platform == "win32":
+            try:
+                user32 = ctypes.windll.user32
+                hwnd = int(self.winId())
+                lparam = ((h & 0xFFFF) << 16) | (w & 0xFFFF)
+                # SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+                user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0037)
+                user32.PostMessageW(hwnd, 0x0005, 0, lparam)  # WM_SIZE
+                child = user32.FindWindowExW(hwnd, 0, None, None)
+                if child:
+                    user32.SetWindowPos(child, 0, 0, 0, w, h, 0x0014)
+                    user32.PostMessageW(child, 0x0005, 0, lparam)
+                # RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN
+                user32.RedrawWindow(hwnd, None, None, 0x0181)
+            except Exception:
+                pass
+        self.resize(max(2, w - 1), h)
+        self.resize(w, h)
+        self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -155,6 +142,7 @@ class VideoPlayerPanel(QWidget):
         self._thumb_cache = thumb_cache
         self._palette = palette
         self._duration = 0.0
+        self._live_display_offset = 0.0
         self._seeking = False
         self._is_paused = True
         self._is_fullscreen = False
@@ -340,8 +328,11 @@ class VideoPlayerPanel(QWidget):
 
         btn_row.addStretch()
 
-        self.live_badge = QLabel("● EN VIVO")
+        self.live_badge = QPushButton("● EN VIVO")
         self.live_badge.setObjectName("LiveBadge")
+        self.live_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.live_badge.setToolTip("Ir al momento real del directo (En vivo)")
+        self.live_badge.clicked.connect(self.reload_live_requested.emit)
         self.live_badge.setVisible(False)
         btn_row.addWidget(self.live_badge)
 
@@ -386,10 +377,9 @@ class VideoPlayerPanel(QWidget):
         self.wl_btn.clicked.connect(self.watch_later_toggled.emit)
         btn_row.addWidget(self.wl_btn)
 
-        self.reload_live_btn = QPushButton()
-        self.reload_live_btn.setObjectName("IconBtn")
-        self.reload_live_btn.setFixedSize(32, 32)
-        self.reload_live_btn.setToolTip("Sincronizar con el directo")
+        self.reload_live_btn = QPushButton(" Ir al vivo")
+        self.reload_live_btn.setObjectName("PillBtn")
+        self.reload_live_btn.setToolTip("Ir al momento real del directo (En vivo)")
         self.reload_live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reload_live_btn.setVisible(False)
         self.reload_live_btn.clicked.connect(self.reload_live_requested.emit)
@@ -431,7 +421,8 @@ class VideoPlayerPanel(QWidget):
     def _on_seek_moved(self, val: int) -> None:
         if self._duration > 0:
             pos = (val / 1000.0) * self._duration
-            self.pos_lbl.setText(format_duration(pos) or "0:00")
+            off = self._live_display_offset if (self._is_live_mode and not self._is_twitch) else 0.0
+            self.pos_lbl.setText(format_duration(pos + off) or "0:00")
             if not self._seeking:
                 self.seek_requested.emit(pos)
 
@@ -579,18 +570,27 @@ class VideoPlayerPanel(QWidget):
     def set_status(self, text: str) -> None:
         self.status_lbl.setText(text)
 
+    def set_live_display_offset(self, offset: float) -> None:
+        self._live_display_offset = max(0.0, float(offset or 0.0))
+
     def set_duration(self, duration: float) -> None:
         self._duration = max(0.0, duration)
-        self.dur_lbl.setText(format_duration(self._duration) or "0:00")
+        off = self._live_display_offset if (self._is_live_mode and not self._is_twitch) else 0.0
+        self.dur_lbl.setText(format_duration(self._duration + off) or "0:00")
 
     def set_position(self, pos: float) -> None:
-        if self._seeking or self._duration <= 0:
+        if self._seeking:
+            return
+        off = self._live_display_offset if (self._is_live_mode and not self._is_twitch) else 0.0
+        if self._duration <= 0:
+            if self._is_live_mode and not self._is_twitch and pos >= 0:
+                self.pos_lbl.setText(format_duration(pos + off) or "0:00")
             return
         ratio = max(0.0, min(1.0, pos / self._duration))
         self.seek_slider.blockSignals(True)
         self.seek_slider.setValue(int(ratio * 1000))
         self.seek_slider.blockSignals(False)
-        self.pos_lbl.setText(format_duration(pos) or "0:00")
+        self.pos_lbl.setText(format_duration(pos + off) or "0:00")
 
     def set_paused(self, paused: bool) -> None:
         self._is_paused = paused
@@ -635,17 +635,20 @@ class VideoPlayerPanel(QWidget):
     ) -> None:
         self._is_live_mode = bool(is_live)
         self._is_twitch = bool(is_twitch)
-        self.pos_lbl.setVisible(not self._is_live_mode)
-        self.seek_slider.setVisible(not self._is_live_mode)
-        self.dur_lbl.setVisible(not self._is_live_mode)
-        self.speed_combo.setVisible(not self._is_live_mode)
+        if not self._is_live_mode or self._is_twitch:
+            self._live_display_offset = 0.0
+        hide_timeline = self._is_live_mode and self._is_twitch
+        self.pos_lbl.setVisible(not hide_timeline)
+        self.seek_slider.setVisible(not hide_timeline)
+        self.dur_lbl.setVisible(not hide_timeline)
+        self.speed_combo.setVisible(not hide_timeline)
         self.dl_btn.setVisible(not self._is_live_mode)
 
         self.live_badge.setVisible(self._is_live_mode)
         self.viewers_lbl.setText(viewers_text)
         self.viewers_lbl.setVisible(self._is_live_mode and bool(viewers_text))
         self.reload_live_btn.setVisible(self._is_live_mode)
-        if not self._is_live_mode:
+        if not self._is_live_mode or hide_timeline:
             self._duration = 0.0
         self.set_watch_later(self._in_watch_later)
 
