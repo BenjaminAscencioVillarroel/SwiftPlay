@@ -552,6 +552,10 @@ class YouTubeService:
         ] = {}
         self.reload_auth()
 
+    @property
+    def worker_pid(self) -> int | None:
+        return self._worker.worker_pid
+
     def _get_session(self) -> requests.Session:
         sess = getattr(self._http_local, "session", None)
         if sess is None:

@@ -1629,6 +1629,7 @@ class _ParticipantCard(QFrame):
 
     volume_changed = Signal(str, int)
     dm_requested = Signal(str, str, str)
+    watch_share_requested = Signal(dict)
     _AVATAR_FETCH_SIZE = QSize(64, 64)
 
     def __init__(
@@ -1650,6 +1651,12 @@ class _ParticipantCard(QFrame):
         self._thumb_cache = thumb_cache
         self._avatar_url = str(part.get("avatar_url") or "")
         self._thumb_connected = False
+        raw_ss = part.get("screen_share")
+        self._screen_share: dict[str, Any] | None = (
+            dict(raw_ss)
+            if isinstance(raw_ss, dict) and str(raw_ss.get("stream_url") or "").strip() and not self._is_self
+            else None
+        )
 
         name = str(part.get("name") or self._uid)
         is_bot = bool(part.get("is_bot", False))
@@ -1659,7 +1666,7 @@ class _ParticipantCard(QFrame):
 
         self.setObjectName("DiscordParticipantCard")
         self.setMinimumWidth(164)
-        self.setMinimumHeight(142)
+        self.setMinimumHeight(168 if self._screen_share is not None else 142)
         if not self._is_self:
             self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.customContextMenuRequested.connect(self._on_context_menu)
@@ -1715,6 +1722,29 @@ class _ParticipantCard(QFrame):
 
         title_row.addStretch(1)
         lay.addLayout(title_row)
+
+        if self._screen_share is not None:
+            ss_row = QHBoxLayout()
+            ss_row.setSpacing(6)
+            ss_row.addStretch(1)
+
+            live_tag = QLabel("EN VIVO")
+            live_tag.setObjectName("ScreenShareLiveBadge")
+            ss_row.addWidget(live_tag)
+
+            q_txt = str(self._screen_share.get("quality") or "").strip()
+            fps_txt = int(self._screen_share.get("fps") or 0)
+            spec = f" ({q_txt} {fps_txt}fps)" if q_txt and fps_txt else ""
+            watch_btn = QPushButton("Ver pantalla")
+            watch_btn.setObjectName("ScreenShareCardWatchBtn")
+            watch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            watch_btn.setToolTip(f"Ver pantalla compartida de {name}{spec} directo en SwiftPlay")
+            watch_btn.clicked.connect(
+                lambda _c=False, p=dict(self._screen_share): self.watch_share_requested.emit(p)
+            )
+            ss_row.addWidget(watch_btn)
+            ss_row.addStretch(1)
+            lay.addLayout(ss_row)
 
         if not self._is_self:
             vol_row = QHBoxLayout()
@@ -1897,9 +1927,9 @@ class _ScreenShareSetupDialog(QDialog):
         root.addWidget(hdr_lbl)
 
         sub_lbl = QLabel(
-            "Cambia la ventana/monitor, calidad, FPS o audio sin cortar el enlace actual ni sacar a nadie."
+            "Cambia la ventana/monitor, calidad, FPS o audio sin cortar tu transmisión actual."
             if self._is_live_edit
-            else "Tu compa en SwiftPlay la ve directo en el panel de voz y los de Discord oficial entran con 1 clic en el navegador (0 cuentas)."
+            else "Quienes usen SwiftPlay verán tu transmisión EN VIVO directo en la app (sin enviar links). También puedes mandar el enlace para Discord oficial."
         )
         sub_lbl.setObjectName("MutedLabel")
         sub_lbl.setWordWrap(True)
@@ -1950,7 +1980,7 @@ class _ScreenShareSetupDialog(QDialog):
 
         # Envío opcional por Discord (desactivado por defecto; canales y/o DMs)
         has_targets = bool(text_channels or dm_targets)
-        self.announce_check = QCheckBox("Enviar enlace por Discord (canales o DMs)")
+        self.announce_check = QCheckBox("Enviar enlace por chat (para Discord oficial / navegador)")
         self.announce_check.setChecked(False)
         self.announce_check.setEnabled(has_targets)
         root.addWidget(self.announce_check)
@@ -2273,6 +2303,9 @@ class DiscordVoicePanel(QWidget):
         self._screen_share_priv_mb = 0.0
         self._screen_share_pending_opts: dict[str, Any] | None = None
         self._screen_share_announces: list[tuple[str, str, str]] = []  # [(kind, target_id, message_id)]
+        self._screen_share_rev = 0
+        self._remote_screen_shares: dict[str, dict[str, Any]] = {}
+        self._dismissed_share_urls: set[str] = set()
         self._remote_screen_share: dict[str, Any] | None = None
         self._screen_viewer_active = False
         self._screen_viewer_is_local_preview = False
@@ -2281,6 +2314,8 @@ class DiscordVoicePanel(QWidget):
         self._screen_viewer_volume = 80
         self._screen_viewer_stream_url = ""
         self._screen_viewer_watch_url = ""
+        self._screen_viewer_author_id = ""
+        self._screen_viewer_rev = 0
         self._screen_player: MediaPlayer | None = None
 
         # Estado de acordeones y vista exclusiva central (Voz o Chat)
@@ -3691,7 +3726,9 @@ class DiscordVoicePanel(QWidget):
     def _on_bot_state_changed(self, state: str, data: dict[str, Any]) -> None:
         self._bot_state = state
         if state == "connecting":
-            self.status_pill.setText("Conectando...")
+            self.status_pill.setText(
+                "Reconectando..." if data.get("reconnecting") else "Conectando..."
+            )
             self.connect_btn.setText("Cancelar")
             self.connect_btn.setObjectName("DangerBtn")
             self.intents_banner.setVisible(False)
@@ -3711,6 +3748,16 @@ class DiscordVoicePanel(QWidget):
             self._update_info_pill()
             self.sync_notify_channels()
             self.screen_share_btn.setVisible(True)
+            if self._screen_share_state == "sharing" and self._screen_share_info.get("watch_url"):
+                self.svc.set_screen_share_presence(
+                    {
+                        "watch_url": str(self._screen_share_info.get("watch_url") or ""),
+                        "quality": str(self._screen_share_info.get("quality") or "720p"),
+                        "fps": int(self._screen_share_info.get("fps") or 30),
+                        "has_audio": bool(self._screen_share_info.get("has_audio", False)),
+                        "rev": max(1, self._screen_share_rev),
+                    }
+                )
         elif state == "error":
             self._joining_channel_id = ""
             self._mic_test_active = False
@@ -3727,6 +3774,8 @@ class DiscordVoicePanel(QWidget):
             self.info_pill.setVisible(False)
             self.screen_share_btn.setVisible(self.svc.is_connected)
         else:
+            self._remote_screen_shares.clear()
+            self._dismissed_share_urls.clear()
             self.stop_screen_share_session()
             self.screen_share_btn.setVisible(False)
             self._joining_channel_id = ""
@@ -4001,6 +4050,21 @@ class DiscordVoicePanel(QWidget):
                     btag = QLabel("APP")
                     btag.setObjectName("DeckTag")
                     m_row.addWidget(btag)
+                own_bot_id = str(self.svc.bot_id or "")
+                m_share = m.get("screen_share") or (
+                    self._remote_screen_shares.get(m_id)
+                    if (m_id and m_id != own_bot_id)
+                    else None
+                )
+                if isinstance(m_share, dict) and str(m_share.get("stream_url") or "").strip():
+                    live_btn = QPushButton("EN VIVO")
+                    live_btn.setObjectName("ScreenShareLiveBadge")
+                    live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    live_btn.setToolTip(f"Ver pantalla de {m_name} directo en SwiftPlay")
+                    live_btn.clicked.connect(
+                        lambda _c=False, p=dict(m_share): self._open_screen_share_viewer(p)
+                    )
+                    m_row.addWidget(live_btn)
                 if m_deaf:
                     dl = QLabel()
                     dl.setPixmap(render_icon("headphones_off", "#F87171", 11).pixmap(QSize(11, 11)))
@@ -4057,6 +4121,8 @@ class DiscordVoicePanel(QWidget):
                         str(m.get("name") or ""),
                         bool(m.get("muted", False)),
                         bool(m.get("deafened", False)),
+                        str(((m.get("screen_share") or {}).get("stream_url")) or ((self._remote_screen_shares.get(str(m.get("id") or "")) or {}).get("stream_url")) or ""),
+                        int(((m.get("screen_share") or {}).get("rev")) or ((self._remote_screen_shares.get(str(m.get("id") or "")) or {}).get("rev")) or 0),
                     )
                     for m in (ch.get("members") or ())
                 ),
@@ -5735,7 +5801,10 @@ class DiscordVoicePanel(QWidget):
             ch_name = str(state.get("channel_name") or "Voz")
             g_name = str(state.get("guild_name") or "")
             self.active_channel_lbl.setText(f"{ch_name} · {g_name}" if g_name else ch_name)
-            self.status_pill.setText(f"En voz · {ch_name}")
+            if state.get("reconnecting"):
+                self.status_pill.setText(f"Reconectando voz · {ch_name}")
+            else:
+                self.status_pill.setText(f"En voz · {ch_name}")
         else:
             self.active_channel_lbl.setText("Sin canal activo")
             if self._joining_channel_id:
@@ -5850,6 +5919,20 @@ class DiscordVoicePanel(QWidget):
                     bool(p.get("muted", False)),
                     bool(p.get("deafened", False)),
                     str(p.get("avatar_url") or ""),
+                    str(
+                        ((p.get("screen_share") or {}).get("stream_url"))
+                        or ((self._remote_screen_shares.get(str(p.get("id") or "")) or {}).get("stream_url"))
+                        or ""
+                    )
+                    if not p.get("is_self")
+                    else "",
+                    int(
+                        ((p.get("screen_share") or {}).get("rev"))
+                        or ((self._remote_screen_shares.get(str(p.get("id") or "")) or {}).get("rev"))
+                        or 0
+                    )
+                    if not p.get("is_self")
+                    else 0,
                 )
                 for p in parts
             ),
@@ -5892,6 +5975,8 @@ class DiscordVoicePanel(QWidget):
             part_with_status = dict(part)
             if uid in self._user_statuses:
                 part_with_status["status"] = self._user_statuses[uid]
+            if not is_self and not part_with_status.get("screen_share") and uid in self._remote_screen_shares:
+                part_with_status["screen_share"] = dict(self._remote_screen_shares[uid])
             card = _ParticipantCard(
                 part_with_status,
                 vol,
@@ -5902,6 +5987,7 @@ class DiscordVoicePanel(QWidget):
             )
             card.volume_changed.connect(self._on_user_vol_value_changed)
             card.dm_requested.connect(self._open_dm_with_user)
+            card.watch_share_requested.connect(self._open_screen_share_viewer)
             self._participant_cards[key] = card
             self._participant_cards_order.append(card)
         self._relayout_participant_cards()
@@ -6221,6 +6307,7 @@ class DiscordVoicePanel(QWidget):
         if state == "sharing":
             is_reconf = bool(data.get("reconfigured", False))
             self._screen_share_info = dict(data)
+            self._screen_share_rev = (self._screen_share_rev + 1) if is_reconf else 1
             if not is_reconf:
                 self._screen_share_stats = {}
             self.screen_share_btn.setText(" Dejar de compartir")
@@ -6231,6 +6318,16 @@ class DiscordVoicePanel(QWidget):
             self._refresh_share_live_strip()
             self.share_live_strip.setVisible(True)
             self._set_pane_visible("voice", True)
+            if self.svc.is_connected and data.get("watch_url"):
+                self.svc.set_screen_share_presence(
+                    {
+                        "watch_url": str(data.get("watch_url") or ""),
+                        "quality": str(data.get("quality") or "720p"),
+                        "fps": int(data.get("fps") or 30),
+                        "has_audio": bool(data.get("has_audio", False)),
+                        "rev": self._screen_share_rev,
+                    }
+                )
 
             opts = self._screen_share_pending_opts
             self._screen_share_pending_opts = None
@@ -6283,7 +6380,10 @@ class DiscordVoicePanel(QWidget):
         self._screen_share_stats = {}
         self._screen_share_ws_mb = 0.0
         self._screen_share_priv_mb = 0.0
+        self._screen_share_rev = 0
         self._screen_share_pending_opts = None
+        if self.svc.is_connected:
+            self.svc.set_screen_share_presence(None)
         self.screen_share_btn.setText(" Compartir pantalla")
         self.screen_share_btn.setObjectName("PillBtn")
         self.screen_share_btn.style().unpolish(self.screen_share_btn)
@@ -6352,6 +6452,9 @@ class DiscordVoicePanel(QWidget):
         if self._screen_viewer_active and self._screen_viewer_is_local_preview:
             self._close_screen_share_viewer()
         self._mark_announced_share_ended()
+        self._screen_share_rev = 0
+        if self.svc.is_connected:
+            self.svc.set_screen_share_presence(None)
         self.screen_share_svc.stop_share()
 
     def _copy_active_share_url(self) -> None:
@@ -6386,33 +6489,115 @@ class DiscordVoicePanel(QWidget):
             }
         )
 
+    def _refresh_remote_share_banner(self) -> None:
+        if not hasattr(self, "remote_share_banner"):
+            return
+        cur_cid = str(self._voice_state.get("channel_id") or "")
+        candidates = [
+            v
+            for v in self._remote_screen_shares.values()
+            if str(v.get("stream_url") or "") not in self._dismissed_share_urls
+        ]
+        if not candidates:
+            self._remote_screen_share = None
+            self.remote_share_banner.setVisible(False)
+            return
+
+        # Priorizar transmisiones en el canal de voz actual o de presencia nativa
+        candidates.sort(
+            key=lambda v: (
+                0 if (cur_cid and str(v.get("channel_id") or "") == cur_cid) else 1,
+                0 if v.get("source") == "presence" else 1,
+            )
+        )
+        chosen = dict(candidates[0])
+        self._remote_screen_share = chosen
+        author = str(chosen.get("author_name") or "Usuario")
+        ch_name = str(chosen.get("channel_name") or "")
+        q_txt = str(chosen.get("quality") or "").strip()
+        fps_n = int(chosen.get("fps") or 0)
+        if chosen.get("source") == "presence":
+            spec = f" · {q_txt} {fps_n}fps" if q_txt and fps_n else ""
+            ch_ctx = f" en 🔊 {ch_name}" if ch_name else ""
+            self.remote_share_lbl.setText(f"🔴 {author} está compartiendo pantalla{ch_ctx}{spec}")
+            self.remote_browser_btn.setVisible(False)
+        else:
+            if chosen.get("is_dm") or ch_name.startswith("DM"):
+                loc = f" ({ch_name})" if ch_name else " (DM)"
+            else:
+                loc = f" en #{ch_name}" if ch_name else ""
+            self.remote_share_lbl.setText(f"🖥️ {author} está compartiendo pantalla{loc}")
+            self.remote_browser_btn.setVisible(bool(chosen.get("watch_url")))
+        self.remote_watch_btn.setText("Ver pantalla")
+        self.remote_share_banner.setVisible(True)
+
     def _on_remote_screen_share_detected(self, data: dict[str, Any]) -> None:
         if not isinstance(data, dict):
             return
+        aid = str(data.get("author_id") or "").strip()
+        if aid and aid == str(self.svc.bot_id or ""):
+            return
         if data.get("is_self") and self._screen_share_state == "sharing":
             return
-        self._remote_screen_share = dict(data)
-        author = str(data.get("author_name") or "Usuario")
-        ch_name = str(data.get("channel_name") or "")
-        if data.get("is_dm") or ch_name.startswith("DM"):
-            loc = f" ({ch_name})" if ch_name else " (DM)"
-        else:
-            loc = f" en #{ch_name}" if ch_name else ""
-        self.remote_share_lbl.setText(f"🖥️ {author} está compartiendo pantalla{loc}")
-        self.remote_share_banner.setVisible(True)
+        stream_u = str(data.get("stream_url") or "").strip()
+        if not stream_u:
+            return
+        mid = str(data.get("message_id") or "").strip()
+        key = aid or (f"msg:{mid}" if mid else stream_u)
+        self._dismissed_share_urls.discard(stream_u)
+        self._remote_screen_shares[key] = dict(data)
+        self._refresh_remote_share_banner()
+        self._render_participants()
+        self._render_channels()
+
+        new_rev = int(data.get("rev") or 1)
+        if (
+            self._screen_viewer_active
+            and not self._screen_viewer_is_local_preview
+            and aid
+            and aid == self._screen_viewer_author_id
+            and (new_rev > self._screen_viewer_rev or stream_u != self._screen_viewer_stream_url)
+        ):
+            self._open_screen_share_viewer(data)
 
     def _on_remote_screen_share_ended(self, data: dict[str, Any]) -> None:
-        mid = str((data or {}).get("message_id") or "")
-        cur_mid = str((self._remote_screen_share or {}).get("message_id") or "")
-        if not mid or (cur_mid and cur_mid == mid):
-            self._remote_screen_share = None
-            self.remote_share_banner.setVisible(False)
-            if self._screen_viewer_active and cur_mid and cur_mid == mid:
+        d = data or {}
+        aid = str(d.get("author_id") or "").strip()
+        mid = str(d.get("message_id") or "").strip()
+        removed_urls: set[str] = set()
+        for k in list(self._remote_screen_shares.keys()):
+            v = self._remote_screen_shares[k]
+            match = (
+                (aid and (k == aid or str(v.get("author_id") or "") == aid))
+                or (mid and str(v.get("message_id") or "") == mid)
+                or (not aid and not mid)
+            )
+            if match:
+                u = str(v.get("stream_url") or "")
+                if u:
+                    removed_urls.add(u)
+                del self._remote_screen_shares[k]
+
+        self._refresh_remote_share_banner()
+        self._render_participants()
+        self._render_channels()
+
+        if self._screen_viewer_active and not self._screen_viewer_is_local_preview:
+            viewer_ended = (
+                (aid and aid == self._screen_viewer_author_id)
+                or (self._screen_viewer_stream_url and self._screen_viewer_stream_url in removed_urls)
+                or (not aid and not mid)
+            )
+            if viewer_ended:
                 self._close_screen_share_viewer()
                 self.toast_requested.emit("La transmisión de pantalla ha finalizado.")
 
     def _dismiss_remote_share_banner(self) -> None:
-        self.remote_share_banner.setVisible(False)
+        if self._remote_screen_share is not None:
+            u = str(self._remote_screen_share.get("stream_url") or "")
+            if u:
+                self._dismissed_share_urls.add(u)
+        self._refresh_remote_share_banner()
 
     def _watch_detected_remote_share(self) -> None:
         if self._remote_screen_share:
@@ -6457,6 +6642,8 @@ class DiscordVoicePanel(QWidget):
 
         self._screen_viewer_stream_url = stream_url
         self._screen_viewer_watch_url = watch_url
+        self._screen_viewer_author_id = str(payload.get("author_id") or "").strip()
+        self._screen_viewer_rev = int(payload.get("rev") or 1)
         self._screen_viewer_active = True
         self._screen_viewer_is_local_preview = bool(payload.get("is_local_preview", False))
         if "start_muted" in payload:
@@ -6464,6 +6651,12 @@ class DiscordVoicePanel(QWidget):
         elif not self._screen_viewer_is_local_preview:
             self._screen_viewer_muted = False
         self.screen_viewer_title_lbl.setText(header)
+        if hasattr(self, "screen_viewer_browser_btn"):
+            self.screen_viewer_browser_btn.setVisible(
+                bool(watch_url)
+                and not self._screen_viewer_is_local_preview
+                and payload.get("source") != "presence"
+            )
         self.screen_viewer_card.setVisible(True)
         self._set_pane_visible("voice", True)
 
@@ -6479,6 +6672,8 @@ class DiscordVoicePanel(QWidget):
         self._screen_viewer_expanded = False
         self._screen_viewer_stream_url = ""
         self._screen_viewer_watch_url = ""
+        self._screen_viewer_author_id = ""
+        self._screen_viewer_rev = 0
         self.screen_viewer_expand_btn.setText("Expandir")
         self.participants_scroll.setVisible(True)
         self.screen_viewer_card.setVisible(False)
@@ -6524,11 +6719,16 @@ class DiscordVoicePanel(QWidget):
 
     def stop_screen_share_session(self) -> None:
         """Detiene compartida y visor al desconectar Discord, manteniendo el servicio reutilizable."""
+        self._remote_screen_shares.clear()
+        self._dismissed_share_urls.clear()
         self._remote_screen_share = None
         if hasattr(self, "remote_share_banner"):
             self.remote_share_banner.setVisible(False)
         self._close_screen_share_viewer()
         self._mark_announced_share_ended()
+        self._screen_share_rev = 0
+        if self.svc.is_connected:
+            self.svc.set_screen_share_presence(None)
         if hasattr(self, "screen_share_svc"):
             try:
                 self.screen_share_svc.stop_share()

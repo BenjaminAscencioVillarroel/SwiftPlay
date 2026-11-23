@@ -33,6 +33,10 @@ _SCREEN_SHARE_URL_RE = re.compile(
     r"(https://[a-z0-9-]+\.trycloudflare\.com|http://127\.0\.0\.1:\d+)/watch\?t=([A-Za-z0-9_-]+)",
     re.IGNORECASE,
 )
+_PRESENCE_SHARE_RE = re.compile(
+    r"sws1\|([a-z0-9-]+|127\.0\.0\.1:\d+)\|([A-Za-z0-9_-]{8,64})\|(\d{3,4}p)\|(\d{2})\|([01])(?:\|(\d+))?",
+    re.IGNORECASE,
+)
 
 
 def _cleanup_all_screen_services() -> None:
@@ -140,6 +144,66 @@ def parse_screen_share_message(content: str) -> dict[str, str] | None:
     }
 
 
+def encode_screen_share_presence(
+    watch_url: str,
+    *,
+    quality: str = "720p",
+    fps: int = 30,
+    has_audio: bool = True,
+    rev: int = 1,
+) -> str:
+    """Codifica un beacon compacto <=128 caracteres para descubrir transmisiones vía presencia Discord."""
+    m = _SCREEN_SHARE_URL_RE.search(str(watch_url or "").strip())
+    if not m:
+        return ""
+    raw_base = m.group(1).lower()
+    token = m.group(2)
+    if raw_base.startswith("http://127.0.0.1:"):
+        host = raw_base[len("http://") :]
+    elif raw_base.startswith("https://") and raw_base.endswith(".trycloudflare.com"):
+        host = raw_base[len("https://") : -len(".trycloudflare.com")]
+    else:
+        return ""
+    q = str(quality or "720p").strip()
+    if q not in ("480p", "720p", "1080p"):
+        q = "720p"
+    f = 60 if int(fps or 30) >= 60 else 30
+    a = 1 if has_audio else 0
+    r = max(1, int(rev or 1))
+    core = f"sws1|{host}|{token}|{q}|{f}|{a}|{r}"
+    full = f"🔴 En vivo · {core}"
+    if len(full) <= 128:
+        return full
+    return core if len(core) <= 128 else ""
+
+
+def parse_screen_share_presence(text: str) -> dict[str, Any] | None:
+    """Decodifica un beacon `sws1|...` presente en el estado/actividad de Discord."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    m = _PRESENCE_SHARE_RE.search(raw)
+    if not m:
+        return None
+    host = m.group(1).lower()
+    token = m.group(2)
+    quality = m.group(3)
+    fps = int(m.group(4))
+    audio_flag = m.group(5)
+    rev = int(m.group(6) or 1)
+    base = f"http://{host}" if host.startswith("127.0.0.1:") else f"https://{host}.trycloudflare.com"
+    return {
+        "watch_url": f"{base}/watch?t={token}",
+        "stream_url": f"{base}/stream.mp4?t={token}",
+        "token": token,
+        "quality": quality,
+        "fps": fps,
+        "has_audio": audio_flag == "1",
+        "rev": rev,
+        "source": "presence",
+    }
+
+
 class ScreenShareService(QObject):
     """Gestiona el ciclo de vida de screen_share_worker.py vía JSON-lines."""
 
@@ -159,12 +223,33 @@ class ScreenShareService(QObject):
         self._pending: dict[int, Future[Any]] = {}
         self._state = "idle"
         self._active_info: dict[str, Any] = {}
+        self._child_pids: list[int] = []
         _ACTIVE_SCREEN_SERVICES.add(self)
 
     @property
     def is_worker_running(self) -> bool:
         with self._lock:
             return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def worker_pid(self) -> int | None:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return int(self._proc.pid)
+            return None
+
+    @property
+    def active_pids(self) -> list[int]:
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                return []
+            pids: list[int] = [int(self._proc.pid)]
+            seen = set(pids)
+            for pid in self._child_pids:
+                if pid > 0 and pid not in seen:
+                    seen.add(pid)
+                    pids.append(pid)
+            return pids
 
     @property
     def is_sharing(self) -> bool:
@@ -238,6 +323,7 @@ class ScreenShareService(QObject):
             with self._lock:
                 if self._proc is proc:
                     self._proc = None
+                    self._child_pids = []
                     reset_needed = True
             if reset_needed and not self._closed:
                 self._state = "idle"
@@ -263,10 +349,21 @@ class ScreenShareService(QObject):
                 st = str(data.get("state") or "idle")
                 self._state = st
                 self._active_info = dict(data) if st == "sharing" else {}
+                with self._lock:
+                    if st == "sharing":
+                        raw_pids = data.get("child_pids")
+                        if isinstance(raw_pids, list):
+                            self._child_pids = [int(p) for p in raw_pids if int(p or 0) > 0]
+                    else:
+                        self._child_pids = []
                 self.state_changed.emit(st, data)
             elif event == "stats" and isinstance(data, dict):
                 self.stats_updated.emit(data)
             elif event == "worker_ram" and isinstance(data, dict):
+                raw_pids = data.get("child_pids")
+                if isinstance(raw_pids, list):
+                    with self._lock:
+                        self._child_pids = [int(p) for p in raw_pids if int(p or 0) > 0]
                 self.worker_ram_updated.emit(
                     float(data.get("ws_mb") or 0.0),
                     float(data.get("priv_mb") or 0.0),
@@ -384,6 +481,7 @@ class ScreenShareService(QObject):
         with self._lock:
             proc = self._proc
             self._proc = None
+            self._child_pids = []
         if proc is not None:
             try:
                 if proc.poll() is None and proc.stdin is not None:

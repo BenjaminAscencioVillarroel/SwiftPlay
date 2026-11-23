@@ -395,27 +395,48 @@ class _PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
     ]
 
 
-def get_process_memory_mb() -> tuple[float, float]:
-    """Devuelve (WorkingSetSize_MB, PrivateUsage_MB) del proceso actual en Windows."""
-    if sys.platform != "win32":
+class _PROCESS_MEMORY_COUNTERS_EX2(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t),
+        ("PrivateWorkingSetSize", ctypes.c_size_t),
+        ("SharedCommitUsage", ctypes.c_ulonglong),
+    ]
+
+
+def _query_handle_memory_mb(h_proc: wintypes.HANDLE) -> tuple[float, float]:
+    """Lee (PrivateWorkingSet_o_WorkingSet_MB, PrivateUsage_MB) para un handle Windows."""
+    if sys.platform != "win32" or not h_proc:
         return 0.0, 0.0
     try:
         kernel32 = ctypes.windll.kernel32
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        fn = getattr(kernel32, "K32GetProcessMemoryInfo", None)
-        if fn is None:
-            fn = ctypes.windll.psapi.GetProcessMemoryInfo
-        fn.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(_PROCESS_MEMORY_COUNTERS_EX),
-            wintypes.DWORD,
-        ]
-        fn.restype = wintypes.BOOL
+        fn_raw = getattr(kernel32, "K32GetProcessMemoryInfo", None)
+        if fn_raw is None:
+            fn_raw = ctypes.windll.psapi.GetProcessMemoryInfo
+
+        c2 = _PROCESS_MEMORY_COUNTERS_EX2()
+        c2.cb = ctypes.sizeof(c2)
+        fn_raw.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        fn_raw.restype = wintypes.BOOL
+        if fn_raw(h_proc, ctypes.byref(c2), c2.cb) and c2.WorkingSetSize > 0:
+            ws_bytes = c2.PrivateWorkingSetSize if c2.PrivateWorkingSetSize > 0 else c2.WorkingSetSize
+            return (
+                ws_bytes / (1024 * 1024),
+                c2.PrivateUsage / (1024 * 1024),
+            )
 
         counters = _PROCESS_MEMORY_COUNTERS_EX()
         counters.cb = ctypes.sizeof(counters)
-        h_proc = kernel32.GetCurrentProcess()
-        if fn(h_proc, ctypes.byref(counters), counters.cb):
+        if fn_raw(h_proc, ctypes.byref(counters), counters.cb):
             return (
                 counters.WorkingSetSize / (1024 * 1024),
                 counters.PrivateUsage / (1024 * 1024),
@@ -425,8 +446,20 @@ def get_process_memory_mb() -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def get_process_memory_mb() -> tuple[float, float]:
+    """Devuelve (PrivateWorkingSet_MB, PrivateUsage_MB) del proceso actual en Windows."""
+    if sys.platform != "win32":
+        return 0.0, 0.0
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        return _query_handle_memory_mb(kernel32.GetCurrentProcess())
+    except Exception:
+        return 0.0, 0.0
+
+
 def get_pid_memory_mb(pid: int) -> tuple[float, float]:
-    """Devuelve (WorkingSetSize_MB, PrivateUsage_MB) para cualquier PID activo en Windows."""
+    """Devuelve (PrivateWorkingSet_MB, PrivateUsage_MB) para cualquier PID activo en Windows."""
     if sys.platform != "win32" or not pid or int(pid) <= 0:
         return 0.0, 0.0
     h_proc = None
@@ -439,23 +472,7 @@ def get_pid_memory_mb(pid: int) -> tuple[float, float]:
         h_proc = kernel32.OpenProcess(0x1000, False, wintypes.DWORD(int(pid)))  # PROCESS_QUERY_LIMITED_INFORMATION
         if not h_proc:
             return 0.0, 0.0
-        fn = getattr(kernel32, "K32GetProcessMemoryInfo", None)
-        if fn is None:
-            fn = ctypes.windll.psapi.GetProcessMemoryInfo
-        fn.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(_PROCESS_MEMORY_COUNTERS_EX),
-            wintypes.DWORD,
-        ]
-        fn.restype = wintypes.BOOL
-
-        counters = _PROCESS_MEMORY_COUNTERS_EX()
-        counters.cb = ctypes.sizeof(counters)
-        if fn(h_proc, ctypes.byref(counters), counters.cb):
-            return (
-                counters.WorkingSetSize / (1024 * 1024),
-                counters.PrivateUsage / (1024 * 1024),
-            )
+        return _query_handle_memory_mb(h_proc)
     except Exception:
         pass
     finally:
@@ -574,6 +591,35 @@ def _ft_to_int(ft: _FILETIME) -> int:
     return (int(ft.dwHighDateTime) << 32) | int(ft.dwLowDateTime)
 
 
+def _read_pid_cpu_time(pid: int) -> int | None:
+    if sys.platform != "win32" or not pid or int(pid) <= 0:
+        return None
+    h_proc = None
+    k32 = ctypes.windll.kernel32
+    try:
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        h_proc = k32.OpenProcess(0x1000, False, wintypes.DWORD(int(pid)))
+        if not h_proc:
+            return None
+        ft_c, ft_e, ft_k, ft_u = _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME()
+        if not k32.GetProcessTimes(
+            h_proc, ctypes.byref(ft_c), ctypes.byref(ft_e), ctypes.byref(ft_k), ctypes.byref(ft_u)
+        ):
+            return None
+        return _ft_to_int(ft_k) + _ft_to_int(ft_u)
+    except Exception:
+        return None
+    finally:
+        if h_proc:
+            try:
+                k32.CloseHandle(h_proc)
+            except Exception:
+                pass
+
+
 class SystemResourceMonitor:
     """Monitor liviano nativo de RAM, CPU% y GPU% (Win32 API + PDH sin dependencias)."""
 
@@ -583,6 +629,7 @@ class SystemResourceMonitor:
     def __init__(self, pid: int | None = None) -> None:
         self._pid = int(pid or os.getpid())
         self._last_proc_cpu: int | None = None
+        self._last_extra_cpu: dict[int, int] = {}
         self._last_sys_total: int | None = None
         self._last_sys_idle: int | None = None
         self._pdh = None
@@ -667,7 +714,7 @@ class SystemResourceMonitor:
             self._pdh_query = None
             self._pdh_gpu_counter = None
 
-    def _sample_cpu_pct(self) -> tuple[float, float]:
+    def _sample_cpu_pct(self, extra_pids: list[int] | None = None) -> tuple[float, float]:
         if sys.platform != "win32" or self._proc_handle is None:
             return 0.0, 0.0
         try:
@@ -698,13 +745,29 @@ class SystemResourceMonitor:
             sys_idle = _ft_to_int(ft_idle)
             sys_total = _ft_to_int(ft_s_kern) + _ft_to_int(ft_s_user)
 
+            extra_set = {
+                int(p) for p in (extra_pids or ()) if p and int(p) > 0 and int(p) != self._pid
+            }
+            for old_pid in list(self._last_extra_cpu.keys()):
+                if old_pid not in extra_set:
+                    del self._last_extra_cpu[old_pid]
+
+            d_extra = 0
+            for ep in extra_set:
+                cur_ep = _read_pid_cpu_time(ep)
+                if cur_ep is not None:
+                    prev_ep = self._last_extra_cpu.get(ep)
+                    if prev_ep is not None:
+                        d_extra += max(0, cur_ep - prev_ep)
+                    self._last_extra_cpu[ep] = cur_ep
+
             if self._last_proc_cpu is None or self._last_sys_total is None or self._last_sys_idle is None:
                 self._last_proc_cpu = proc_total
                 self._last_sys_total = sys_total
                 self._last_sys_idle = sys_idle
                 return 0.0, 0.0
 
-            d_proc = max(0, proc_total - self._last_proc_cpu)
+            d_proc = max(0, proc_total - self._last_proc_cpu) + d_extra
             d_total = sys_total - self._last_sys_total
             d_idle = max(0, sys_idle - self._last_sys_idle)
             self._last_proc_cpu = proc_total
@@ -720,7 +783,7 @@ class SystemResourceMonitor:
         except Exception:
             return 0.0, 0.0
 
-    def _sample_gpu_pct(self) -> tuple[float, float]:
+    def _sample_gpu_pct(self, extra_pids: list[int] | None = None) -> tuple[float, float]:
         if sys.platform != "win32" or self._pdh is None or not self._pdh_query or not self._pdh_gpu_counter:
             return 0.0, 0.0
         try:
@@ -754,7 +817,8 @@ class SystemResourceMonitor:
 
             app_by_eng: dict[str, float] = {}
             sys_by_eng: dict[str, float] = {}
-            pid_prefix = f"pid_{self._pid}_"
+            all_pids = {self._pid} | {int(p) for p in (extra_pids or ()) if p and int(p) > 0}
+            pid_prefixes = tuple(f"pid_{p}_" for p in all_pids)
             n_items = int(cnt.value)
             for idx in range(n_items):
                 item = arr_ptr[idx]
@@ -770,7 +834,7 @@ class SystemResourceMonitor:
                 luid_pos = name.find("luid_")
                 sys_key = name[luid_pos:] if luid_pos >= 0 else eng_key
                 sys_by_eng[sys_key] = sys_by_eng.get(sys_key, 0.0) + val
-                if name.startswith(pid_prefix):
+                if name.startswith(pid_prefixes):
                     app_by_eng[eng_key] = app_by_eng.get(eng_key, 0.0) + val
 
             app_gpu = max(app_by_eng.values(), default=0.0)
@@ -779,10 +843,10 @@ class SystemResourceMonitor:
         except Exception:
             return 0.0, 0.0
 
-    def sample(self) -> ResourceSnapshot:
+    def sample(self, extra_pids: list[int] | None = None) -> ResourceSnapshot:
         ws_mb, priv_mb = get_process_memory_mb()
-        app_cpu, sys_cpu = self._sample_cpu_pct()
-        app_gpu, sys_gpu = self._sample_gpu_pct()
+        app_cpu, sys_cpu = self._sample_cpu_pct(extra_pids=extra_pids)
+        app_gpu, sys_gpu = self._sample_gpu_pct(extra_pids=extra_pids)
         return ResourceSnapshot(
             ws_mb=ws_mb,
             priv_mb=priv_mb,
@@ -845,6 +909,14 @@ def resolve_worker_python_and_env(app_root: Path = APP_ROOT) -> tuple[str, dict[
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    # Evitar spin-wait OpenMP (ggml/Silero) y arenas multi-hilo en OpenBLAS/NumPy/Rayon
+    env["OMP_NUM_THREADS"] = "1"
+    env["OMP_WAIT_POLICY"] = "PASSIVE"
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
+    env["RAYON_NUM_THREADS"] = "1"
+    env["GGML_NUM_THREADS"] = "1"
 
     src_dir = app_root / "src"
     venv_dir: Path | None = None

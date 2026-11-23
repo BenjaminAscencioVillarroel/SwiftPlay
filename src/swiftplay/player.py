@@ -200,7 +200,7 @@ class MediaPlayer(QObject):
                 kwargs["swapchain_depth"] = 2
                 kwargs["gpu_shader_cache"] = "no"
                 kwargs["icc_cache"] = "no"
-                kwargs["demuxer_max_bytes"] = "4MiB"
+                kwargs["demuxer_max_bytes"] = "3MiB"
                 kwargs["demuxer_max_back_bytes"] = "512KiB"
                 kwargs["cursor_autohide"] = "no"
                 kwargs["msg_level"] = "all=no,vo=error"
@@ -435,7 +435,7 @@ class MediaPlayer(QObject):
                 player["demuxer-lavf-analyzeduration"] = 0.5
                 player["audio-buffer"] = 0.1
                 player["demuxer-max-bytes"] = (
-                    "2MiB" if self._is_audio_only_instance else "4MiB"
+                    "2MiB" if self._is_audio_only_instance else "3MiB"
                 )
                 player["demuxer-max-back-bytes"] = (
                     "256KiB" if self._is_audio_only_instance else "512KiB"

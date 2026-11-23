@@ -63,6 +63,13 @@ class YtdlpWorkerClient:
         self._closed = False
         _ACTIVE_CLIENTS.add(self)
 
+    @property
+    def worker_pid(self) -> int | None:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return int(self._proc.pid)
+            return None
+
     def _build_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"

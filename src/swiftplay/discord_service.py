@@ -80,6 +80,7 @@ class DiscordService(QObject):
         self._pending: dict[int, Future[Any]] = {}
 
         self._state = "disconnected"
+        self._bot_id = ""
         self._bot_name = ""
         self._bot_avatar_url = ""
         self._in_voice = False
@@ -109,6 +110,10 @@ class DiscordService(QObject):
     @property
     def active_channel_name(self) -> str:
         return self._active_channel_name
+
+    @property
+    def bot_id(self) -> str:
+        return self._bot_id
 
     @property
     def bot_name(self) -> str:
@@ -225,9 +230,11 @@ class DiscordService(QObject):
                 st = str(data.get("state") or "disconnected")
                 self._state = st
                 if st == "connected":
+                    self._bot_id = str(data.get("bot_id") or "")
                     self._bot_name = str(data.get("bot_name") or "Bot")
                     self._bot_avatar_url = str(data.get("bot_avatar_url") or "")
                 elif st in ("disconnected", "error"):
+                    self._bot_id = ""
                     self._bot_name = ""
                     self._bot_avatar_url = ""
                     self._in_voice = False
@@ -484,6 +491,13 @@ class DiscordService(QObject):
             spawn=False,
         )
 
+    def set_screen_share_presence(self, share: dict[str, Any] | None) -> None:
+        self._send_command(
+            "set_screen_share_presence",
+            {"share": dict(share) if isinstance(share, dict) else None},
+            spawn=False,
+        )
+
     def disconnect_and_kill(self) -> None:
         proc: subprocess.Popen[str] | None = None
         with self._lock:
@@ -518,6 +532,7 @@ class DiscordService(QObject):
                         pass
         self._fail_pending("Worker Discord desconectado.")
         self._state = "disconnected"
+        self._bot_id = ""
         self._bot_name = ""
         self._bot_avatar_url = ""
         self._in_voice = False
@@ -530,7 +545,7 @@ class DiscordService(QObject):
                 pass
 
     def stop_if_idle(self) -> None:
-        if self.is_worker_running and not self._in_voice:
+        if self.is_worker_running and not self._in_voice and self._state in ("disconnected", "error"):
             self.disconnect_and_kill()
 
     def close(self) -> None:

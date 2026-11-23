@@ -28,6 +28,18 @@ _QUALITY_PRESETS: dict[str, tuple[int, int, str, str, str]] = {
     "720p": (1280, 720, "3000k", "4200k", "2100k"),
     "1080p": (1920, 1080, "4500k", "6500k", "3200k"),
 }
+
+
+def _compute_even_scaled_size(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int]:
+    """Calcula resolución objetivo par <= max_w x max_h preservando relación de aspecto."""
+    cap_w = max(2, int(max_w) & ~1)
+    cap_h = max(2, int(max_h) & ~1)
+    if src_w <= 0 or src_h <= 0:
+        return cap_w, cap_h
+    scale = min(1.0, cap_w / float(src_w), cap_h / float(src_h))
+    out_w = min(cap_w, max(2, int(round(src_w * scale)) & ~1))
+    out_h = min(cap_h, max(2, int(round(src_h * scale)) & ~1))
+    return max(2, out_w & ~1), max(2, out_h & ~1)
 _ENCODER_CACHE: str | None = None
 _CLOUDFLARED_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 
@@ -733,9 +745,11 @@ class WasapiLoopbackCapture:
                 chunks: list[bytes] = []
                 frames_this_tick = 0
                 try:
-                    while self._running:
+                    for _ in range(64):
+                        if not self._running:
+                            break
                         hr = get_next(self._cap_ptr, ctypes.byref(pkt_frames))
-                        if hr < 0 or pkt_frames.value == 0:
+                        if hr != 0 or pkt_frames.value == 0:
                             break
                         hr = get_buf(
                             self._cap_ptr,
@@ -745,7 +759,7 @@ class WasapiLoopbackCapture:
                             ctypes.byref(dev_pos),
                             ctypes.byref(qpc_pos),
                         )
-                        if hr < 0:
+                        if hr != 0:
                             break
                         n_fr = int(num_frames.value)
                         try:
@@ -758,6 +772,8 @@ class WasapiLoopbackCapture:
                                 frames_this_tick += n_fr
                         finally:
                             rel_buf(self._cap_ptr, num_frames.value)
+                        if n_fr <= 0:
+                            break
                 except Exception:
                     break
 
@@ -857,6 +873,10 @@ def _encoder_args(encoder: str, quality: str, fps: int) -> list[str]:
             "p1",
             "-tune",
             "ull",
+            "-zerolatency",
+            "1",
+            "-rc-lookahead",
+            "0",
             "-rc",
             "vbr",
             "-b:v",
@@ -940,9 +960,12 @@ def build_ffmpeg_command(
     synthetic_audio: bool = False,
 ) -> list[str]:
     w, h, _br, _max_br, _buf_sz = _QUALITY_PRESETS.get(quality, _QUALITY_PRESETS["720p"])
-    cmd: list[str] = [str(ffmpeg_path), "-hide_banner", "-loglevel", "warning", "-threads", "2"]
+    threads = "2" if encoder == "libx264" else "1"
+    pix_fmt = "nv12" if encoder in ("h264_nvenc", "h264_amf", "h264_qsv") else "yuv420p"
+    cmd: list[str] = [str(ffmpeg_path), "-hide_banner", "-loglevel", "warning", "-threads", threads]
     kind = str(source.get("kind") or "monitor")
     src_id = str(source.get("id") or "monitor:0")
+    vf: str | None = None
 
     if src_id == "synthetic":
         cmd += [
@@ -952,7 +975,7 @@ def build_ffmpeg_command(
             "-i",
             f"testsrc=size={w}x{h}:rate={fps}",
         ]
-        vf = "format=yuv420p"
+        vf = f"format={pix_fmt}"
     elif kind == "window":
         win_title = str(source.get("title") or "").strip()
         cmd += [
@@ -965,19 +988,53 @@ def build_ffmpeg_command(
             "-i",
             f"title={win_title}",
         ]
-        vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+        vf = (
+            f"scale=w={w}:h={h}:force_original_aspect_ratio=decrease"
+            f":force_divisible_by=2:flags=fast_bilinear,format={pix_fmt}"
+        )
+    elif capture_backend == "ddagrab_gpu":
+        idx = int(source.get("index") or 0)
+        src_w = int(source.get("width") or 0)
+        src_h = int(source.get("height") or 0)
+        out_w, out_h = _compute_even_scaled_size(src_w, src_h, w, h)
+        if encoder == "h264_nvenc" and src_w > 0 and src_h > 0 and src_w == out_w and src_h == out_h:
+            dda_graph = f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse=1"
+        else:
+            dda_graph = (
+                f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse=1,"
+                f"scale_d3d11=width={out_w}:height={out_h}:format=nv12"
+            )
+        cmd += [
+            "-f",
+            "lavfi",
+            "-i",
+            dda_graph,
+        ]
+        vf = None
     elif capture_backend == "ddagrab":
         idx = int(source.get("index") or 0)
+        src_w = int(source.get("width") or 0)
+        src_h = int(source.get("height") or 0)
         cmd += [
             "-f",
             "lavfi",
             "-i",
             f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra",
         ]
-        vf = (
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
-        )
+        if (
+            src_w > 0
+            and src_h > 0
+            and src_w <= w
+            and src_h <= h
+            and (src_w % 2 == 0)
+            and (src_h % 2 == 0)
+        ):
+            vf = f"format={pix_fmt}"
+        else:
+            vf = (
+                f"scale=w={w}:h={h}:force_original_aspect_ratio=decrease"
+                f":force_divisible_by=2:flags=fast_bilinear,format={pix_fmt}"
+            )
     else:
         left = int(source.get("left") or 0)
         top = int(source.get("top") or 0)
@@ -1001,7 +1058,13 @@ def build_ffmpeg_command(
                 f"{mw}x{mh}",
             ]
         cmd += ["-i", "desktop"]
-        vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+        if mw > 0 and mh > 0 and mw <= w and mh <= h and (mw % 2 == 0) and (mh % 2 == 0):
+            vf = f"format={pix_fmt}"
+        else:
+            vf = (
+                f"scale=w={w}:h={h}:force_original_aspect_ratio=decrease"
+                f":force_divisible_by=2:flags=fast_bilinear,format={pix_fmt}"
+            )
 
     has_audio = False
     if synthetic_audio and src_id == "synthetic":
@@ -1025,7 +1088,8 @@ def build_ffmpeg_command(
     if has_audio:
         cmd += ["-map", "1:a:0"]
 
-    cmd += ["-vf", vf]
+    if vf:
+        cmd += ["-vf", vf]
     cmd += _encoder_args(encoder, quality, fps)
     if has_audio:
         cmd += ["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000"]
@@ -1739,22 +1803,47 @@ class ScreenShareWorkerApp:
         self._tunnel_proc = None
         self._terminate_proc(tun, close_stdin=False)
 
+    def _active_child_pids(self) -> list[int]:
+        pids: list[int] = []
+        for proc in (self._ffmpeg_proc, self._tunnel_proc):
+            if proc is not None and proc.poll() is None:
+                try:
+                    pid = int(proc.pid)
+                    if pid > 0:
+                        pids.append(pid)
+                except Exception:
+                    pass
+        return pids
+
     def _start_ram_reporter(self) -> None:
         self._stop_ram_reporter()
 
         async def _ram_loop() -> None:
-            from swiftplay.windows_os import get_pid_memory_mb, get_process_memory_mb
+            from swiftplay.windows_os import (
+                get_pid_memory_mb,
+                get_process_memory_mb,
+                trim_process_memory,
+            )
 
+            tick = 0
             while self._sharing:
                 try:
+                    tick += 1
                     ws, priv = get_process_memory_mb()
-                    for proc in (self._ffmpeg_proc, self._tunnel_proc):
-                        if proc is not None and proc.poll() is None:
-                            p_ws, p_priv = get_pid_memory_mb(int(proc.pid))
-                            ws += p_ws
-                            priv += p_priv
+                    child_pids = self._active_child_pids()
+                    for pid in child_pids:
+                        p_ws, p_priv = get_pid_memory_mb(pid)
+                        ws += p_ws
+                        priv += p_priv
+                    if tick % 12 == 0:
+                        trim_process_memory(collect_gc=False)
                     self.emit_event(
-                        "worker_ram", {"ws_mb": round(ws, 1), "priv_mb": round(priv, 1)}
+                        "worker_ram",
+                        {
+                            "ws_mb": round(ws, 1),
+                            "priv_mb": round(priv, 1),
+                            "child_pids": child_pids,
+                        },
                     )
                 except Exception:
                     pass
@@ -1782,7 +1871,7 @@ class ScreenShareWorkerApp:
                 pass
             self._relay = None
         if emit_idle:
-            self.emit_event("worker_ram", {"ws_mb": 0.0, "priv_mb": 0.0})
+            self.emit_event("worker_ram", {"ws_mb": 0.0, "priv_mb": 0.0, "child_pids": []})
             self.emit_event("state", {"state": "idle"})
 
     async def _spawn_ffmpeg_and_wait_init(
@@ -1891,6 +1980,8 @@ class ScreenShareWorkerApp:
             if proc.stdout is None:
                 return
             for line in proc.stdout:
+                if found_url.done():
+                    continue
                 txt = line.strip()
                 if txt:
                     tail.append(txt)
@@ -1899,7 +1990,6 @@ class ScreenShareWorkerApp:
                 m = _CLOUDFLARED_URL_RE.search(txt)
                 if m and not found_url.done():
                     loop.call_soon_threadsafe(found_url.set_result, m.group(0).rstrip("/"))
-                    break
 
         t = threading.Thread(target=_reader, daemon=True, name="cloudflared-reader")
         t.start()
@@ -1962,7 +2052,14 @@ class ScreenShareWorkerApp:
         if source_id == "synthetic":
             attempts = [("synthetic", False)]
         elif source.get("kind") == "monitor":
-            attempts = [("ddagrab", use_wasapi), ("gdigrab", use_wasapi)]
+            if encoder in ("h264_nvenc", "h264_amf"):
+                attempts = [
+                    ("ddagrab_gpu", use_wasapi),
+                    ("ddagrab", use_wasapi),
+                    ("gdigrab", use_wasapi),
+                ]
+            else:
+                attempts = [("ddagrab", use_wasapi), ("gdigrab", use_wasapi)]
             if use_wasapi:
                 attempts.append(("gdigrab", False))
         else:
@@ -1990,7 +2087,7 @@ class ScreenShareWorkerApp:
                     relay,
                     use_wasapi=attempt_wasapi,
                     exclude_pid=exclude_pid,
-                    timeout_s=3.5,
+                    timeout_s=(2.0 if backend == "ddagrab_gpu" else 3.5),
                 )
             except Exception as exc:
                 self._ffmpeg_stderr_tail.append(str(exc))
@@ -2064,6 +2161,7 @@ class ScreenShareWorkerApp:
             "ws_url": f"{base_url.replace('https://', 'wss://').replace('http://', 'ws://')}/ws{token_q}",
             "token": relay.token,
             "port": port,
+            "child_pids": self._active_child_pids(),
         }
         if reconfigured:
             out["reconfigured"] = True

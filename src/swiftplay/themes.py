@@ -927,6 +927,37 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
         border: 1px solid {p.border_bright};
         border-radius: 12px;
     }}
+
+    QLabel#ScreenShareLiveBadge, QPushButton#ScreenShareLiveBadge {{
+        background-color: #DC2626;
+        color: #FFFFFF;
+        border: none;
+        border-radius: 6px;
+        padding: 1px 6px;
+        font-size: 10px;
+        font-weight: 700;
+    }}
+
+    QPushButton#ScreenShareLiveBadge:hover {{
+        background-color: #EF4444;
+        color: #FFFFFF;
+    }}
+
+    QPushButton#ScreenShareCardWatchBtn {{
+        background-color: #2A1B20;
+        color: #F1F3F6;
+        border: 1px solid #991B1B;
+        border-radius: 8px;
+        padding: 3px 9px;
+        font-size: 11px;
+        font-weight: 600;
+    }}
+
+    QPushButton#ScreenShareCardWatchBtn:hover {{
+        background-color: #B91C1C;
+        color: #FFFFFF;
+        border-color: #EF4444;
+    }}
     """
 
 

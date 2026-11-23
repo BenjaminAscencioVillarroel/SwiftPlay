@@ -14,6 +14,40 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-23 — Fix Desconexiones Aleatorias de Discord y Caídas de Llamada de Voz
+- **Files:** `src/swiftplay/discord_service.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/ui/discord_panel.py`, `scripts/verify_swiftplay.py`
+- **Root Causes:** `on_voice_state_update` expulsaba inmediatamente la llamada durante reconexiones transitorias del servidor de voz (`after.channel is None`), `DiscordService.stop_if_idle()` mataba sesiones conectadas fuera de llamada al minimizar a bandeja/mini-barra/trim, `VoiceConnectionState.timeout` quedaba en `7s` en llamadas largas, `on_ready` podía limpiar voz al reconectar el Gateway y `_connect_bot` no tenía bucle automático de reconexión ante caídas transitorias de Gateway.
+- **Changes / Decisions:**
+  - **`DiscordService.stop_if_idle()` (`discord_service.py`):** Solo cierra el worker si `_state in ("disconnected", "error")` y no está en llamada.
+  - **Gracia + Auto-Rejoin de Voz y Watchdog (`discord_worker.py`):** `_SwiftVoiceConnectionState` registra `last_close_code` y fuerza `socket_reader.resume(force=True)` tras handshake; `_join_channel()` eleva `vc._connection.timeout = 25.0`; `on_voice_state_update` inicia `_verify_voice_drop_after_grace()` (hasta `12s`) distinguiendo kick/borrado real de canal (`4014`/`4022`) frente a reconexiones internas o saltos de región/servidor (`_schedule_auto_rejoin()` hasta 3 intentos); watchdog pasivo en `_housekeeping_loop()` y diagnóstico con tope de `200 KB` en `%LOCALAPPDATA%\SwiftPlay\logs\discord_voice_diag.log`.
+  - **Reconexión Automática de Gateway (`discord_worker.py`, `discord_panel.py`):** `_connect_bot()` reintenta con backoff (`2s..30s`) conservando `_desired_voice_target` para reingresar a la llamada al volver `on_ready()` (sin limpiar sesiones activas) y muestra `"Reconectando..."` / `"Reconectando voz · <canal>"` en la UI.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+## 2026-11-23 — Optimización Screen Share (GPU D3D11 Zero-Copy / `fast_bilinear`+`nv12`, Guard WASAPI y Monitor Unificado)
+- **Files:** `src/swiftplay/screen_share_worker.py`, `src/swiftplay/screen_share_service.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Pipeline FFmpeg de Bajo CPU/RAM (`screen_share_worker.py`):** `_encoder_args("h264_nvenc")` añade `-zerolatency 1 -rc-lookahead 0`; `build_ffmpeg_command()` usa `-threads 1` para encoders HW, nuevo backend prioritario `ddagrab_gpu` (D3D11 nativo directo a `h264_nvenc` o `scale_d3d11=format=nv12` sin `hwdownload`) con fallback rápido `timeout_s=2.0`, y rutas CPU/GDI optimizadas a un solo escalado `:flags=fast_bilinear` + `format=nv12` (o sin filtro `scale` si ya cabe parmente en la resolución objetivo).
+  - **Estabilidad de Worker (`screen_share_worker.py`):** `WasapiLoopbackCapture._worker()` corta explícitamente el bucle interno con `hr != 0` (protección contra `AUDCLNT_S_BUFFER_EMPTY = 0x08890001` positivo) y tope de `64` paquetes por tick; `_start_cloudflared()` sigue drenando `stdout` hasta EOF sin romper el pipe tras obtener la URL.
+  - **Árbol Completo en Monitor Lateral (`screen_share_worker.py`, `screen_share_service.py`, `main_window.py`):** El worker reporta `child_pids` (`ffmpeg.exe`, `cloudflared.exe`) en `state` y `worker_ram` (con trim periódico de WorkingSet cada 30 s); `ScreenShareService.active_pids` y `MainWindow._refresh_resource_monitor()` incluyen esos PIDs para sumar `CPU`, `GPU` y `TOTAL (+DS)` bajo una sola métrica en SwiftPlay.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+## 2026-11-23 — Optimización Masiva CPU/RAM (Fin Spin-Wait OpenMP/OpenBLAS + Techo RAM + Monitor Proceso Completo)
+- **Files:** `src/swiftplay/windows_os.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/screen_share_service.py`, `src/swiftplay/ytdlp_worker.py`, `src/swiftplay/youtube_service.py`, `src/swiftplay/player.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Root Causes Diagnosed Live:** `pysilero_vad` (`ggml-cpu`) lanzaba hilos OpenMP con `OMP_WAIT_POLICY=ACTIVE` quemando `~25%` CPU constante (`3` núcleos al `100%`) y `numpy`/OpenBLAS multi-hilo reservaba `+353 MB` de commit privado (`~501 MB` en `discord_worker`), mientras el monitor lateral solo medía `CPU`/`GPU` del GUI (ignorando `discord_worker`) y reportaba `WorkingSet` en vez de `PrivateWorkingSet`.
+- **Changes / Decisions:**
+  - **1 Hilo + Espera Pasiva (`windows_os.py`, `discord_worker.py`):** Fijados `OMP_NUM_THREADS=1`, `OMP_WAIT_POLICY=PASSIVE`, `OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `NUMEXPR_NUM_THREADS=1`, `RAYON_NUM_THREADS=1`, `GGML_NUM_THREADS=1` tanto al arrancar `discord_worker.py` como en `resolve_worker_python_and_env()`, eliminando el spin-wait en reposo (`0.0 ms` CPU idle) y bajando el commit privado del worker con IA activa de `~501 MB` a `~132 MB`.
+  - **DSP Cero-Copias & Fast-Path (`discord_worker.py`):** Buffer reutilizado `self._out_full` + escala/clip in-place en `_DeepFilterMicDsp`, bypass digital para silencio puro (`rms < 15` sin hablar) y espera adaptativa (`0.25 s` en reposo) en `_mic_sender_loop()`.
+  - **Techo de RAM GUI + `libmpv` (`main_window.py`, `player.py`):** `QPixmapCache` reducido a `1024 KB`, `ThumbnailCache` a `24`, limpieza automática de páginas de catálogo ocultas al entrar a video con `>24` tarjetas o cuando la GUI supera `135 MB` en Video/Discord, y `demuxer_max_bytes="3MiB"`.
+  - **Métricas Reales de Árbol de Procesos (`windows_os.py`, `main_window.py`, servicios):** `get_process_memory_mb` / `get_pid_memory_mb` usan `PROCESS_MEMORY_COUNTERS_EX2` (`PrivateWorkingSetSize` = columna Memoria del Administrador de tareas), y `SystemResourceMonitor.sample(extra_pids=...)` suma el CPU% y GPU% reales de GUI + `discord_worker` + `screen_share_worker` + `ytdlp_worker`.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+## 2026-11-23 — Descubrimiento Nativo de Pantalla Compartida SwiftPlay-a-SwiftPlay sin Links (Presencia Discord + UI `EN VIVO`)
+- **Files:** `src/swiftplay/screen_share_service.py`, `src/swiftplay/discord_service.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/discord_panel.py`, `.agents/ARCHITECTURE.md`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Beacon Compacto en Presencia Discord (`screen_share_service.py`, `discord_service.py`, `discord_worker.py`):** Quien transmite ahora publica automáticamente su sesión vía `CustomActivity` (`sws1|<host>|<token>|<quality>|<fps>|<audio>|<rev>`, ≤ 128 chars) al iniciar, reconfigurar o detener la compartida (sin enviar ningún enlace al chat salvo que el usuario lo marque explícitamente para Discord oficial). Los demás clientes SwiftPlay en el servidor descubren la transmisión en `on_ready()`, `guild.chunk`, `on_presence_update` y `on_voice_state_update`, ocultando el token crudo en `_format_member_activity()` y limpiando el estado al desconectar.
+  - **Botones Nativos `EN VIVO` / `Ver pantalla` (`discord_panel.py`, `themes.py`):** Cada participante transmitiendo muestra insignia `EN VIVO` y botón `Ver pantalla` en `_ParticipantCard`, un botón `EN VIVO` clicable junto a su nombre en los canales de voz de la barra lateral, y el banner superior del panel de voz (ocultando el botón `Navegador` cuando proviene de presencia nativa y recargando el visor automáticamente si quien comparte cambia ventana/FPS/calidad en vivo).
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
 ## 2026-11-23 — Fix Pantalla Azul D3D11 (`libmpv`) al Alternar con `Tab` y Nombres DM Numéricos
 - **Files:** `src/swiftplay/player.py`, `src/swiftplay/ui/video_surface.py`, `src/swiftplay/ui/main_window.py`, `src/swiftplay/storage.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/ui/discord_panel.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

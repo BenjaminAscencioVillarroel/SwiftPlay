@@ -15,6 +15,17 @@ from datetime import datetime, timedelta
 import json
 import math
 import os
+
+for _env_k, _env_v in (
+    ("OMP_NUM_THREADS", "1"),
+    ("OMP_WAIT_POLICY", "PASSIVE"),
+    ("OPENBLAS_NUM_THREADS", "1"),
+    ("MKL_NUM_THREADS", "1"),
+    ("NUMEXPR_NUM_THREADS", "1"),
+    ("RAYON_NUM_THREADS", "1"),
+    ("GGML_NUM_THREADS", "1"),
+):
+    os.environ.setdefault(_env_k, _env_v)
 import queue
 import re
 import struct
@@ -23,6 +34,11 @@ import threading
 import time
 import warnings
 from typing import Any, Callable, Literal
+
+from swiftplay.screen_share_service import (
+    encode_screen_share_presence,
+    parse_screen_share_presence,
+)
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
@@ -333,6 +349,7 @@ class _DeepFilterMicDsp:
         self._hop = 480
         self._in_buf: Any = None
         self._out_buf: Any = None
+        self._out_full: Any = None
         self._in_ptr: Any = None
         self._out_ptr: Any = None
         self._np: Any = None
@@ -359,6 +376,7 @@ class _DeepFilterMicDsp:
         self._df_state = None
         self._in_buf = None
         self._out_buf = None
+        self._out_full = None
         self._in_ptr = None
         self._out_ptr = None
         if st and self._lib is not None:
@@ -419,6 +437,7 @@ class _DeepFilterMicDsp:
             self._hop = hop
             self._in_buf = np.zeros(hop, dtype=np.float32)
             self._out_buf = np.zeros(hop, dtype=np.float32)
+            self._out_full = np.zeros(FRAME_SAMPLES, dtype=np.float32)
             self._in_ptr = self._in_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
             self._out_ptr = self._out_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
             self._apply_params_locked()
@@ -522,13 +541,20 @@ class _DeepFilterMicDsp:
         except Exception:
             pass
 
-    def process_20ms(self, raw_mono: bytes) -> tuple[bytes, float, float | None] | None:
+    def process_20ms(
+        self, raw_mono: bytes, *, is_speaking: bool = False
+    ) -> tuple[bytes, float, float | None] | None:
         if len(raw_mono) != MONO_FRAME_BYTES:
             return raw_mono, 1.0, None
         with self._lock:
             if not self._ensure_ready_locked():
                 return None
             try:
+                if not is_speaking and _pcm_rms(raw_mono) < 15:
+                    self._hp_prev_x = 0.0
+                    self._hp_prev_y = 0.0
+                    return b"\x00" * MONO_FRAME_BYTES, -15.0, 0.0
+
                 np = self._np
                 lib = self._lib
                 st = self._df_state
@@ -551,18 +577,18 @@ class _DeepFilterMicDsp:
                 self._hp_prev_y = py
 
                 hp_arr = np.asarray(hp, dtype=np.float32)
-                clean_parts = []
+                out_full = self._out_full
                 max_lsnr = -15.0
                 for off in range(0, FRAME_SAMPLES, hop):
                     np.copyto(self._in_buf, hp_arr[off : off + hop])
                     lsnr = float(lib.df_process_frame(st, self._in_ptr, self._out_ptr))
                     if lsnr > max_lsnr:
                         max_lsnr = lsnr
-                    clean_parts.append(self._out_buf.copy())
+                    out_full[off : off + hop] = self._out_buf
 
-                clean_f = np.concatenate(clean_parts) if len(clean_parts) > 1 else clean_parts[0]
-                clean_i16 = np.clip(clean_f * 32767.0, -32768.0, 32767.0).astype(np.int16)
-                clean_bytes = clean_i16.tobytes()
+                np.multiply(out_full, 32767.0, out=out_full)
+                np.clip(out_full, -32768.0, 32767.0, out=out_full)
+                clean_bytes = out_full.astype(np.int16).tobytes()
                 silero_prob = self._silero.process_20ms(clean_bytes)
                 return clean_bytes, max_lsnr, silero_prob
             except Exception:
@@ -703,7 +729,7 @@ class MicProcessor:
 
         if df_dsp is not None and ns_mode in ("ai", "ai_max"):
             if df_dsp.is_ready:
-                df_res = df_dsp.process_20ms(raw_mono_frame)
+                df_res = df_dsp.process_20ms(raw_mono_frame, is_speaking=speaking)
                 if df_res is not None:
                     work_frame, lsnr_db, silero_prob = df_res
                     use_dsp = True
@@ -1970,7 +1996,8 @@ class AudioEngine:
         aop = _get_audioop()
         while self._running:
             try:
-                raw = self._mic_queue.get(timeout=0.08)
+                wait_s = 0.08 if self._local_speaking else 0.25
+                raw = self._mic_queue.get(timeout=wait_s)
             except queue.Empty:
                 now = time.monotonic()
                 if self._mic_proc.check_hangover(now) and self._local_speaking:
@@ -2043,6 +2070,8 @@ def _make_voice_client_cls(on_init: Callable[[Any], None] | None = None):
 
         def __init__(self, voice_client: discord.VoiceClient, *, hook: Any = None) -> None:
             super().__init__(voice_client, hook=hook)
+            self.last_close_code: int = 0
+            self.last_close_reason: str = ""
             self.connect_timings: dict[str, Any] = {
                 "t0": time.perf_counter(),
                 "op4_ms": 0,
@@ -2145,6 +2174,17 @@ def _make_voice_client_cls(on_init: Callable[[Any], None] | None = None):
                 return ip, port
 
             ws.discover_ip = _fast_discover_ip  # type: ignore[method-assign]
+            orig_poll = ws.poll_event
+
+            async def _tracked_poll_event() -> Any:
+                try:
+                    return await orig_poll()
+                except ConnectionClosed as exc:
+                    state.last_close_code = int(getattr(exc, "code", 0) or 0)
+                    state.last_close_reason = str(getattr(exc, "reason", "") or "")
+                    raise
+
+            ws.poll_event = _tracked_poll_event  # type: ignore[method-assign]
             return ws
 
         async def _handshake_websocket(self) -> None:
@@ -2156,7 +2196,15 @@ def _make_voice_client_cls(on_init: Callable[[Any], None] | None = None):
             while self.ws.secret_key is None:
                 await self.ws.poll_event()
             self.connect_timings["key_ms"] = max(0, int((time.perf_counter() - t0) * 1000))
+            self.last_close_code = 0
+            self.last_close_reason = ""
             self.state = ConnectionFlowState.connected
+            try:
+                sr = getattr(self, "_socket_reader", None)
+                if sr is not None:
+                    sr.resume(force=True)
+            except Exception:
+                pass
 
     class SwiftVoiceClient(discord.VoiceClient):
         """VoiceClient con recepción UDP DAVE E2EE + envío directo de micrófono."""
@@ -2516,8 +2564,30 @@ _STATUS_ORDER: dict[str, int] = {
 }
 
 
+def _extract_presence_screen_share(member: Any) -> dict[str, Any] | None:
+    """Extrae un beacon `sws1|...` de pantalla compartida desde las actividades del miembro."""
+    acts = list(getattr(member, "activities", None) or ())
+    if not acts:
+        single = getattr(member, "activity", None)
+        if single is not None:
+            acts = [single]
+    for act in acts:
+        for field in ("state", "name", "details"):
+            val = getattr(act, field, None)
+            if not val:
+                continue
+            parsed = parse_screen_share_presence(str(val))
+            if parsed is not None:
+                return parsed
+    return None
+
+
 def _format_member_activity(member: Any) -> str:
     """Devuelve texto breve de actividad o estado personalizado de un miembro."""
+    ss = _extract_presence_screen_share(member)
+    if ss is not None:
+        return f"🔴 Compartiendo pantalla ({ss['quality']} {ss['fps']}fps)"
+
     acts = list(getattr(member, "activities", None) or ())
     if not acts:
         single = getattr(member, "activity", None)
@@ -2735,6 +2805,15 @@ class DiscordWorkerApp:
         self._post_join_task: asyncio.Task[Any] | None = None
         self._joining_channel_id: str = ""
         self._last_join_diag: str = ""
+        self._desired_voice_target: tuple[int, int] | None = None
+        self._desired_voice_meta: tuple[str, str] = ("", "")
+        self._voice_reconnecting: bool = False
+        self._vc_disconnected_since: float = 0.0
+        self._voice_drop_task: asyncio.Task[Any] | None = None
+        self._voice_rejoin_attempts: int = 0
+        self._initial_ready_done: bool = False
+        self._manual_disconnect: bool = False
+        self._gw_backoff: float = 2.0
 
         self._mixer = VoiceAudioMixer()
         self._audio: AudioEngine | None = None
@@ -2762,6 +2841,8 @@ class DiscordWorkerApp:
         self._presence_dirty_guilds: set[int] = set()
         self._chunked_guilds: set[int] = set()
         self._last_presence_emit = 0.0
+        self._local_share_presence: dict[str, Any] | None = None
+        self._presence_shares: dict[int, dict[str, Any]] = {}
 
     def _emit_json(self, obj: dict[str, Any]) -> None:
         line = json.dumps(obj, ensure_ascii=False) + "\n"
@@ -2966,6 +3047,135 @@ class DiscordWorkerApp:
                     out[k] = st
         return out
 
+    async def _set_screen_share_presence(self, share: dict[str, Any] | None) -> None:
+        import discord
+
+        if isinstance(share, dict) and str(share.get("watch_url") or "").strip():
+            self._local_share_presence = dict(share)
+        else:
+            self._local_share_presence = None
+
+        client = self._client
+        if client is None or not client.is_ready():
+            return
+        if self._local_share_presence:
+            s = self._local_share_presence
+            beacon = encode_screen_share_presence(
+                str(s.get("watch_url") or ""),
+                quality=str(s.get("quality") or "720p"),
+                fps=int(s.get("fps") or 30),
+                has_audio=bool(s.get("has_audio", True)),
+                rev=int(s.get("rev") or 1),
+            )
+            if beacon:
+                await client.change_presence(
+                    status=discord.Status.online,
+                    activity=discord.CustomActivity(name=beacon),
+                )
+                return
+        await client.change_presence(status=discord.Status.online, activity=None)
+
+    def _sync_member_presence_share(
+        self, guild: Any, member: Any, *, emit_snapshots: bool = True
+    ) -> bool:
+        if member is None:
+            return False
+        uid = _safe_int(getattr(member, "id", 0))
+        client = self._client
+        bot_id = int(client.user.id) if client and client.user else 0
+        if not uid or (bot_id and uid == bot_id):
+            return False
+
+        info = _extract_presence_screen_share(member)
+        if info is not None:
+            voice = getattr(member, "voice", None)
+            vch = getattr(voice, "channel", None)
+            ch_id_str = str(getattr(vch, "id", "") or "") if vch is not None else ""
+            ch_name = str(getattr(vch, "name", "") or "") if vch is not None else ""
+            g_id_str = str(getattr(guild, "id", "") or "") if guild is not None else ""
+            g_name = str(getattr(guild, "name", "") or "") if guild is not None else ""
+            author_name = str(
+                getattr(member, "display_name", "") or getattr(member, "name", "") or uid
+            )
+            payload: dict[str, Any] = {
+                "guild_id": g_id_str,
+                "guild_name": g_name,
+                "channel_id": ch_id_str,
+                "channel_name": ch_name,
+                "message_id": "",
+                "author_id": str(uid),
+                "author_name": author_name,
+                "author_avatar_url": _member_avatar_url(member),
+                "watch_url": info["watch_url"],
+                "stream_url": info["stream_url"],
+                "token": info["token"],
+                "quality": info["quality"],
+                "fps": info["fps"],
+                "has_audio": info["has_audio"],
+                "rev": info["rev"],
+                "source": "presence",
+                "is_self": False,
+            }
+            new_sig = (
+                payload["stream_url"],
+                payload["quality"],
+                payload["fps"],
+                payload["has_audio"],
+                payload["rev"],
+                payload["channel_id"],
+            )
+            prev = self._presence_shares.get(uid)
+            prev_sig = (
+                (
+                    prev.get("stream_url"),
+                    prev.get("quality"),
+                    prev.get("fps"),
+                    prev.get("has_audio"),
+                    prev.get("rev"),
+                    prev.get("channel_id"),
+                )
+                if prev is not None
+                else None
+            )
+            if new_sig == prev_sig:
+                return False
+            self._presence_shares[uid] = payload
+            self.emit_event("screen_share_detected", payload)
+            if emit_snapshots:
+                self._emit_snapshots()
+            return True
+
+        if uid not in self._presence_shares:
+            return False
+        if client is not None:
+            for og in list(getattr(client, "guilds", ()) or ()):
+                if guild is not None and getattr(og, "id", None) == getattr(guild, "id", None):
+                    continue
+                om = og.get_member(uid) if hasattr(og, "get_member") else None
+                if om is not None and _extract_presence_screen_share(om) is not None:
+                    return False
+        self._presence_shares.pop(uid, None)
+        self.emit_event(
+            "screen_share_ended",
+            {"author_id": str(uid), "source": "presence"},
+        )
+        if emit_snapshots:
+            self._emit_snapshots()
+        return True
+
+    def _scan_guild_presence_shares(
+        self, guild: Any, *, emit_snapshots: bool = False
+    ) -> bool:
+        if guild is None:
+            return False
+        changed = False
+        for m in list(getattr(guild, "members", None) or ()):
+            if self._sync_member_presence_share(guild, m, emit_snapshots=False):
+                changed = True
+        if changed and emit_snapshots:
+            self._emit_snapshots()
+        return changed
+
     def _build_guilds_snapshot(self) -> list[dict[str, Any]]:
         client = self._client
         if client is None or not client.is_ready():
@@ -2986,6 +3196,7 @@ class DiscordWorkerApp:
                             "status": self._resolve_member_status(g, uid),
                             "muted": bool(getattr(vs, "self_mute", False) or getattr(vs, "mute", False)),
                             "deafened": bool(getattr(vs, "self_deaf", False) or getattr(vs, "deaf", False)),
+                            "screen_share": dict(self._presence_shares[uid]) if uid in self._presence_shares else None,
                         }
                     )
                 perms = ch.permissions_for(g.me) if g.me is not None else None
@@ -3030,9 +3241,63 @@ class DiscordWorkerApp:
 
     def _build_voice_state_dict(self) -> dict[str, Any]:
         vc = self._vc
+        if (
+            vc is not None
+            and not vc.is_connected()
+            and self._voice_reconnecting
+            and self._desired_voice_target is not None
+        ):
+            gid_d, cid_d = self._desired_voice_target
+            g_name_d, ch_name_d = self._desired_voice_meta
+            parts_d: list[dict[str, Any]] = []
+            ch_obj = getattr(vc, "channel", None)
+            if ch_obj is None and self._client is not None:
+                g_obj = self._client.get_guild(gid_d)
+                ch_obj = g_obj.get_channel(cid_d) if g_obj is not None else None
+            if ch_obj is not None and getattr(ch_obj, "guild", None) is not None:
+                g_ref = ch_obj.guild
+                for uid_key, vs in (getattr(ch_obj, "voice_states", None) or {}).items():
+                    uid, name, is_bot, av_url = self._resolve_member_name(g_ref, int(uid_key))
+                    parts_d.append(
+                        {
+                            "id": str(uid),
+                            "name": name,
+                            "is_bot": is_bot,
+                            "avatar_url": av_url,
+                            "status": self._resolve_member_status(g_ref, uid),
+                            "is_self": bool(
+                                self._client and self._client.user and uid == self._client.user.id
+                            ),
+                            "muted": bool(getattr(vs, "self_mute", False) or getattr(vs, "mute", False)),
+                            "deafened": bool(
+                                getattr(vs, "self_deaf", False) or getattr(vs, "deaf", False)
+                            ),
+                            "screen_share": dict(self._presence_shares[uid])
+                            if uid in self._presence_shares
+                            else None,
+                        }
+                    )
+            return {
+                "in_voice": True,
+                "reconnecting": True,
+                "joining_channel_id": str(cid_d),
+                "guild_id": str(gid_d),
+                "guild_name": g_name_d,
+                "channel_id": str(cid_d),
+                "channel_name": ch_name_d or "Voz",
+                "muted": self._muted,
+                "deafened": self._deafened,
+                "mic_test": self._mic_test_active,
+                "dave_active": False,
+                "dave_code": "",
+                "connect_diag": "Reconectando voz...",
+                "participants": parts_d,
+            }
+
         if vc is None or not vc.is_connected() or getattr(vc, "channel", None) is None:
             return {
                 "in_voice": False,
+                "reconnecting": False,
                 "joining_channel_id": self._joining_channel_id,
                 "guild_id": "",
                 "channel_id": "",
@@ -3062,10 +3327,12 @@ class DiscordWorkerApp:
                     "is_self": bool(self._client and self._client.user and uid == self._client.user.id),
                     "muted": bool(getattr(vs, "self_mute", False) or getattr(vs, "mute", False)),
                     "deafened": bool(getattr(vs, "self_deaf", False) or getattr(vs, "deaf", False)),
+                    "screen_share": dict(self._presence_shares[uid]) if uid in self._presence_shares else None,
                 }
             )
         return {
             "in_voice": True,
+            "reconnecting": bool(self._voice_reconnecting),
             "joining_channel_id": self._joining_channel_id,
             "guild_id": str(g.id),
             "guild_name": str(g.name),
@@ -3137,7 +3404,20 @@ class DiscordWorkerApp:
 
     def _attach_client_events(self, client: Any) -> None:
         @client.event
+        async def on_disconnect() -> None:
+            self._write_voice_diag("GATEWAY_DISCONNECT")
+
+        @client.event
+        async def on_resumed() -> None:
+            self._gw_backoff = 2.0
+            self._write_voice_diag("GATEWAY_RESUMED")
+
+        @client.event
         async def on_ready() -> None:
+            is_initial = not self._initial_ready_done
+            self._initial_ready_done = True
+            self._gw_backoff = 2.0
+            self._write_voice_diag(f"GATEWAY_READY initial={is_initial}")
             self._state = "connected"
             user = client.user
             self.emit_event(
@@ -3151,31 +3431,51 @@ class DiscordWorkerApp:
                     "presences": self._collect_known_presences(),
                 },
             )
+            for g in list(getattr(client, "guilds", ()) or ()):
+                self._scan_guild_presence_shares(g, emit_snapshots=False)
             self._emit_snapshots()
+            if self._local_share_presence is not None:
+                try:
+                    await self._set_screen_share_presence(self._local_share_presence)
+                except Exception:
+                    pass
             if self._active_guild_id:
                 await self._select_guild(self._active_guild_id)
             try:
                 self._ensure_audio_engine().warmup_async()
             except Exception:
                 pass
-            try:
-                async def _clear_orphan_voice_sessions() -> None:
-                    for g in list(getattr(client, "guilds", ()) or ()):
-                        me = getattr(g, "me", None)
-                        vs = getattr(me, "voice", None) if me is not None else None
-                        if (
-                            vs is not None
-                            and getattr(vs, "channel", None) is not None
-                            and getattr(g, "voice_client", None) is None
-                        ):
-                            try:
-                                await g.change_voice_state(channel=None)
-                            except Exception:
-                                pass
+            if (
+                is_initial
+                and self._vc is None
+                and not self._joining_channel_id
+                and self._desired_voice_target is None
+            ):
+                try:
+                    async def _clear_orphan_voice_sessions() -> None:
+                        for g in list(getattr(client, "guilds", ()) or ()):
+                            me = getattr(g, "me", None)
+                            vs = getattr(me, "voice", None) if me is not None else None
+                            if (
+                                vs is not None
+                                and getattr(vs, "channel", None) is not None
+                                and getattr(g, "voice_client", None) is None
+                            ):
+                                try:
+                                    await g.change_voice_state(channel=None)
+                                except Exception:
+                                    pass
 
-                asyncio.create_task(_clear_orphan_voice_sessions())
-            except Exception:
-                pass
+                    asyncio.create_task(_clear_orphan_voice_sessions())
+                except Exception:
+                    pass
+            elif (
+                self._desired_voice_target is not None
+                and not self._manual_disconnect
+                and not self._joining_channel_id
+                and (self._vc is None or not self._vc.is_connected())
+            ):
+                asyncio.create_task(self._schedule_auto_rejoin("gateway_ready"))
             try:
                 from swiftplay.windows_os import trim_process_memory
 
@@ -3201,16 +3501,34 @@ class DiscordWorkerApp:
 
         @client.event
         async def on_voice_state_update(member: Any, before: Any, after: Any) -> None:
-            if (
-                client.user
-                and member.id == client.user.id
-                and after.channel is None
-                and self._vc is not None
-                and not self._joining_channel_id
-            ):
-                # Bot desconectado externamente del canal de voz
-                asyncio.create_task(self._leave_channel_internal())
-                return
+            if client.user and member.id == client.user.id:
+                if after.channel is not None:
+                    self._desired_voice_target = (
+                        int(after.channel.guild.id),
+                        int(after.channel.id),
+                    )
+                    self._desired_voice_meta = (
+                        str(getattr(after.channel.guild, "name", "") or ""),
+                        str(getattr(after.channel, "name", "") or ""),
+                    )
+                elif (
+                    after.channel is None
+                    and self._vc is not None
+                    and not self._joining_channel_id
+                    and not self._manual_disconnect
+                ):
+                    conn = getattr(self._vc, "_connection", None)
+                    expecting = bool(getattr(conn, "_expecting_disconnect", False))
+                    code = int(getattr(conn, "last_close_code", 0) or 0)
+                    self._write_voice_diag(
+                        f"VOICE_STATE_NONE expecting={expecting} code={code}"
+                    )
+                    if self._voice_drop_task is None or self._voice_drop_task.done():
+                        self._voice_drop_task = asyncio.create_task(
+                            self._verify_voice_drop_after_grace(self._vc)
+                        )
+                    return
+            self._sync_member_presence_share(getattr(member, "guild", None), member, emit_snapshots=False)
             self._emit_snapshots()
 
         @client.event
@@ -3225,6 +3543,7 @@ class DiscordWorkerApp:
                 if st not in _STATUS_ORDER:
                     st = "offline"
                 self.emit_event("presence", {"user_id": str(uid), "status": st})
+            self._sync_member_presence_share(g, after, emit_snapshots=True)
 
         @client.event
         async def on_member_join(member: Any) -> None:
@@ -3432,6 +3751,7 @@ class DiscordWorkerApp:
 
     async def _connect_bot(self) -> None:
         import discord
+        from discord.errors import ConnectionClosed
         from swiftplay.security import load_discord_token_decrypted
 
         token = load_discord_token_decrypted()
@@ -3443,53 +3763,96 @@ class DiscordWorkerApp:
         if self._client is not None:
             await self._disconnect_bot()
 
+        self._manual_disconnect = False
+        self._initial_ready_done = False
+        self._gw_backoff = 2.0
         self._state = "connecting"
         self.emit_event("state", {"state": "connecting"})
         self._voice_cls = _make_voice_client_cls(on_init=self._wire_voice_client)
+        fatal_gateway_codes = {4004, 4010, 4011, 4012, 4013, 4014}
 
         async def _runner() -> None:
             try:
-                self._privileged_intents_ok = True
-                client = self._build_client(True)
-                self._client = client
-                self._attach_client_events(client)
-                try:
-                    await client.start(token, reconnect=True)
-                except discord.PrivilegedIntentsRequired:
-                    self._privileged_intents_ok = False
+                while not self._manual_disconnect and (
+                    self._stop_event is None or not self._stop_event.is_set()
+                ):
+                    self._privileged_intents_ok = True
+                    client = self._build_client(True)
+                    self._client = client
+                    self._attach_client_events(client)
+                    fatal_err: str | None = None
                     try:
-                        await client.close()
-                    except Exception:
-                        pass
+                        try:
+                            await client.start(token, reconnect=True)
+                        except discord.PrivilegedIntentsRequired:
+                            self._privileged_intents_ok = False
+                            try:
+                                await client.close()
+                            except Exception:
+                                pass
+                            self.emit_event(
+                                "warning",
+                                {
+                                    "message": (
+                                        "Activa 'Presence Intent', 'Server Members Intent' y 'Message Content Intent' "
+                                        "en Discord Developer Portal para ver estados y chat completo. Conectando en modo Voz..."
+                                    )
+                                },
+                            )
+                            client2 = self._build_client(False)
+                            self._client = client2
+                            self._attach_client_events(client2)
+                            await client2.start(token, reconnect=True)
+                    except discord.LoginFailure:
+                        self._write_voice_diag("GATEWAY_LOGIN_FAIL")
+                        fatal_err = "Bot Token inválido o revocado en Discord Developer Portal."
+                    except asyncio.CancelledError:
+                        raise
+                    except ConnectionClosed as exc:
+                        code = int(getattr(exc, "code", 0) or 0)
+                        reason = str(getattr(exc, "reason", "") or "")
+                        self._write_voice_diag(f"GATEWAY_CLOSED code={code} reason={reason}")
+                        if code in fatal_gateway_codes:
+                            fatal_err = f"Discord cerró el Gateway (código {code})."
+                    except Exception as exc:
+                        self._write_voice_diag(f"GATEWAY_ERROR {type(exc).__name__}: {exc}")
+
+                    if fatal_err is not None:
+                        self._state = "error"
+                        self.emit_event("state", {"state": "error", "message": fatal_err})
+                        break
+
+                    if self._manual_disconnect or (
+                        self._stop_event is not None and self._stop_event.is_set()
+                    ):
+                        break
+
+                    saved_voice = self._desired_voice_target
+                    saved_meta = self._desired_voice_meta
+                    dead_client = self._client
+                    self._client = None
+                    await self._leave_channel_internal(trim_memory=False, clear_desired=False)
+                    self._desired_voice_target = saved_voice
+                    self._desired_voice_meta = saved_meta
+                    if dead_client is not None:
+                        try:
+                            await asyncio.wait_for(dead_client.close(), timeout=2.0)
+                        except Exception:
+                            pass
+
+                    self._state = "connecting"
+                    self.emit_event("state", {"state": "connecting", "reconnecting": True})
                     self.emit_event(
                         "warning",
-                        {
-                            "message": (
-                                "Activa 'Presence Intent', 'Server Members Intent' y 'Message Content Intent' "
-                                "en Discord Developer Portal para ver estados y chat completo. Conectando en modo Voz..."
-                            )
-                        },
+                        {"message": "Conexión con Discord interrumpida. Reconectando..."},
                     )
-                    client2 = self._build_client(False)
-                    self._client = client2
-                    self._attach_client_events(client2)
-                    await client2.start(token, reconnect=True)
-            except discord.LoginFailure:
-                self._state = "error"
-                self.emit_event(
-                    "state",
-                    {
-                        "state": "error",
-                        "message": "Bot Token inválido o revocado en Discord Developer Portal.",
-                    },
-                )
+                    wait_s = min(30.0, max(2.0, float(self._gw_backoff)))
+                    self._gw_backoff = min(30.0, wait_s * 2.0)
+                    await asyncio.sleep(wait_s)
             except asyncio.CancelledError:
                 pass
-            except Exception as exc:
-                self._state = "error"
-                self.emit_event("state", {"state": "error", "message": str(exc)})
             finally:
-                await self._leave_channel_internal()
+                await self._leave_channel_internal(clear_desired=True)
 
         self._bot_task = asyncio.create_task(_runner())
 
@@ -3520,7 +3883,167 @@ class DiscordWorkerApp:
                 pass
         self._joining_channel_id = ""
 
-    async def _leave_channel_internal(self, *, trim_memory: bool = True) -> None:
+    async def _verify_voice_drop_after_grace(self, vc_ref: Any) -> None:
+        if vc_ref is None or self._manual_disconnect or self._desired_voice_target is None:
+            return
+        self._voice_reconnecting = True
+        self.emit_event("voice_state", self._build_voice_state_dict())
+
+        t0 = time.monotonic()
+        try:
+            while (time.monotonic() - t0) < 12.0:
+                await asyncio.sleep(0.25)
+                if (
+                    self._manual_disconnect
+                    or self._joining_channel_id
+                    or self._desired_voice_target is None
+                    or self._vc is not vc_ref
+                ):
+                    return
+                if vc_ref.is_connected():
+                    self._voice_reconnecting = False
+                    self._vc_disconnected_since = 0.0
+                    self._voice_rejoin_attempts = 0
+                    try:
+                        sr = getattr(getattr(vc_ref, "_connection", None), "_socket_reader", None)
+                        if sr is not None:
+                            sr.resume(force=True)
+                    except Exception:
+                        pass
+                    self._write_voice_diag("VOICE_RECOVERED")
+                    asyncio.create_task(
+                        vc_ref.kickstart_voice(keep_speaking=not self._muted)
+                    )
+                    self._emit_snapshots()
+                    return
+                conn = getattr(vc_ref, "_connection", None)
+                runner = getattr(conn, "_runner", None) if conn is not None else None
+                connector = getattr(conn, "_connector", None) if conn is not None else None
+                runner_alive = (runner is not None and not runner.done()) or (
+                    connector is not None and not connector.done()
+                )
+                if not runner_alive and (time.monotonic() - t0) >= 1.2:
+                    break
+        except asyncio.CancelledError:
+            return
+
+        if (
+            self._manual_disconnect
+            or self._joining_channel_id
+            or self._vc is not vc_ref
+            or self._desired_voice_target is None
+        ):
+            return
+
+        conn = getattr(vc_ref, "_connection", None)
+        code = int(getattr(conn, "last_close_code", 0) or 0)
+        expecting = bool(getattr(conn, "_expecting_disconnect", False))
+        gid = self._desired_voice_target[0]
+        guild = self._client.get_guild(gid) if self._client is not None else None
+        me = getattr(guild, "me", None) if guild is not None else None
+        me_vs = getattr(me, "voice", None) if me is not None else None
+        me_in_voice = bool(me_vs is not None and getattr(me_vs, "channel", None) is not None)
+
+        if code in (4014, 4022) and not expecting and not me_in_voice:
+            self._write_voice_diag(f"VOICE_EXTERNAL_KICK code={code}")
+            self._desired_voice_target = None
+            self._desired_voice_meta = ("", "")
+            self._voice_reconnecting = False
+            self.emit_event(
+                "warning", {"message": "Fuiste desconectado del canal de voz."}
+            )
+            await self._leave_channel_internal(clear_desired=True)
+            return
+
+        self._write_voice_diag(f"VOICE_DROP_REJOIN code={code} expecting={expecting}")
+        await self._schedule_auto_rejoin(f"voice_drop_{code}")
+
+    async def _schedule_auto_rejoin(self, reason: str) -> None:
+        if (
+            self._manual_disconnect
+            or self._desired_voice_target is None
+            or self._client is None
+            or not self._client.is_ready()
+            or self._joining_channel_id
+        ):
+            return
+
+        if self._vc is not None and self._vc.is_connected():
+            self._voice_reconnecting = False
+            self._voice_rejoin_attempts = 0
+            self._vc_disconnected_since = 0.0
+            self._emit_snapshots()
+            return
+
+        while (
+            self._voice_rejoin_attempts < 3
+            and not self._manual_disconnect
+            and self._desired_voice_target is not None
+            and self._client is not None
+            and self._client.is_ready()
+            and not self._joining_channel_id
+        ):
+            self._voice_rejoin_attempts += 1
+            attempt = self._voice_rejoin_attempts
+            delay = (1.0, 2.5, 5.0)[min(attempt - 1, 2)]
+            if attempt == 1:
+                self.emit_event(
+                    "warning", {"message": "Reconectando al canal de voz..."}
+                )
+            await asyncio.sleep(delay)
+            if (
+                self._manual_disconnect
+                or self._desired_voice_target is None
+                or self._client is None
+                or not self._client.is_ready()
+                or self._joining_channel_id
+            ):
+                return
+            if self._vc is not None and self._vc.is_connected():
+                self._voice_reconnecting = False
+                self._voice_rejoin_attempts = 0
+                self._vc_disconnected_since = 0.0
+                self._emit_snapshots()
+                return
+
+            gid, cid = self._desired_voice_target
+            self._write_voice_diag(
+                f"VOICE_AUTO_REJOIN attempt={attempt} reason={reason} ch={cid}"
+            )
+            try:
+                await self._join_channel(gid, cid, is_rejoin=True)
+                self._voice_reconnecting = False
+                self._voice_rejoin_attempts = 0
+                self._vc_disconnected_since = 0.0
+                self._write_voice_diag("VOICE_AUTO_REJOIN_OK")
+                return
+            except Exception as exc:
+                self._write_voice_diag(
+                    f"VOICE_AUTO_REJOIN_FAIL attempt={attempt} err={exc}"
+                )
+
+        if self._voice_rejoin_attempts >= 3 and self._desired_voice_target is not None:
+            self._write_voice_diag(f"VOICE_REJOIN_EXHAUSTED reason={reason}")
+            self._desired_voice_target = None
+            self._desired_voice_meta = ("", "")
+            self._voice_reconnecting = False
+            self.emit_event(
+                "warning",
+                {"message": "Se perdió la conexión de voz tras varios reintentos."},
+            )
+            await self._leave_channel_internal(clear_desired=True)
+
+    async def _leave_channel_internal(
+        self, *, trim_memory: bool = True, clear_desired: bool = True
+    ) -> None:
+        dt = self._voice_drop_task
+        self._voice_drop_task = None
+        if dt is not None and not dt.done() and dt is not asyncio.current_task():
+            dt.cancel()
+            try:
+                await dt
+            except (asyncio.CancelledError, Exception):
+                pass
         pj = self._post_join_task
         self._post_join_task = None
         if pj is not None and not pj.done() and pj is not asyncio.current_task():
@@ -3557,6 +4080,12 @@ class DiscordWorkerApp:
                 pass
         self._joining_channel_id = ""
         self._connecting_vc = None
+        self._vc_disconnected_since = 0.0
+        self._voice_reconnecting = False
+        if clear_desired:
+            self._desired_voice_target = None
+            self._desired_voice_meta = ("", "")
+            self._voice_rejoin_attempts = 0
         self._dave_active = False
         self._dave_code = ""
         self._mic_test_active = False
@@ -3574,11 +4103,26 @@ class DiscordWorkerApp:
         self._emit_snapshots()
 
     async def _disconnect_bot(self) -> None:
+        self._manual_disconnect = True
+        self._desired_voice_target = None
+        self._desired_voice_meta = ("", "")
+        self._voice_reconnecting = False
+        self._voice_rejoin_attempts = 0
         await self._cancel_inflight_join()
-        await self._leave_channel_internal()
+        await self._leave_channel_internal(clear_desired=True)
         if self._audio is not None:
             self._audio.close()
         client = self._client
+        if client is not None and self._local_share_presence is not None:
+            try:
+                import discord
+
+                await asyncio.wait_for(
+                    client.change_presence(status=discord.Status.online, activity=None),
+                    timeout=1.0,
+                )
+            except Exception:
+                pass
         self._client = None
         if client is not None:
             try:
@@ -3599,6 +4143,8 @@ class DiscordWorkerApp:
         self._dm_channels.clear()
         self._presence_dirty_guilds.clear()
         self._chunked_guilds.clear()
+        self._presence_shares.clear()
+        self._local_share_presence = None
         self._state = "disconnected"
         self.emit_event("state", {"state": "disconnected"})
 
@@ -3618,6 +4164,7 @@ class DiscordWorkerApp:
                 self._chunked_guilds.add(gid)
             except Exception:
                 pass
+        self._scan_guild_presence_shares(guild, emit_snapshots=True)
         self._emit_guild_members(gid)
 
     async def _open_text_channel(self, guild_id: int, channel_id: int, limit: int = 50) -> None:
@@ -3903,8 +4450,12 @@ class DiscordWorkerApp:
             from swiftplay.paths import LOGS_DIR
 
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = LOGS_DIR / "discord_voice_diag.log"
+            if log_path.exists() and log_path.stat().st_size > 200_000:
+                tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]
+                log_path.write_text("\n".join(tail) + "\n", encoding="utf-8")
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(LOGS_DIR / "discord_voice_diag.log", "a", encoding="utf-8") as fh:
+            with open(log_path, "a", encoding="utf-8") as fh:
                 fh.write(f"[{ts}] {line}\n")
         except Exception:
             pass
@@ -4011,7 +4562,9 @@ class DiscordWorkerApp:
                 self._audio.release_dsp_idle()
         await self._sync_voice_flags()
 
-    async def _join_channel(self, guild_id: int, channel_id: int) -> None:
+    async def _join_channel(
+        self, guild_id: int, channel_id: int, *, is_rejoin: bool = False
+    ) -> None:
         async with self._voice_lock:
             if self._client is None or not self._client.is_ready():
                 raise RuntimeError("El bot aún no está conectado a Discord.")
@@ -4040,6 +4593,16 @@ class DiscordWorkerApp:
                         },
                     )
 
+            self._desired_voice_target = (int(guild_id), int(channel_id))
+            self._desired_voice_meta = (
+                str(getattr(guild, "name", "") or ""),
+                str(getattr(channel, "name", "") or ""),
+            )
+            if not is_rejoin:
+                self._voice_rejoin_attempts = 0
+                self._voice_reconnecting = False
+            self._vc_disconnected_since = 0.0
+
             if self._mic_test_active:
                 self._mic_test_active = False
                 prev_m, prev_d = self._mic_test_saved_flags or (False, False)
@@ -4061,6 +4624,9 @@ class DiscordWorkerApp:
                 and existing_vc.channel.guild.id == guild_id
             ):
                 self._vc = existing_vc
+                conn_ex = getattr(existing_vc, "_connection", None)
+                if conn_ex is not None:
+                    conn_ex.timeout = 25.0
                 if existing_vc.channel.id == channel_id:
                     engine = self._ensure_audio_engine()
                     engine.configure(muted=self._muted, loopback=False)
@@ -4068,6 +4634,7 @@ class DiscordWorkerApp:
                     if not engine._running:
                         await asyncio.to_thread(engine.start)
                     self._last_join_diag = "Conexión: ya activo en sala"
+                    self._voice_reconnecting = False
                     self._emit_snapshots()
                     return
                 self._joining_channel_id = str(channel_id)
@@ -4079,18 +4646,22 @@ class DiscordWorkerApp:
                     self._write_voice_diag(self._last_join_diag)
                 finally:
                     self._joining_channel_id = ""
+                if conn_ex is not None:
+                    conn_ex.timeout = 25.0
                 self._mixer.clear()
                 already_dave = bool(existing_vc._connection.can_encrypt)
                 self._dave_was_active = already_dave
                 self._dave_active = already_dave
                 self._dave_code = str(existing_vc.voice_privacy_code or "")
+                self._voice_reconnecting = False
+                self._vc_disconnected_since = 0.0
                 self._emit_snapshots()
                 self._post_join_task = asyncio.create_task(
                     self._finish_post_join(existing_vc, t_start)
                 )
                 return
 
-            await self._leave_channel_internal(trim_memory=False)
+            await self._leave_channel_internal(trim_memory=False, clear_desired=False)
             if (
                 guild.me is not None
                 and getattr(guild.me, "voice", None) is not None
@@ -4134,7 +4705,9 @@ class DiscordWorkerApp:
                         )
                         if attempt_idx == 0:
                             self._write_voice_diag(f"RETRY_1 {fail_diag}")
-                            await self._leave_channel_internal(trim_memory=False)
+                            await self._leave_channel_internal(
+                                trim_memory=False, clear_desired=False
+                            )
                             self._joining_channel_id = str(channel_id)
                             try:
                                 await guild.change_voice_state(channel=None)
@@ -4144,7 +4717,9 @@ class DiscordWorkerApp:
                             continue
                         self._last_join_diag = fail_diag
                         self._write_voice_diag(f"TIMEOUT {fail_diag}")
-                        await self._leave_channel_internal(trim_memory=False)
+                        await self._leave_channel_internal(
+                            trim_memory=False, clear_desired=not is_rejoin
+                        )
                         raise RuntimeError(
                             f"Tiempo de espera agotado al entrar en '{channel.name}'. "
                             "Revisa permisos del canal o conexión UDP."
@@ -4156,15 +4731,22 @@ class DiscordWorkerApp:
                         pending_vc, max(0, int((time.perf_counter() - t_start) * 1000))
                     )
                     self._write_voice_diag(f"ERROR {exc}: {fail_diag}")
-                    await self._leave_channel_internal(trim_memory=False)
+                    await self._leave_channel_internal(
+                        trim_memory=False, clear_desired=not is_rejoin
+                    )
                 raise
             finally:
                 self._joining_channel_id = ""
                 self._connecting_vc = None
 
             self._wire_voice_client(vc)
+            conn = getattr(vc, "_connection", None)
+            if conn is not None:
+                conn.timeout = 25.0
             self._connecting_vc = None
             self._vc = vc
+            self._voice_reconnecting = False
+            self._vc_disconnected_since = 0.0
             self._mixer.clear()
             already_dave = bool(vc._connection.can_encrypt)
             self._dave_was_active = already_dave
@@ -4210,6 +4792,42 @@ class DiscordWorkerApp:
                     self._speaking_timestamps.pop(uid, None)
             self._emit_speaking_snapshot()
 
+            if (
+                self._vc is not None
+                and not self._joining_channel_id
+                and not self._manual_disconnect
+            ):
+                if self._vc.is_connected():
+                    self._vc_disconnected_since = 0.0
+                    if self._voice_reconnecting:
+                        self._voice_reconnecting = False
+                        self._voice_rejoin_attempts = 0
+                        try:
+                            sr = getattr(
+                                getattr(self._vc, "_connection", None), "_socket_reader", None
+                            )
+                            if sr is not None:
+                                sr.resume(force=True)
+                        except Exception:
+                            pass
+                        self._write_voice_diag("VOICE_RECOVERED_WATCHDOG")
+                        asyncio.create_task(
+                            self._vc.kickstart_voice(keep_speaking=not self._muted)
+                        )
+                        self.emit_event("voice_state", self._build_voice_state_dict())
+                else:
+                    if self._vc_disconnected_since <= 0.0:
+                        self._vc_disconnected_since = now
+                        if self._desired_voice_target is not None and not self._voice_reconnecting:
+                            self._voice_reconnecting = True
+                            self.emit_event("voice_state", self._build_voice_state_dict())
+                    elif (now - self._vc_disconnected_since) >= 1.5 and (
+                        self._voice_drop_task is None or self._voice_drop_task.done()
+                    ):
+                        self._voice_drop_task = asyncio.create_task(
+                            self._verify_voice_drop_after_grace(self._vc)
+                        )
+
             if self._vc is not None and self._vc.is_connected():
                 new_active = bool(self._vc._connection.can_encrypt)
                 new_code = str(self._vc.voice_privacy_code or "")
@@ -4254,10 +4872,10 @@ class DiscordWorkerApp:
                     self.emit_event("voice_state", self._build_voice_state_dict())
 
             in_call = self._vc is not None and self._vc.is_connected()
-            trim_interval = 120.0 if in_call else 60.0
-            if (now - trim_tick) >= trim_interval:
+            if (now - trim_tick) >= 60.0:
                 trim_tick = now
-                trim_process_memory(collect_gc=not in_call)
+                if not in_call or ws > 65.0:
+                    trim_process_memory(collect_gc=not in_call)
 
     async def handle_command(self, req: dict[str, Any]) -> None:
         req_id = req.get("id")
@@ -4415,6 +5033,8 @@ class DiscordWorkerApp:
                     engine.restart_streams()
                 if flags_changed and self._vc is not None and self._vc.is_connected():
                     await self._sync_voice_flags()
+            elif cmd == "set_screen_share_presence":
+                await self._set_screen_share_presence(req.get("share"))
             elif cmd == "shutdown":
                 await self._disconnect_bot()
                 if req_id is not None:

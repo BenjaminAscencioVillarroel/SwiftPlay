@@ -228,8 +228,8 @@ class MainWindow(QMainWindow):
         self.yt = YouTubeService()
         self.twitch = TwitchService()
         self.discord_service = DiscordService(self)
-        QPixmapCache.setCacheLimit(2048)
-        self.thumb_cache = ThumbnailCache(max_items=32, parent=self)
+        QPixmapCache.setCacheLimit(1024)
+        self.thumb_cache = ThumbnailCache(max_items=24, parent=self)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(4)
 
@@ -1956,8 +1956,14 @@ class MainWindow(QMainWindow):
             return
         self._ram_log_tick_count += 1
         self._log_ram_sample("periodic")
-        if (self._ram_log_tick_count % 2) == 0:
-            self.thumb_cache.trim(20)
+        cur_p = self.stack.currentIndex()
+        high_ram = self._last_gui_ws_mb > 135.0
+        if (self._ram_log_tick_count % 2) == 0 or (
+            high_ram and cur_p in (self.PAGE_VIDEO_PLAYER, self.PAGE_DISCORD)
+        ):
+            if high_ram and cur_p in (self.PAGE_VIDEO_PLAYER, self.PAGE_DISCORD):
+                self._clear_hidden_browse_pages(clear_all=False)
+            self.thumb_cache.trim(14 if high_ram else 16)
             QPixmapCache.clear()
             active_vid = self.video_player.has_active_stream and not self._video_paused
             trim_process_memory(collect_gc=not active_vid)
@@ -2623,6 +2629,17 @@ class MainWindow(QMainWindow):
             if page_idx == self.PAGE_VIDEO_PLAYER:
                 if prev_idx != self.PAGE_VIDEO_PLAYER:
                     self._video_return_page = prev_idx
+                hidden_cards = (
+                    len(self.video_grid._widgets)
+                    + len(self.wl_grid._widgets)
+                    + len(self.history_grid._widgets)
+                    + len(self._music_rows)
+                    + len(self._music_tiles)
+                    + len(self.twitch_grid._widgets)
+                    + len(self.channel_grid._widgets)
+                )
+                if hidden_cards > 24:
+                    self._clear_hidden_browse_pages(clear_all=False)
                 self.thumb_cache.trim(12)
                 QPixmapCache.clear()
                 if self._video_paused and self.video_player.is_loaded:
@@ -5898,7 +5915,19 @@ class MainWindow(QMainWindow):
         if self._res_sampled_once and not self.isVisible():
             return
         self._res_sampled_once = True
-        snap = self._resource_monitor.sample()
+        extra_pids: list[int] = []
+        seen_pids: set[int] = set()
+        raw_pids = [
+            self.discord_service.worker_pid,
+            self.yt.worker_pid,
+        ]
+        if hasattr(self, "discord_panel"):
+            raw_pids.extend(self.discord_panel.screen_share_svc.active_pids)
+        for pid in raw_pids:
+            if pid and int(pid) > 0 and int(pid) not in seen_pids:
+                seen_pids.add(int(pid))
+                extra_pids.append(int(pid))
+        snap = self._resource_monitor.sample(extra_pids=extra_pids)
         gui_ws = snap.ws_mb if snap.ws_mb > 0 else snap.priv_mb
         self._last_gui_ws_mb = gui_ws
         ds_ws = max(0.0, float(self._discord_ws_mb))
@@ -5911,17 +5940,17 @@ class MainWindow(QMainWindow):
         self.res_cpu_lbl.setText(f"{snap.app_cpu_pct:.1f}%")
         self.res_gpu_lbl.setText(f"{snap.app_gpu_pct:.1f}%")
         ss_line = (
-            f"RAM física Pantalla (WS): {ss_ws:.1f} MB  ·  Confirmada (Priv): {ss_priv:.1f} MB\n"
+            f"RAM Pantalla/FFmpeg (PrivWS): {ss_ws:.1f} MB  ·  Confirmada (Priv): {ss_priv:.1f} MB\n"
             if ss_ws > 0.0
             else ""
         )
         self.resource_card.setToolTip(
-            f"RAM física App (WS): {gui_ws:.1f} MB  ·  Confirmada (Priv): {snap.priv_mb:.1f} MB\n"
-            f"RAM física Discord (WS): {ds_ws:.1f} MB  ·  Confirmada (Priv): {ds_priv:.1f} MB\n"
+            f"RAM App (PrivWS): {gui_ws:.1f} MB  ·  Confirmada (Priv): {snap.priv_mb:.1f} MB\n"
+            f"RAM Discord (PrivWS): {ds_ws:.1f} MB  ·  Confirmada (Priv): {ds_priv:.1f} MB\n"
             f"{ss_line}"
-            f"Total físico (App + Workers): {total_ws:.1f} MB\n"
-            f"CPU app: {snap.app_cpu_pct:.1f}%  ·  CPU sistema: {snap.sys_cpu_pct:.1f}%\n"
-            f"GPU app: {snap.app_gpu_pct:.1f}%  ·  GPU sistema: {snap.sys_gpu_pct:.1f}%"
+            f"Total (App + Workers): {total_ws:.1f} MB\n"
+            f"CPU App + Workers: {snap.app_cpu_pct:.1f}%  ·  CPU sistema: {snap.sys_cpu_pct:.1f}%\n"
+            f"GPU App + Workers: {snap.app_gpu_pct:.1f}%  ·  GPU sistema: {snap.sys_gpu_pct:.1f}%"
         )
 
     def _cleanup_before_exit(self) -> None:

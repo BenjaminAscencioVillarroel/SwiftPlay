@@ -402,7 +402,7 @@ def test_storage_config_themes() -> None:
     res_mon = SystemResourceMonitor()
     try:
         snap1 = res_mon.sample()
-        snap2 = res_mon.sample()
+        snap2 = res_mon.sample(extra_pids=[os.getpid()])
         assert snap2.ws_mb > 0.0 and 0.0 <= snap2.app_cpu_pct <= 100.0 and 0.0 <= snap2.app_gpu_pct <= 100.0
     finally:
         res_mon.close()
@@ -1379,6 +1379,74 @@ def test_gui_and_libmpv_smoke(
                 dp._on_remote_screen_share_ended({"message_id": "999"})
                 app.processEvents()
                 assert dp.remote_share_banner.isHidden(), "Banner remoto debe ocultarse al finalizar"
+
+                # Descubrimiento nativo SwiftPlay-a-SwiftPlay vía Presencia (tarjeta + fila voz + banner sin navegador)
+                _prev_guilds_snap = list(dp._guilds)
+                try:
+                    dp._on_guilds_updated(
+                        [
+                            {
+                                "id": "10",
+                                "name": "SrvDemo",
+                                "voice_channels": [
+                                    {
+                                        "id": "101",
+                                        "name": "Sala",
+                                        "can_connect": True,
+                                        "members": [
+                                            {"id": "1", "name": "Socio", "is_bot": True, "avatar_url": "", "muted": False, "deafened": False},
+                                            {"id": "2", "name": "SocioBot", "is_bot": True, "avatar_url": "", "muted": False, "deafened": False},
+                                        ],
+                                    }
+                                ],
+                                "text_channels": [
+                                    {"id": "201", "name": "bots", "can_read": True, "can_send": True},
+                                    {"id": "202", "name": "clips", "can_read": True, "can_send": True},
+                                ],
+                            }
+                        ]
+                    )
+                    dp._on_remote_screen_share_detected(
+                        {
+                            "guild_id": "10",
+                            "channel_id": "101",
+                            "channel_name": "Sala",
+                            "author_id": "2",
+                            "author_name": "SocioBot",
+                            "watch_url": "https://abc-xyz.trycloudflare.com/watch?t=TokEn_1234",
+                            "stream_url": "https://abc-xyz.trycloudflare.com/stream.mp4?t=TokEn_1234",
+                            "quality": "720p",
+                            "fps": 60,
+                            "has_audio": True,
+                            "rev": 1,
+                            "source": "presence",
+                            "is_self": False,
+                        }
+                    )
+                    app.processEvents()
+                    assert not dp.remote_share_banner.isHidden(), "Banner remoto debe mostrarse por presencia nativa"
+                    assert dp.remote_browser_btn.isHidden(), "Botón Navegador debe ocultarse en transmisiones nativas"
+                    assert "60fps" in dp.remote_share_lbl.text()
+                    card_p2 = dp._participant_cards.get("2")
+                    assert card_p2 is not None and any(
+                        b.text().strip() == "Ver pantalla" for b in card_p2.findChildren(QPushButton)
+                    ), "La tarjeta del participante compartiendo debe mostrar botón 'Ver pantalla'"
+                    assert any(
+                        b.text().strip() == "EN VIVO" for b in dp.vc_list_widget.findChildren(QPushButton)
+                    ), "La fila del canal de voz debe mostrar botón 'EN VIVO'"
+                    dp._on_remote_screen_share_ended({"author_id": "2", "source": "presence"})
+                    app.processEvents()
+                    assert dp.remote_share_banner.isHidden()
+                    card_p2_after = dp._participant_cards.get("2")
+                    assert card_p2_after is not None and not any(
+                        b.text().strip() == "Ver pantalla" for b in card_p2_after.findChildren(QPushButton)
+                    ), "Al terminar compartida debe desaparecer 'Ver pantalla' de la tarjeta"
+                    assert not any(
+                        b.text().strip() == "EN VIVO" for b in dp.vc_list_widget.findChildren(QPushButton)
+                    ), "Al terminar compartida debe desaparecer 'EN VIVO' de la barra lateral"
+                finally:
+                    dp._on_guilds_updated(_prev_guilds_snap)
+                    app.processEvents()
 
                 # Autocuración de hilo DM cuyo user_name había quedado con el ID numérico
                 dm_num_id = "999999999999999099"
@@ -2476,6 +2544,15 @@ def test_discord_voice_bridge() -> None:
             w_exe, w_env = resolve_worker_python_and_env(ROOT)
             assert Path(w_exe).name.lower() == "pythonw.exe", w_exe
             assert str(ROOT / "src") in w_env.get("PYTHONPATH", "")
+            for ek, ev in (
+                ("OMP_NUM_THREADS", "1"),
+                ("OMP_WAIT_POLICY", "PASSIVE"),
+                ("OPENBLAS_NUM_THREADS", "1"),
+                ("MKL_NUM_THREADS", "1"),
+                ("RAYON_NUM_THREADS", "1"),
+                ("GGML_NUM_THREADS", "1"),
+            ):
+                assert w_env.get(ek) == ev, f"{ek} esperado={ev!r}, obtenido={w_env.get(ek)!r}"
             test_sub = subprocess.Popen(
                 [w_exe, "-c", "import sys"],
                 stdout=subprocess.DEVNULL,
@@ -2787,6 +2864,24 @@ async def _check_worker_join():
     assert ser["reply_to"] is not None and ser["reply_to"]["author_name"] == "NuBa"
     assert float(ser.get("created_ts") or 0.0) > 0.0, "created_ts debe serializarse para agrupar mensajes"
 
+    # Verificar resiliencia de reconexión de voz: _desired_voice_target y _build_voice_state_dict
+    app._desired_voice_target = (1, 10)
+    app._desired_voice_meta = ("Srv", "Privado")
+    await app._leave_channel_internal(trim_memory=False, clear_desired=False)
+    assert app._desired_voice_target == (1, 10), "clear_desired=False debe conservar destino de voz"
+    app._vc = SimpleNamespace(is_connected=lambda: False, channel=ch)
+    app._voice_reconnecting = True
+    rec_vs = app._build_voice_state_dict()
+    assert rec_vs["in_voice"] is True and rec_vs["reconnecting"] is True and rec_vs["channel_name"] == "Privado", rec_vs
+    app._vc = None
+    await app._leave_channel_internal(trim_memory=False, clear_desired=True)
+    assert app._desired_voice_target is None and app._voice_reconnecting is False
+
+    app._write_voice_diag("VERIFY_PING")
+    from swiftplay.paths import LOGS_DIR as _LOGS_DIR
+    _diag_file = _LOGS_DIR / "discord_voice_diag.log"
+    assert _diag_file.exists() and "VERIFY_PING" in _diag_file.read_text(encoding="utf-8", errors="replace")
+
 asyncio.run(_check_worker_join())
 
 # Caso E: Supresión neuronal estilo Krisp (DeepFilterNet3 + Silero VAD) y modo estándar WebRTC
@@ -2858,8 +2953,17 @@ for j in range(30):
 mean_proc_ms = sum(click_times_ms) / len(click_times_ms)
 assert click_speaking is False, "Clics de teclado y ruido ambiente no deben abrir el micrófono en ai_max"
 assert mean_proc_ms < 15.0, f"Tiempo medio por frame demasiado alto para tiempo real: {mean_proc_ms:.2f} ms"
+_sil_frame = bytes(1920)
+sil_fast = ai_proc._df_dsp.process_20ms(_sil_frame, is_speaking=False)
+assert sil_fast == (_sil_frame, -15.0, 0.0), f"Fast-path de silencio inválido: {sil_fast!r}"
+import time as _t_idle
+_c_idle0 = _t_idle.process_time()
+_t_idle.sleep(0.30)
+_c_idle_dt = _t_idle.process_time() - _c_idle0
+assert _c_idle_dt < 0.08, f"Spin-wait OpenMP/BLAS detectado en reposo: {_c_idle_dt:.3f}s"
 ws_ai, priv_ai = _get_mem_mb()
-print(f"DF_AI_OK mean_ms={mean_proc_ms:.2f} ws={ws_ai:.1f} priv={priv_ai:.1f}")
+assert priv_ai < 240.0, f"Priv commit excesivo en worker DSP ({priv_ai:.1f} MB)"
+print(f"DF_AI_OK mean_ms={mean_proc_ms:.2f} idle_cpu={_c_idle_dt:.3f}s ws={ws_ai:.1f} priv={priv_ai:.1f}")
 ai_proc.release_dsp()
 assert ai_proc._df_dsp._df_state is None and ai_proc._df_dsp._silero._vad is None
 ai_proc.close()
@@ -3203,6 +3307,30 @@ assert snap_app._mic_test_active is False and snap_app._muted is False and snap_
 if snap_app._audio is not None:
     snap_app._audio.close()
 
+from types import SimpleNamespace as _SNS
+from swiftplay.discord_worker import (
+    _extract_presence_screen_share,
+    _format_member_activity,
+)
+from swiftplay.screen_share_service import encode_screen_share_presence
+
+_beacon = encode_screen_share_presence(
+    "https://test-pres.trycloudflare.com/watch?t=AbCdEf_1234",
+    quality="1080p",
+    fps=60,
+    has_audio=True,
+    rev=2,
+)
+_fake_member = _SNS(
+    activities=[_SNS(type=_SNS(name="custom"), state=_beacon, name="Custom Status")],
+    activity=None,
+)
+_parsed_p = _extract_presence_screen_share(_fake_member)
+assert _parsed_p is not None and _parsed_p["stream_url"] == "https://test-pres.trycloudflare.com/stream.mp4?t=AbCdEf_1234"
+assert _parsed_p["quality"] == "1080p" and _parsed_p["fps"] == 60 and _parsed_p["rev"] == 2
+_act_txt = _format_member_activity(_fake_member)
+assert "sws1|" not in _act_txt and "Compartiendo pantalla" in _act_txt, _act_txt
+
 print("RTP_DAVE_OK")
 """
     env = os.environ.copy()
@@ -3233,6 +3361,20 @@ print("RTP_DAVE_OK")
         print(
             f"   Worker Discord OK: {len(devs['inputs']) - 1} entradas, {len(devs['outputs']) - 1} salidas detectadas."
         )
+        # Verificar stop_if_idle(): NO debe matar una sesión conectada al minimizar/limpiar RAM
+        killed_calls = []
+        orig_dk = svc.disconnect_and_kill
+        try:
+            svc.disconnect_and_kill = lambda: killed_calls.append("killed")  # type: ignore[method-assign]
+            svc._state = "connected"
+            svc._in_voice = False
+            svc.stop_if_idle()
+            assert not killed_calls, "stop_if_idle() no debe desconectar un bot conectado en reposo"
+            svc._state = "disconnected"
+            svc.stop_if_idle()
+            assert killed_calls == ["killed"], "stop_if_idle() sí debe limpiar un worker huérfano desconectado"
+        finally:
+            svc.disconnect_and_kill = orig_dk  # type: ignore[method-assign]
     finally:
         svc.close()
     assert not svc.is_worker_running, "El worker debe terminar por completo tras close()"
@@ -3257,9 +3399,11 @@ print("RTP_DAVE_OK")
     from swiftplay.screen_share_service import (
         SCREEN_SHARE_ENDED_MARKER,
         ScreenShareService,
+        encode_screen_share_presence,
         format_screen_share_announcement,
         is_screen_share_ended_message,
         parse_screen_share_message,
+        parse_screen_share_presence,
     )
 
     ann_msg = format_screen_share_announcement(
@@ -3275,6 +3419,24 @@ print("RTP_DAVE_OK")
     assert parsed_ss["stream_url"] == "https://demo-abc.trycloudflare.com/stream.mp4?t=TokEn_123"
     assert is_screen_share_ended_message(f"⏹️ {SCREEN_SHARE_ENDED_MARKER}.")
     assert parse_screen_share_message(f"⏹️ {SCREEN_SHARE_ENDED_MARKER}.") is None
+
+    pres_cf = encode_screen_share_presence(
+        "https://demo-abc.trycloudflare.com/watch?t=TokEn_123456",
+        quality="1080p",
+        fps=60,
+        has_audio=True,
+        rev=3,
+    )
+    assert pres_cf and len(pres_cf) <= 128, f"Beacon presencia inválido: {pres_cf!r}"
+    dec_cf = parse_screen_share_presence(pres_cf)
+    assert dec_cf is not None
+    assert dec_cf["stream_url"] == "https://demo-abc.trycloudflare.com/stream.mp4?t=TokEn_123456"
+    assert dec_cf["quality"] == "1080p" and dec_cf["fps"] == 60 and dec_cf["has_audio"] is True and dec_cf["rev"] == 3
+    pres_loc = encode_screen_share_presence("http://127.0.0.1:61234/watch?t=LocTok_99", quality="480p", fps=30, has_audio=False, rev=1)
+    dec_loc = parse_screen_share_presence(pres_loc)
+    assert dec_loc is not None and dec_loc["stream_url"] == "http://127.0.0.1:61234/stream.mp4?t=LocTok_99"
+    assert dec_loc["has_audio"] is False and dec_loc["fps"] == 30
+    assert parse_screen_share_presence("Jugando Valorant") is None
 
     ss_svc = ScreenShareService()
     try:
@@ -3327,6 +3489,50 @@ cmd_audio = build_ffmpeg_command(
     audio_info=("f32le", 48000, 2),
 )
 assert "-thread_queue_size" not in cmd_audio, "FFmpeg pipe:0 no debe incluir -thread_queue_size"
+cmd_gpu_1080 = build_ffmpeg_command(
+    ff_p,
+    source={"id": "monitor:0", "kind": "monitor", "index": 0, "width": 1920, "height": 1080},
+    quality="1080p",
+    fps=60,
+    encoder="h264_nvenc",
+    capture_backend="ddagrab_gpu",
+)
+cmd_gpu_1080_txt = " ".join(cmd_gpu_1080)
+assert "ddagrab=" in cmd_gpu_1080_txt and "hwdownload" not in cmd_gpu_1080_txt
+assert "-vf" not in cmd_gpu_1080 and "-threads" in cmd_gpu_1080 and cmd_gpu_1080[cmd_gpu_1080.index("-threads") + 1] == "1"
+assert "-zerolatency" in cmd_gpu_1080 and "-rc-lookahead" in cmd_gpu_1080
+cmd_gpu_720 = build_ffmpeg_command(
+    ff_p,
+    source={"id": "monitor:0", "kind": "monitor", "index": 0, "width": 1920, "height": 1080},
+    quality="720p",
+    fps=60,
+    encoder="h264_nvenc",
+    capture_backend="ddagrab_gpu",
+)
+assert "scale_d3d11=width=1280:height=720:format=nv12" in " ".join(cmd_gpu_720)
+assert "hwdownload" not in " ".join(cmd_gpu_720)
+cmd_cpu_fb = build_ffmpeg_command(
+    ff_p,
+    source={"id": "monitor:0", "kind": "monitor", "index": 0, "width": 1920, "height": 1080},
+    quality="720p",
+    fps=60,
+    encoder="h264_nvenc",
+    capture_backend="ddagrab",
+)
+vf_cpu_fb = cmd_cpu_fb[cmd_cpu_fb.index("-vf") + 1]
+assert "flags=fast_bilinear" in vf_cpu_fb and "force_divisible_by=2" in vf_cpu_fb
+assert "format=nv12" in vf_cpu_fb and vf_cpu_fb.count("scale=") == 1
+assert cmd_cpu_fb[cmd_cpu_fb.index("-threads") + 1] == "1"
+cmd_gdi_x264 = build_ffmpeg_command(
+    ff_p,
+    source={"id": "monitor:0", "kind": "monitor", "index": 0, "width": 1920, "height": 1080},
+    quality="720p",
+    fps=30,
+    encoder="libx264",
+    capture_backend="gdigrab",
+)
+assert "format=yuv420p" in " ".join(cmd_gdi_x264)
+assert cmd_gdi_x264[cmd_gdi_x264.index("-threads") + 1] == "2"
 # Probar pipe:0 real de audio f32le + testsrc con -frames:v 8 antes de '-f mp4'
 cmd_short = cmd_audio[:-7] + ["-frames:v", "8", "-shortest"] + cmd_audio[-7:]
 res_a = subprocess.run(cmd_short, input=b"\\x00" * (48000 * 8), capture_output=True, timeout=10)
@@ -3418,6 +3624,10 @@ print("SCREEN_SHARE_RELAY_OK")
         assert reconf.get("token") == share_info.get("token") and reconf.get("port") == share_info.get("port"), (
             "Reconfigure en vivo no debe cambiar ni el token ni la URL del stream"
         )
+        active_ss_pids = ss_svc.active_pids
+        assert ss_svc.worker_pid in active_ss_pids and len(active_ss_pids) >= 2, (
+            f"active_pids debe incluir worker + ffmpeg.exe mientras comparte: {active_ss_pids}"
+        )
         ss_out, ss_err = ss_proc.communicate(timeout=20)
         assert ss_proc.returncode == 0 and "SCREEN_SHARE_RELAY_OK" in ss_out, (
             f"Falló prueba de relay/reconfigure de compartida de pantalla: {ss_out}\n{ss_err}"
@@ -3427,11 +3637,14 @@ print("SCREEN_SHARE_RELAY_OK")
         assert self_ws > 0.0 and self_priv > 0.0
         print(
             f"   Compartida de pantalla OK: encoder={share_info.get('encoder')} "
-            f"audio={share_info.get('has_audio')} port={share_info.get('port')} (hot-reconfigure 60fps WS OK)."
+            f"audio={share_info.get('has_audio')} port={share_info.get('port')} "
+            f"pids={len(active_ss_pids)} (hot-reconfigure 60fps WS OK)."
         )
     finally:
         ss_svc.close()
-    assert not ss_svc.is_worker_running, "El worker de pantalla debe terminar por completo tras close()"
+    assert not ss_svc.is_worker_running and ss_svc.active_pids == [], (
+        "El worker de pantalla debe terminar por completo tras close()"
+    )
     print("   OK: DPAPI Bot, mezclador PCM, descifrado AEAD+DAVE, ScreenShare y workers 0 MB verificados.")
 
 
