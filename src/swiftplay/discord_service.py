@@ -373,6 +373,9 @@ class DiscordService(QObject):
     def set_deaf(self, deafened: bool) -> None:
         self._send_command("set_deaf", {"deafened": bool(deafened)}, spawn=False)
 
+    def set_mic_test(self, enabled: bool) -> None:
+        self._send_command("set_mic_test", {"enabled": bool(enabled)}, spawn=False)
+
     def set_output_volume(self, volume: int) -> None:
         self._send_command("set_output_volume", {"volume": int(volume)}, spawn=False)
 
@@ -477,6 +480,11 @@ class DiscordService(QObject):
                     proc.stdin.flush()
             except Exception:
                 pass
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    pass
             for pipe in (proc.stdin, proc.stdout):
                 if pipe is not None:
                     try:
@@ -485,16 +493,13 @@ class DiscordService(QObject):
                         pass
             if proc.poll() is None:
                 try:
-                    proc.wait(timeout=1.2)
+                    proc.terminate()
+                    proc.wait(timeout=0.8)
                 except Exception:
                     try:
-                        proc.terminate()
-                        proc.wait(timeout=0.8)
+                        proc.kill()
                     except Exception:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
+                        pass
         self._fail_pending("Worker Discord desconectado.")
         self._state = "disconnected"
         self._bot_name = ""

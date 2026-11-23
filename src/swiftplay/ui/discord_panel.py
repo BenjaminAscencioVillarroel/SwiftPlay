@@ -1845,6 +1845,8 @@ class DiscordVoicePanel(QWidget):
         self._speaking: dict[str, bool] = {}
         self._muted = False
         self._deafened = False
+        self._mic_test_active = False
+        self._mic_test_prev_flags: tuple[bool, bool] | None = None
         self._bot_state = "disconnected"
         self._joining_channel_id = ""
         self._user_volumes: dict[str, int] = {}
@@ -2399,7 +2401,7 @@ class DiscordVoicePanel(QWidget):
         # Popover flotante de configuración de audio (abierto desde el engranaje lateral)
         self.audio_popup = QFrame(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.audio_popup.setObjectName("DiscordDeckCard")
-        self.audio_popup.setFixedWidth(368)
+        self.audio_popup.setFixedWidth(404)
         pop_lay = QVBoxLayout(self.audio_popup)
         pop_lay.setContentsMargins(12, 10, 12, 10)
         pop_lay.setSpacing(8)
@@ -2413,6 +2415,7 @@ class DiscordVoicePanel(QWidget):
         pop_lay.addLayout(pop_hdr)
 
         self.audio_advanced_box = QWidget()
+        self.audio_advanced_box.setObjectName("TransparentBox")
         adv_lay = QVBoxLayout(self.audio_advanced_box)
         adv_lay.setContentsMargins(0, 2, 0, 0)
         adv_lay.setSpacing(8)
@@ -2500,8 +2503,10 @@ class DiscordVoicePanel(QWidget):
         adv_lay.addLayout(dev_out_row)
 
         ns_row = QHBoxLayout()
-        ns_row.setSpacing(8)
-        ns_row.addWidget(QLabel("Supresión:"))
+        ns_row.setSpacing(6)
+        ns_lbl = QLabel("Supresión:")
+        ns_lbl.setFixedWidth(70)
+        ns_row.addWidget(ns_lbl)
         self.ns_combo = QComboBox()
         for ns_label, ns_key in (
             ("IA Máxima (estilo Krisp)", "ai_max"),
@@ -2518,15 +2523,38 @@ class DiscordVoicePanel(QWidget):
         )
         self.ns_combo.currentIndexChanged.connect(self._on_ns_changed)
         ns_row.addWidget(self.ns_combo, 1)
+        adv_lay.addLayout(ns_row)
 
+        bottom_audio_row = QHBoxLayout()
+        bottom_audio_row.setSpacing(8)
         self.agc_check = QCheckBox("Auto-ganancia")
         self.agc_check.setChecked(self.cfg.discord_mic_agc)
         self.agc_check.setToolTip(
             "Ajusta automáticamente el volumen de tu micrófono (AGC con limitador anti-saturación)"
         )
         self.agc_check.toggled.connect(self._on_agc_toggled)
-        ns_row.addWidget(self.agc_check)
-        adv_lay.addLayout(ns_row)
+        bottom_audio_row.addWidget(self.agc_check)
+        bottom_audio_row.addStretch(1)
+
+        self.mic_test_btn = QPushButton("Probar micrófono")
+        self.mic_test_btn.setObjectName("PillBtn")
+        self.mic_test_btn.setProperty("active", "false")
+        self.mic_test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mic_test_btn.setToolTip(
+            "Te silencia y ensordece en el canal para escucharte en local con tus ajustes de voz."
+        )
+        self.mic_test_btn.clicked.connect(self._toggle_mic_test)
+        bottom_audio_row.addWidget(self.mic_test_btn)
+        adv_lay.addLayout(bottom_audio_row)
+
+        self.mic_test_hint_lbl = QLabel(
+            "Escuchándote en local (silenciado y ensordecido en el canal)"
+        )
+        self.mic_test_hint_lbl.setObjectName("MutedLabel")
+        self.mic_test_hint_lbl.setStyleSheet("color: #4ADE80; font-size: 11px;")
+        self.mic_test_hint_lbl.setWordWrap(True)
+        self.mic_test_hint_lbl.setVisible(False)
+        adv_lay.addWidget(self.mic_test_hint_lbl)
 
         pop_lay.addWidget(self.audio_advanced_box)
         self.audio_popup.hide()
@@ -3147,6 +3175,9 @@ class DiscordVoicePanel(QWidget):
             self.sync_notify_channels()
         elif state == "error":
             self._joining_channel_id = ""
+            self._mic_test_active = False
+            self._mic_test_prev_flags = None
+            self._sync_mic_test_ui()
             self.status_pill.setText("Error")
             self.connect_btn.setText(
                 "Desconectar" if self.svc.is_worker_running else "Conectar Bot"
@@ -3158,6 +3189,9 @@ class DiscordVoicePanel(QWidget):
             self.info_pill.setVisible(False)
         else:
             self._joining_channel_id = ""
+            self._mic_test_active = False
+            self._mic_test_prev_flags = None
+            self._sync_mic_test_ui()
             self._selected_guild_id = ""
             self._active_chat_kind = ""
             self._active_chat_id = ""
@@ -3326,16 +3360,20 @@ class DiscordVoicePanel(QWidget):
         is_cur = bool(self._voice_state.get("in_voice")) and cid == active_cid
         is_joining = bool(self._joining_channel_id and cid == self._joining_channel_id)
         can_join = bool(can_connect and not is_cur and not is_joining)
+        is_clickable = bool(can_join or is_cur or is_joining)
 
-        row_frame = _VoiceChannelRowFrame(can_join)
+        row_frame = _VoiceChannelRowFrame(is_clickable)
         row_frame.setObjectName("DiscordChannelRow")
         row_frame.setProperty("active", "true" if is_cur else "false")
-        row_frame.setProperty("clickable", "true" if can_join else "false")
+        row_frame.setProperty("clickable", "true" if is_clickable else "false")
         if can_join:
             row_frame.join_requested.connect(
                 lambda g=gid, c=cid, n=cname: self._on_join_channel_clicked(g, c, n)
             )
             row_frame.setToolTip(f"Clic para entrar a 🔊 {cname}")
+        elif is_cur or is_joining:
+            row_frame.join_requested.connect(lambda: self._set_pane_visible("voice", True))
+            row_frame.setToolTip(f"Clic para ver la llamada en 🔊 {cname}")
         gname = next(
             (str(g.get("name") or "") for g in self._guilds if str(g.get("id") or "") == gid),
             "",
@@ -4991,6 +5029,14 @@ class DiscordVoicePanel(QWidget):
         return False
 
     def _on_join_channel_clicked(self, guild_id: str, channel_id: str, channel_name: str) -> None:
+        if self._mic_test_active:
+            self._mic_test_active = False
+            prev_m, prev_d = self._mic_test_prev_flags or (False, False)
+            self._mic_test_prev_flags = None
+            self._muted = bool(prev_m)
+            self._deafened = bool(prev_d)
+            self._sync_mic_test_ui()
+            self._emit_voice_status()
         self._joining_channel_id = channel_id
         self.status_pill.setText(f"Conectando a {channel_name}...")
         self._set_pane_visible("voice", True)
@@ -5011,6 +5057,16 @@ class DiscordVoicePanel(QWidget):
         self._joining_channel_id = str(state.get("joining_channel_id") or "")
         in_voice = bool(state.get("in_voice", False))
         new_ch_id = str(state.get("channel_id") or "")
+        if "mic_test" in state:
+            srv_test = bool(state.get("mic_test", False))
+            if not srv_test and self._mic_test_active and not prev_in_voice and not in_voice:
+                pass
+            elif srv_test != self._mic_test_active:
+                self._mic_test_active = srv_test
+                if not srv_test and prev_in_voice and not in_voice and self._mic_test_prev_flags is not None:
+                    self._muted, self._deafened = self._mic_test_prev_flags
+                    self._mic_test_prev_flags = None
+                self._sync_mic_test_ui()
 
         if in_voice:
             ch_name = str(state.get("channel_name") or "Voz")
@@ -5237,7 +5293,49 @@ class DiscordVoicePanel(QWidget):
         save_config(self.cfg)
         self.svc.set_devices(in_name, out_name)
 
+    def _sync_mic_test_ui(self) -> None:
+        if not hasattr(self, "mic_test_btn"):
+            return
+        active = bool(self._mic_test_active)
+        self.mic_test_btn.setText("Dejar de probar" if active else "Probar micrófono")
+        self.mic_test_btn.setProperty("active", "true" if active else "false")
+        self.mic_test_btn.style().unpolish(self.mic_test_btn)
+        self.mic_test_btn.style().polish(self.mic_test_btn)
+        if hasattr(self, "mic_test_hint_lbl"):
+            self.mic_test_hint_lbl.setVisible(active)
+
+    def _toggle_mic_test(self) -> None:
+        if not self._mic_test_active:
+            if not self.svc.is_connected and self._bot_state != "connected":
+                self.toast_requested.emit(
+                    "Conecta el Bot de Discord primero para probar tu micrófono."
+                )
+                return
+            self._mic_test_prev_flags = (self._muted, self._deafened)
+            self._mic_test_active = True
+            self._muted = True
+            self._deafened = True
+            self._sync_mic_test_ui()
+            self._refresh_mute_deaf_buttons()
+            self._emit_voice_status()
+            self.svc.set_mic_test(True)
+            return
+
+        self._mic_test_active = False
+        prev_m, prev_d = self._mic_test_prev_flags or (False, False)
+        self._mic_test_prev_flags = None
+        self._muted = bool(prev_m)
+        self._deafened = bool(prev_d)
+        self._sync_mic_test_ui()
+        self._refresh_mute_deaf_buttons()
+        self._emit_voice_status()
+        self.svc.set_mic_test(False)
+
     def _toggle_mute(self) -> None:
+        if self._mic_test_active:
+            self._mic_test_active = False
+            self._mic_test_prev_flags = None
+            self._sync_mic_test_ui()
         self._muted = not self._muted
         self._refresh_mute_deaf_buttons()
         self.svc.set_mute(self._muted)
@@ -5245,6 +5343,10 @@ class DiscordVoicePanel(QWidget):
         self.sound_event_requested.emit("mute_on" if self._muted else "mute_off")
 
     def _toggle_deaf(self) -> None:
+        if self._mic_test_active:
+            self._mic_test_active = False
+            self._mic_test_prev_flags = None
+            self._sync_mic_test_ui()
         self._deafened = not self._deafened
         self._refresh_mute_deaf_buttons()
         self.svc.set_deaf(self._deafened)

@@ -322,6 +322,9 @@ class _DeepFilterMicDsp:
         self._hp_prev_x = 0.0
         self._hp_prev_y = 0.0
         self._silero = _SileroVoiceGate()
+        self._ready = False
+        self._warming = False
+        self._warmup_flag_lock = threading.Lock()
         self._failed = False
 
     def _apply_params_locked(self) -> None:
@@ -332,6 +335,7 @@ class _DeepFilterMicDsp:
         self._lib.df_set_post_filter_beta(self._df_state, self._ctypes.c_float(beta))
 
     def _free_locked(self) -> None:
+        self._ready = False
         st = self._df_state
         self._df_state = None
         self._in_buf = None
@@ -400,6 +404,7 @@ class _DeepFilterMicDsp:
             self._out_ptr = self._out_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
             self._apply_params_locked()
             self._silero.warmup()
+            self._ready = True
             return True
         except Exception:
             self._free_locked()
@@ -408,11 +413,42 @@ class _DeepFilterMicDsp:
 
     @property
     def is_ready(self) -> bool:
-        return bool(self._df_state)
+        return bool(self._ready and self._df_state)
 
     def warmup(self) -> bool:
         with self._lock:
             return self._ensure_ready_locked()
+
+    def start_warmup_async(self) -> None:
+        """Precalienta DeepFilterNet3 y Silero VAD en segundo plano de forma idempotente."""
+        if self._ready or self._failed or self._mode not in ("ai", "ai_max"):
+            return
+        with self._warmup_flag_lock:
+            if self._warming or self._ready or self._failed or self._mode not in ("ai", "ai_max"):
+                return
+            self._warming = True
+
+        def _bg() -> None:
+            try:
+                ok = self.warmup()
+                if ok:
+                    try:
+                        from swiftplay.windows_os import trim_process_memory
+
+                        trim_process_memory(collect_gc=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                with self._warmup_flag_lock:
+                    self._warming = False
+
+        threading.Thread(
+            target=_bg,
+            daemon=True,
+            name="discord-audio-warmup",
+        ).start()
 
     def reconfigure(self, mode: str) -> None:
         norm = _normalize_ns_mode(mode)
@@ -423,8 +459,10 @@ class _DeepFilterMicDsp:
                 self._hp_prev_x = 0.0
                 self._hp_prev_y = 0.0
                 self._silero.reset()
-            elif self._df_state:
-                self._apply_params_locked()
+            else:
+                self._failed = False
+                if self._df_state:
+                    self._apply_params_locked()
 
     def reset(self) -> None:
         if not self._df_state:
@@ -536,6 +574,13 @@ class MicProcessor:
         if df_dsp is not None and ns_mode in ("ai", "ai_max"):
             df_dsp.warmup()
 
+    def ensure_warmup_async(self) -> None:
+        with self._lock:
+            ns_mode = self._noise_suppression
+            df_dsp = self._df_dsp
+        if df_dsp is not None and ns_mode in ("ai", "ai_max"):
+            df_dsp.start_warmup_async()
+
     def close(self) -> None:
         self.release_dsp()
 
@@ -617,35 +662,34 @@ class MicProcessor:
         use_dsp = False
         voice_ok = True
 
-        if df_dsp is not None and ns_mode in ("ai", "ai_max") and df_dsp.is_ready:
-            df_res = df_dsp.process_20ms(raw_mono_frame)
-            if df_res is not None:
-                work_frame, lsnr_db, silero_prob = df_res
-                use_dsp = True
-                if ns_mode == "ai":
-                    if silero_prob is not None:
-                        if speaking:
-                            voice_ok = (silero_prob >= 0.12) or (lsnr_db >= -1.0)
+        if df_dsp is not None and ns_mode in ("ai", "ai_max"):
+            if df_dsp.is_ready:
+                df_res = df_dsp.process_20ms(raw_mono_frame)
+                if df_res is not None:
+                    work_frame, lsnr_db, silero_prob = df_res
+                    use_dsp = True
+                    if ns_mode == "ai":
+                        if silero_prob is not None:
+                            if speaking:
+                                voice_ok = (silero_prob >= 0.12) or (lsnr_db >= -1.0)
+                            else:
+                                voice_ok = (silero_prob >= 0.30 and lsnr_db >= -6.0) or (lsnr_db >= 6.0)
                         else:
-                            voice_ok = (silero_prob >= 0.30 and lsnr_db >= -6.0) or (lsnr_db >= 6.0)
+                            voice_ok = lsnr_db >= (-1.0 if speaking else 3.0)
                     else:
-                        voice_ok = lsnr_db >= (-1.0 if speaking else 3.0)
-                else:
-                    if silero_prob is not None:
-                        if speaking:
-                            voice_ok = (silero_prob >= 0.16) or (lsnr_db >= 2.0)
+                        if silero_prob is not None:
+                            if speaking:
+                                voice_ok = (silero_prob >= 0.16) or (lsnr_db >= 2.0)
+                            else:
+                                voice_ok = (silero_prob >= 0.45 and lsnr_db >= -4.0) or (
+                                    silero_prob >= 0.65
+                                )
                         else:
-                            voice_ok = (silero_prob >= 0.45 and lsnr_db >= -4.0) or (
-                                silero_prob >= 0.65
-                            )
-                    else:
-                        voice_ok = lsnr_db >= (0.0 if speaking else 5.0)
-            elif webrtc_dsp is not None:
-                work_frame, speech_prob = webrtc_dsp.process_20ms(raw_mono_frame)
-                use_dsp = True
-                open_prob, hold_prob = _NS_SPEECH_PROB_THRESHOLDS["webrtc"]
-                voice_ok = speech_prob >= (hold_prob if speaking else open_prob)
-        elif webrtc_dsp is not None and ns_mode in ("webrtc", "ai", "ai_max"):
+                            voice_ok = lsnr_db >= (0.0 if speaking else 5.0)
+            else:
+                df_dsp.start_warmup_async()
+
+        if not use_dsp and webrtc_dsp is not None and ns_mode in ("webrtc", "ai", "ai_max"):
             work_frame, speech_prob = webrtc_dsp.process_20ms(raw_mono_frame)
             use_dsp = True
             open_prob, hold_prob = _NS_SPEECH_PROB_THRESHOLDS["webrtc"]
@@ -1453,6 +1497,9 @@ class AudioEngine:
         self._mic_thread: threading.Thread | None = None
 
         self._muted = False
+        self._loopback = False
+        self._loopback_lock = threading.Lock()
+        self._loopback_queue: deque[bytes] = deque(maxlen=12)
         self._mic_proc = MicProcessor(noise_suppression="ai", enable_webrtc=True)
         self._local_speaking = False
         self._last_vu_emit = 0.0
@@ -1475,6 +1522,7 @@ class AudioEngine:
         self,
         *,
         muted: bool | None = None,
+        loopback: bool | None = None,
         mic_gain_pct: int | None = None,
         agc_enabled: bool | None = None,
         vad_threshold: int | None = None,
@@ -1482,9 +1530,14 @@ class AudioEngine:
         input_device_name: str | None = None,
         output_device_name: str | None = None,
     ) -> None:
+        if loopback is not None:
+            self._loopback = bool(loopback)
+            if not self._loopback:
+                with self._loopback_lock:
+                    self._loopback_queue.clear()
         if muted is not None:
             self._muted = bool(muted)
-            if self._muted:
+            if self._muted and not self._loopback:
                 self._mic_proc.reset()
                 if self._local_speaking:
                     self._local_speaking = False
@@ -1496,6 +1549,8 @@ class AudioEngine:
             vad_threshold=vad_threshold,
             noise_suppression=noise_suppression,
         )
+        if noise_suppression is not None and self._running:
+            self._mic_proc.ensure_warmup_async()
         if input_device_name is not None:
             new_in = str(input_device_name or "").strip()
             if new_in != self._input_device_name:
@@ -1519,34 +1574,10 @@ class AudioEngine:
 
     def warmup_async(self) -> None:
         """Precalienta DeepFilterNet3 y Silero VAD en segundo plano al entrar en voz."""
-        with self._warmup_lock:
-            if self._warmup_started:
-                return
-            self._warmup_started = True
-
-        def _run() -> None:
-            try:
-                self._mic_proc.warmup()
-                try:
-                    from swiftplay.windows_os import trim_process_memory
-
-                    trim_process_memory(collect_gc=True)
-                except Exception:
-                    pass
-            except Exception:
-                with self._warmup_lock:
-                    self._warmup_started = False
-
-        threading.Thread(
-            target=_run,
-            daemon=True,
-            name="discord-audio-warmup",
-        ).start()
+        self._mic_proc.ensure_warmup_async()
 
     def release_dsp_idle(self) -> None:
         """Libera buffers de DSP neuronal cuando no hay llamada de voz activa."""
-        with self._warmup_lock:
-            self._warmup_started = False
         try:
             self._mic_proc.release_dsp()
         except Exception:
@@ -1568,6 +1599,8 @@ class AudioEngine:
             self._in_rate_state = None
             self._mic_proc.reset()
             self._local_speaking = False
+            with self._loopback_lock:
+                self._loopback_queue.clear()
             while not self._mic_queue.empty():
                 try:
                     self._mic_queue.get_nowait()
@@ -1826,7 +1859,18 @@ class AudioEngine:
         try:
             aop = _get_audioop()
             while len(self._out_buf) < needed:
-                pcm_48k = self._mixer.mix_frame()
+                if self._loopback:
+                    with self._loopback_lock:
+                        pcm_48k = (
+                            self._loopback_queue.popleft()
+                            if self._loopback_queue
+                            else SILENCE_PCM
+                        )
+                    master_vol = getattr(self._mixer, "_master_volume", 1.0)
+                    if pcm_48k != SILENCE_PCM and abs(master_vol - 1.0) > 0.01:
+                        pcm_48k = _pcm_scale(pcm_48k, master_vol)
+                else:
+                    pcm_48k = self._mixer.mix_frame()
                 chunk = pcm_48k
                 if self._out_channels == 1:
                     chunk = _pcm_to_mono(chunk, 2)
@@ -1844,7 +1888,7 @@ class AudioEngine:
         if not self._running:
             return
         self._in_cb_count += 1
-        if self._muted:
+        if self._muted and not self._loopback:
             return
         raw = bytes(indata)
         if not raw:
@@ -1876,7 +1920,7 @@ class AudioEngine:
 
             if not self._running:
                 break
-            if not raw or self._muted:
+            if not raw or (self._muted and not self._loopback):
                 continue
 
             mono = _pcm_to_mono(raw, self._in_channels) if self._in_channels > 1 else raw
@@ -1893,7 +1937,7 @@ class AudioEngine:
                 frame = bytes(self._in_mono_buf[:MONO_FRAME_BYTES])
                 del self._in_mono_buf[:MONO_FRAME_BYTES]
 
-                if self._muted:
+                if self._muted and not self._loopback:
                     continue
 
                 now = time.monotonic()
@@ -1906,7 +1950,15 @@ class AudioEngine:
                     except Exception:
                         pass
 
-                if should_tx:
+                if self._loopback:
+                    if self._local_speaking:
+                        self._local_speaking = False
+                        self._on_speaking_state(False)
+                    if should_tx:
+                        with self._loopback_lock:
+                            for mono_out in tx_frames:
+                                self._loopback_queue.append(_pcm_mono_to_stereo(mono_out))
+                elif should_tx:
                     if not self._local_speaking:
                         self._local_speaking = True
                         self._on_speaking_state(True)
@@ -1922,7 +1974,128 @@ def _make_voice_client_cls(on_init: Callable[[Any], None] | None = None):
     """Construye dinámicamente SwiftVoiceClient sin importar discord al nivel de módulo."""
     import davey
     import discord
-    from discord.voice_state import VoiceConnectionState
+    from discord.errors import ConnectionClosed
+    from discord.voice_state import ConnectionFlowState, VoiceConnectionState
+
+    class _SwiftVoiceConnectionState(VoiceConnectionState):
+        """VoiceConnectionState con IP Discovery sin carrera de socket y tiempos por fase."""
+
+        def __init__(self, voice_client: discord.VoiceClient, *, hook: Any = None) -> None:
+            super().__init__(voice_client, hook=hook)
+            self.connect_timings: dict[str, Any] = {
+                "t0": time.perf_counter(),
+                "op4_ms": 0,
+                "ws_ms": 0,
+                "ip_ms": 0,
+                "key_ms": 0,
+                "attempts": 0,
+                "close_codes": [],
+            }
+
+        async def _inner_connect(
+            self, reconnect: bool, self_deaf: bool, self_mute: bool, resume: bool
+        ) -> None:
+            t0 = time.perf_counter()
+            self.connect_timings = {
+                "t0": t0,
+                "op4_ms": 0,
+                "ws_ms": 0,
+                "ip_ms": 0,
+                "key_ms": 0,
+                "attempts": 0,
+                "close_codes": [],
+            }
+            for i in range(3):
+                self.connect_timings["attempts"] = i + 1
+                await self._voice_connect(self_deaf=self_deaf, self_mute=self_mute)
+                if self.state is ConnectionFlowState.disconnected:
+                    self.state = ConnectionFlowState.set_guild_voice_state
+
+                await self._wait_for_state(ConnectionFlowState.got_both_voice_updates)
+                self.connect_timings["op4_ms"] = max(0, int((time.perf_counter() - t0) * 1000))
+
+                try:
+                    self.ws = await self._connect_websocket(resume)
+                    self.connect_timings["ws_ms"] = max(0, int((time.perf_counter() - t0) * 1000))
+                    await self._handshake_websocket()
+                    break
+                except ConnectionClosed as exc:
+                    codes = self.connect_timings["close_codes"]
+                    codes.append(int(getattr(exc, "code", 0) or 0))
+                    if reconnect and i < 2:
+                        wait = 0.4 + i * 0.4
+                        try:
+                            await asyncio.wait_for(self.disconnect(cleanup=False), timeout=1.5)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(wait)
+                        continue
+                    try:
+                        await asyncio.wait_for(self.disconnect(), timeout=1.5)
+                    except Exception:
+                        pass
+                    raise
+
+        async def _connect_websocket(self, resume: bool) -> Any:
+            ws = await super()._connect_websocket(resume)
+            state = self
+
+            async def _fast_discover_ip() -> tuple[str, int]:
+                packet = bytearray(74)
+                struct.pack_into(">H", packet, 0, 1)
+                struct.pack_into(">H", packet, 2, 70)
+                struct.pack_into(">I", packet, 4, state.ssrc)
+
+                fut: asyncio.Future[bytes] = state.voice_client.loop.create_future()
+
+                def _on_ip_pkt(data: bytes) -> None:
+                    if len(data) == 74 and data[1] == 0x02 and not fut.done():
+                        state.voice_client.loop.call_soon_threadsafe(
+                            lambda d=data: fut.set_result(d) if not fut.done() else None
+                        )
+
+                state.add_socket_listener(_on_ip_pkt)
+                try:
+                    sr = getattr(state, "_socket_reader", None)
+                    if sr is not None:
+                        sr.resume(force=True)
+                except Exception:
+                    pass
+                try:
+                    for attempt in range(6):
+                        try:
+                            await ws.loop.sock_sendall(state.socket, packet)
+                        except Exception:
+                            pass
+                        try:
+                            recv = await asyncio.wait_for(asyncio.shield(fut), timeout=0.35)
+                            break
+                        except asyncio.TimeoutError:
+                            if attempt >= 5:
+                                recv = await fut
+                            continue
+                finally:
+                    state.remove_socket_listener(_on_ip_pkt)
+
+                ip_start = 8
+                ip_end = recv.index(0, ip_start)
+                ip = recv[ip_start:ip_end].decode("ascii")
+                port = struct.unpack_from(">H", recv, len(recv) - 2)[0]
+                return ip, port
+
+            ws.discover_ip = _fast_discover_ip  # type: ignore[method-assign]
+            return ws
+
+        async def _handshake_websocket(self) -> None:
+            t0 = float(self.connect_timings.get("t0") or time.perf_counter())
+            while not self.ip:
+                await self.ws.poll_event()
+            self.connect_timings["ip_ms"] = max(0, int((time.perf_counter() - t0) * 1000))
+            self.state = ConnectionFlowState.got_ip_discovery
+            while self.ws.secret_key is None:
+                await self.ws.poll_event()
+            self.connect_timings["key_ms"] = max(0, int((time.perf_counter() - t0) * 1000))
+            self.state = ConnectionFlowState.connected
 
     class SwiftVoiceClient(discord.VoiceClient):
         """VoiceClient con recepción UDP DAVE E2EE + envío directo de micrófono."""
@@ -1969,7 +2142,7 @@ def _make_voice_client_cls(on_init: Callable[[Any], None] | None = None):
                 )
 
         def create_connection_state(self) -> VoiceConnectionState:
-            return VoiceConnectionState(self, hook=self._on_voice_ws_message)
+            return _SwiftVoiceConnectionState(self, hook=self._on_voice_ws_message)
 
         async def connect(
             self,
@@ -2496,7 +2669,9 @@ class DiscordWorkerApp:
         self._join_task: asyncio.Task[Any] | None = None
         self._voice_lock = asyncio.Lock()
         self._vc: Any = None
+        self._connecting_vc: Any = None
         self._voice_cls: Any = None
+        self._post_join_task: asyncio.Task[Any] | None = None
         self._joining_channel_id: str = ""
         self._last_join_diag: str = ""
 
@@ -2504,6 +2679,8 @@ class DiscordWorkerApp:
         self._audio: AudioEngine | None = None
         self._muted = False
         self._deafened = False
+        self._mic_test_active = False
+        self._mic_test_saved_flags: tuple[bool, bool] | None = None
         self._speaking_timestamps: dict[int, float] = {}
         self._speaking_lock = threading.Lock()
         self._member_name_cache: dict[int, tuple[str, bool, str]] = {}
@@ -2802,6 +2979,7 @@ class DiscordWorkerApp:
                 "guild_name": "",
                 "muted": self._muted,
                 "deafened": self._deafened,
+                "mic_test": self._mic_test_active,
                 "dave_active": False,
                 "dave_code": "",
                 "connect_diag": self._last_join_diag,
@@ -2834,6 +3012,7 @@ class DiscordWorkerApp:
             "channel_name": str(ch.name),
             "muted": self._muted,
             "deafened": self._deafened,
+            "mic_test": self._mic_test_active,
             "dave_active": bool(self._vc._connection.can_encrypt) if self._vc else self._dave_active,
             "dave_code": str(self._vc.voice_privacy_code or "") if self._vc else self._dave_code,
             "tx_packets": int(getattr(self._vc, "tx_packets", 0)),
@@ -2914,6 +3093,28 @@ class DiscordWorkerApp:
             self._emit_snapshots()
             if self._active_guild_id:
                 await self._select_guild(self._active_guild_id)
+            try:
+                self._ensure_audio_engine().warmup_async()
+            except Exception:
+                pass
+            try:
+                async def _clear_orphan_voice_sessions() -> None:
+                    for g in list(getattr(client, "guilds", ()) or ()):
+                        me = getattr(g, "me", None)
+                        vs = getattr(me, "voice", None) if me is not None else None
+                        if (
+                            vs is not None
+                            and getattr(vs, "channel", None) is not None
+                            and getattr(g, "voice_client", None) is None
+                        ):
+                            try:
+                                await g.change_voice_state(channel=None)
+                            except Exception:
+                                pass
+
+                asyncio.create_task(_clear_orphan_voice_sessions())
+            except Exception:
+                pass
             try:
                 from swiftplay.windows_os import trim_process_memory
 
@@ -3182,6 +3383,14 @@ class DiscordWorkerApp:
         self._emit_speaking_snapshot()
 
     async def _cancel_inflight_join(self) -> None:
+        pj = self._post_join_task
+        self._post_join_task = None
+        if pj is not None and not pj.done() and pj is not asyncio.current_task():
+            pj.cancel()
+            try:
+                await pj
+            except (asyncio.CancelledError, Exception):
+                pass
         task = self._join_task
         self._join_task = None
         if task is not None and not task.done() and task is not asyncio.current_task():
@@ -3193,6 +3402,14 @@ class DiscordWorkerApp:
         self._joining_channel_id = ""
 
     async def _leave_channel_internal(self, *, trim_memory: bool = True) -> None:
+        pj = self._post_join_task
+        self._post_join_task = None
+        if pj is not None and not pj.done() and pj is not asyncio.current_task():
+            pj.cancel()
+            try:
+                await pj
+            except (asyncio.CancelledError, Exception):
+                pass
         self._mixer.clear()
         with self._speaking_lock:
             self._speaking_timestamps.clear()
@@ -3220,9 +3437,13 @@ class DiscordWorkerApp:
             except Exception:
                 pass
         self._joining_channel_id = ""
+        self._connecting_vc = None
         self._dave_active = False
         self._dave_code = ""
+        self._mic_test_active = False
+        self._mic_test_saved_flags = None
         if self._audio is not None:
+            self._audio.configure(loopback=False)
             self._audio.release_dsp_idle()
         if trim_memory:
             try:
@@ -3542,6 +3763,7 @@ class DiscordWorkerApp:
     def _wire_voice_client(self, vc: Any) -> None:
         import discord.opus
 
+        self._connecting_vc = vc
         vc.deafened = self._deafened
         vc.on_opus = lambda uid, seq, pkt, _dec=discord.opus.Decoder: self._mixer.push_opus(
             uid, seq, pkt, decoder_factory=_dec
@@ -3551,6 +3773,120 @@ class DiscordWorkerApp:
         vc.on_speaking_change = self._on_remote_speaking
         vc.on_dave_change = self._on_dave_change
         vc.on_warning = lambda msg: self.emit_event("warning", {"message": msg})
+
+    @staticmethod
+    def _write_voice_diag(line: str) -> None:
+        try:
+            from swiftplay.paths import LOGS_DIR
+
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(LOGS_DIR / "discord_voice_diag.log", "a", encoding="utf-8") as fh:
+                fh.write(f"[{ts}] {line}\n")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_voice_diag(vc: Any, tot_ms: int, *, audio_ms: int | None = None) -> str:
+        conn = getattr(vc, "_connection", None)
+        tm = getattr(conn, "connect_timings", None) if conn is not None else None
+        parts: list[str] = []
+        if conn is not None and getattr(conn, "state", None) is not None:
+            st_name = getattr(conn.state, "name", str(conn.state))
+            if st_name and st_name != "connected":
+                parts.append(f"state={st_name}")
+        if isinstance(tm, dict):
+            op4 = int(tm.get("op4_ms") or 0)
+            ws = int(tm.get("ws_ms") or 0)
+            ip = int(tm.get("ip_ms") or 0)
+            key = int(tm.get("key_ms") or 0)
+            att = int(tm.get("attempts") or 1)
+            codes = tm.get("close_codes") or []
+            parts.append(f"op4 {op4}ms · ws {ws}ms · udp {ip}ms · key {key}ms")
+            if att > 1:
+                parts.append(f"intentos={att}")
+            if codes:
+                parts.append(f"codes={codes}")
+        if audio_ms is not None:
+            parts.append(f"audio {audio_ms}ms")
+        detail = " · ".join(parts)
+        return f"Conexión: {tot_ms} ms ({detail})" if detail else f"Conexión: {tot_ms} ms"
+
+    async def _finish_post_join(
+        self,
+        vc: Any,
+        t_start: float,
+    ) -> None:
+        audio_ms: int | None = None
+        try:
+            engine = self._ensure_audio_engine()
+            engine.configure(muted=self._muted, loopback=self._mic_test_active)
+            try:
+                if not engine._running:
+                    await asyncio.to_thread(engine.start)
+                audio_ms = max(0, int((time.perf_counter() - t_start) * 1000))
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                self.emit_event("warning", {"message": f"Audio inicializado con aviso: {exc}"})
+
+            if self._vc is not vc or not vc.is_connected():
+                return
+
+            engine.warmup_async()
+            prev_dave = (self._dave_active, self._dave_code)
+            keep_speaking = bool(
+                not self._muted and (engine.is_speaking or engine.is_open_mic)
+            )
+            await vc.kickstart_voice(keep_speaking=keep_speaking)
+            if self._vc is not vc or not vc.is_connected():
+                return
+
+            tot_ms = max(0, int((time.perf_counter() - t_start) * 1000))
+            self._last_join_diag = self._format_voice_diag(vc, tot_ms, audio_ms=audio_ms)
+            self._write_voice_diag(self._last_join_diag)
+            cur_dave = (bool(vc._connection.can_encrypt), str(vc.voice_privacy_code or ""))
+            if cur_dave != prev_dave:
+                self._dave_active, self._dave_code = cur_dave
+                if self._dave_active:
+                    self._dave_was_active = True
+            self._emit_snapshots()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            pass
+
+    async def _set_mic_test(self, enabled: bool) -> None:
+        want = bool(enabled)
+        if want:
+            if not self._mic_test_active:
+                self._mic_test_saved_flags = (self._muted, self._deafened)
+                self._mic_test_active = True
+            self._muted = True
+            self._deafened = True
+            self._mixer.set_deafened(True)
+            engine = self._ensure_audio_engine()
+            engine.configure(muted=True, loopback=True)
+            engine.warmup_async()
+            if not engine._running:
+                await asyncio.to_thread(engine.start)
+            await self._sync_voice_flags()
+            return
+
+        if not self._mic_test_active:
+            return
+        self._mic_test_active = False
+        prev_m, prev_d = self._mic_test_saved_flags or (False, False)
+        self._mic_test_saved_flags = None
+        self._muted = bool(prev_m)
+        self._deafened = bool(prev_d)
+        self._mixer.set_deafened(self._deafened)
+        if self._audio is not None:
+            self._audio.configure(muted=self._muted, loopback=False)
+            if (self._vc is None or not self._vc.is_connected()) and self._audio._running:
+                await asyncio.to_thread(self._audio.stop)
+                self._audio.release_dsp_idle()
+        await self._sync_voice_flags()
 
     async def _join_channel(self, guild_id: int, channel_id: int) -> None:
         async with self._voice_lock:
@@ -3581,6 +3917,16 @@ class DiscordWorkerApp:
                         },
                     )
 
+            if self._mic_test_active:
+                self._mic_test_active = False
+                prev_m, prev_d = self._mic_test_saved_flags or (False, False)
+                self._mic_test_saved_flags = None
+                self._muted = bool(prev_m)
+                self._deafened = bool(prev_d)
+                self._mixer.set_deafened(self._deafened)
+                if self._audio is not None:
+                    self._audio.configure(muted=self._muted, loopback=False)
+
             existing_vc = self._vc or guild.voice_client
             t_start = time.perf_counter()
             if (
@@ -3594,8 +3940,10 @@ class DiscordWorkerApp:
                 self._vc = existing_vc
                 if existing_vc.channel.id == channel_id:
                     engine = self._ensure_audio_engine()
-                    engine.configure(muted=self._muted)
-                    await asyncio.to_thread(engine.start)
+                    engine.configure(muted=self._muted, loopback=False)
+                    engine.warmup_async()
+                    if not engine._running:
+                        await asyncio.to_thread(engine.start)
                     self._last_join_diag = "Conexión: ya activo en sala"
                     self._emit_snapshots()
                     return
@@ -3605,97 +3953,106 @@ class DiscordWorkerApp:
                     await existing_vc.move_to(channel, timeout=10.0)
                     t_end = time.perf_counter()
                     self._last_join_diag = f"Cambio de sala: {int((t_end - t_start) * 1000)} ms"
+                    self._write_voice_diag(self._last_join_diag)
                 finally:
                     self._joining_channel_id = ""
-            else:
-                await self._leave_channel_internal(trim_memory=False)
-                self._joining_channel_id = str(channel_id)
-                self._emit_snapshots()
-                engine = self._ensure_audio_engine()
-                engine.configure(muted=self._muted)
-                audio_task = asyncio.create_task(asyncio.to_thread(engine.start))
-                engine.warmup_async()
-                t_audio_done = t_start
-                t_ws_done = t_start
-                try:
-                    async def _do_audio() -> None:
-                        nonlocal t_audio_done
-                        await audio_task
-                        t_audio_done = time.perf_counter()
-
-                    async def _do_voice() -> Any:
-                        nonlocal t_ws_done
-                        res_vc = await channel.connect(
-                            cls=self._voice_cls,
-                            self_mute=self._muted,
-                            self_deaf=self._deafened,
-                            timeout=12.0,
-                        )
-                        t_ws_done = time.perf_counter()
-                        return res_vc
-
-                    _, vc = await asyncio.gather(_do_audio(), _do_voice())
-                    self._wire_voice_client(vc)
-                    self._vc = vc
-                    ws_ms = max(0, int((t_ws_done - t_start) * 1000))
-                    audio_ms = max(0, int((t_audio_done - t_start) * 1000))
-                    tot_ms = max(0, int((time.perf_counter() - t_start) * 1000))
-                    self._last_join_diag = (
-                        f"Conexión: {tot_ms} ms (voz {ws_ms} ms · audio {audio_ms} ms)"
-                    )
-                except asyncio.TimeoutError as exc:
-                    if not audio_task.done():
-                        audio_task.cancel()
-                    try:
-                        await audio_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    await self._leave_channel_internal(trim_memory=False)
-                    raise RuntimeError(
-                        f"Tiempo de espera agotado al entrar en '{channel.name}'. "
-                        "Revisa permisos del canal o conexión UDP."
-                    ) from exc
-                except Exception:
-                    if not audio_task.done():
-                        audio_task.cancel()
-                    try:
-                        await audio_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    await self._leave_channel_internal(trim_memory=False)
-                    raise
-                finally:
-                    self._joining_channel_id = ""
-
-            self._mixer.clear()
-            engine = self._ensure_audio_engine()
-            engine.configure(muted=self._muted)
-            if not engine._running:
-                await asyncio.to_thread(engine.start)
-            engine.warmup_async()
-            vc = self._vc
-            prev_dave_state = (self._dave_active, self._dave_code)
-            if vc is not None and vc.is_connected():
-                already_dave = bool(vc._connection.can_encrypt)
+                self._mixer.clear()
+                already_dave = bool(existing_vc._connection.can_encrypt)
                 self._dave_was_active = already_dave
                 self._dave_active = already_dave
-                self._dave_code = str(vc.voice_privacy_code or "")
+                self._dave_code = str(existing_vc.voice_privacy_code or "")
                 self._emit_snapshots()
-                keep_speaking = bool(
-                    not self._muted and (engine.is_speaking or engine.is_open_mic)
+                self._post_join_task = asyncio.create_task(
+                    self._finish_post_join(existing_vc, t_start)
                 )
-                await vc.kickstart_voice(keep_speaking=keep_speaking)
-                cur_dave_state = (bool(vc._connection.can_encrypt), str(vc.voice_privacy_code or ""))
-                if cur_dave_state != (self._dave_active, self._dave_code) or cur_dave_state != prev_dave_state:
-                    self._dave_active, self._dave_code = cur_dave_state
-                    if self._dave_active:
-                        self._dave_was_active = True
-                    self._emit_snapshots()
-            else:
-                self._dave_was_active = False
-                self._dave_active = False
-                self._dave_code = ""
-                self._emit_snapshots()
+                return
+
+            await self._leave_channel_internal(trim_memory=False)
+            if (
+                guild.me is not None
+                and getattr(guild.me, "voice", None) is not None
+                and getattr(guild.me.voice, "channel", None) is not None
+                and guild.voice_client is None
+            ):
+                try:
+                    await guild.change_voice_state(channel=None)
+                except Exception:
+                    pass
+                deadline_clr = time.monotonic() + 1.2
+                while (
+                    guild.me is not None
+                    and getattr(guild.me, "voice", None) is not None
+                    and getattr(guild.me.voice, "channel", None) is not None
+                    and time.monotonic() < deadline_clr
+                ):
+                    await asyncio.sleep(0.05)
+
+            self._joining_channel_id = str(channel_id)
+            self._emit_snapshots()
+            self._connecting_vc = None
+            vc: Any = None
+            try:
+                for attempt_idx, (inner_to, outer_to) in enumerate(((7.0, 9.0), (8.0, 10.0))):
+                    try:
+                        vc = await asyncio.wait_for(
+                            channel.connect(
+                                cls=self._voice_cls,
+                                self_mute=self._muted,
+                                self_deaf=self._deafened,
+                                timeout=inner_to,
+                            ),
+                            timeout=outer_to,
+                        )
+                        break
+                    except asyncio.TimeoutError as exc:
+                        pending_vc = self._connecting_vc or guild.voice_client
+                        fail_diag = self._format_voice_diag(
+                            pending_vc, max(0, int((time.perf_counter() - t_start) * 1000))
+                        )
+                        if attempt_idx == 0:
+                            self._write_voice_diag(f"RETRY_1 {fail_diag}")
+                            await self._leave_channel_internal(trim_memory=False)
+                            self._joining_channel_id = str(channel_id)
+                            try:
+                                await guild.change_voice_state(channel=None)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.35)
+                            continue
+                        self._last_join_diag = fail_diag
+                        self._write_voice_diag(f"TIMEOUT {fail_diag}")
+                        await self._leave_channel_internal(trim_memory=False)
+                        raise RuntimeError(
+                            f"Tiempo de espera agotado al entrar en '{channel.name}'. "
+                            "Revisa permisos del canal o conexión UDP."
+                        ) from exc
+            except Exception as exc:
+                if not isinstance(exc, RuntimeError) or "Tiempo de espera agotado" not in str(exc):
+                    pending_vc = self._connecting_vc or guild.voice_client
+                    fail_diag = self._format_voice_diag(
+                        pending_vc, max(0, int((time.perf_counter() - t_start) * 1000))
+                    )
+                    self._write_voice_diag(f"ERROR {exc}: {fail_diag}")
+                    await self._leave_channel_internal(trim_memory=False)
+                raise
+            finally:
+                self._joining_channel_id = ""
+                self._connecting_vc = None
+
+            self._wire_voice_client(vc)
+            self._connecting_vc = None
+            self._vc = vc
+            self._mixer.clear()
+            already_dave = bool(vc._connection.can_encrypt)
+            self._dave_was_active = already_dave
+            self._dave_active = already_dave
+            self._dave_code = str(vc.voice_privacy_code or "")
+            tot_ms = max(0, int((time.perf_counter() - t_start) * 1000))
+            self._last_join_diag = self._format_voice_diag(vc, tot_ms)
+            self._emit_snapshots()
+            self._post_join_task = asyncio.create_task(
+                self._finish_post_join(vc, t_start)
+            )
 
     async def _sync_voice_flags(self) -> None:
         vc = self._vc
@@ -3850,13 +4207,25 @@ class DiscordWorkerApp:
                 await self._cancel_inflight_join()
                 await self._leave_channel_internal()
             elif cmd == "set_mute":
+                if self._mic_test_active:
+                    self._mic_test_active = False
+                    self._mic_test_saved_flags = None
+                    if self._audio is not None:
+                        self._audio.configure(loopback=False)
                 self._muted = bool(req.get("muted", False))
-                self._ensure_audio_engine().configure(muted=self._muted)
+                self._ensure_audio_engine().configure(muted=self._muted, loopback=False)
                 await self._sync_voice_flags()
             elif cmd == "set_deaf":
+                if self._mic_test_active:
+                    self._mic_test_active = False
+                    self._mic_test_saved_flags = None
+                    if self._audio is not None:
+                        self._audio.configure(loopback=False)
                 self._deafened = bool(req.get("deafened", False))
                 self._mixer.set_deafened(self._deafened)
                 await self._sync_voice_flags()
+            elif cmd == "set_mic_test":
+                await self._set_mic_test(bool(req.get("enabled", False)))
             elif cmd == "set_output_volume":
                 self._mixer.set_master_volume(_safe_int(req.get("volume", 100)))
             elif cmd == "set_mic_gain":

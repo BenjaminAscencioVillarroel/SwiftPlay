@@ -878,6 +878,12 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
         border-radius: 14px;
     }}
 
+    QFrame#DiscordDeckCard QLabel,
+    QFrame#DiscordDeckCard QCheckBox,
+    QFrame#DiscordDeckCard QSlider {{
+        background-color: transparent;
+    }}
+
     QFrame#DiscordSidebarMiniCard {{
         background-color: {p.surface2};
         border: 1px solid {p.border};

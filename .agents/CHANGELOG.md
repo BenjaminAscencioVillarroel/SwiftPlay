@@ -14,6 +14,22 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-23 — Fix Timeout de Llamada (Sesión Huérfana + Reintento Rápido), "Probar micrófono" Local y Estética Popover Audio
+- **Files:** `src/swiftplay/discord_service.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/discord_panel.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Fix Timeout / Sesión Huérfana al Entrar en Voz (`discord_service.py`, `discord_worker.py`):** `disconnect_and_kill()` espera el cierre limpio del worker (`1.5s`) antes de cerrar sus pipes para que desconecte del canal sin dejar sesión fantasma; `on_ready()` precalienta DF3/Silero y limpia estados de voz huérfanos en el servidor; `_join_channel()` limpia cualquier sesión fantasma previa antes de conectar, ya no bloquea el connect con `AudioEngine.start()` ni con `await` previo, y ejecuta conexión rápida con reintento automático (`7s`/`9s` + `8s`/`10s`) guardando el estado/fase en `_connecting_vc` + `logs/discord_voice_diag.log`.
+  - **Prueba Local de Micrófono / Loopback (`discord_worker.py`, `discord_service.py`, `discord_panel.py`):** Nuevo botón **"Probar micrófono"** en el popover de Audio que silencia y ensordece al bot en Discord (`muted=True, deafened=True`), enruta la captura procesada por el filtro/ganancia/VAD al dispositivo de salida en loopback local sin transmitir a Discord, y restaura automáticamente los estados previos al desactivar o al usar los botones normales.
+  - **Estética Popover Audio (`themes.py`, `discord_panel.py`):** `audio_advanced_box` usa `TransparentBox` junto a reglas transparentes para `QFrame#DiscordDeckCard` (eliminando el rectángulo negro interno) y ensancha `audio_popup` a `404 px` evitando recortes de texto.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+## 2026-11-23 — Fix Supresión IA (Re-warmup), Clic Canal → Voz, UDP Discovery sin Carrera y Diagnóstico de Fases
+- **Files:** `src/swiftplay/discord_worker.py`, `src/swiftplay/ui/discord_panel.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Restauración de Supresión IA (`discord_worker.py`):** `_DeepFilterMicDsp` ahora expone `_ready` real tras completar buffers y Silero VAD, incorpora `start_warmup_async()` idempotente, reinicia `_failed` al reactivar `ai`/`ai_max`, y `MicProcessor.process_frame()` / `AudioEngine.configure()` auto-lanzan el warmup en segundo plano si estaba descargado o si se cambió de modo (`off -> ai`), eliminando el flag bloqueante `_warmup_started`.
+  - **Redirección al Panel Voz desde Canal (`discord_panel.py`):** Al pulsar el canal de voz activo o conectando mientras se visualiza un chat o DM, `_build_voice_channel_row()` ahora cambia automáticamente la vista central al panel de Voz (`_set_pane_visible("voice", True)`).
+  - **Conexión de Voz Sin Bloqueos (`discord_worker.py`):** `_SwiftVoiceConnectionState` corrige la carrera UDP en `discover_ip()` (registra el listener y reanuda `SocketReader` antes de enviar con reintentos cada `0.35 s`), acota reintentos/desconexión y registra tiempos exactos por fase (`op4`, `ws`, `udp`, `key`, `audio`) en `connect_diag` + `logs/discord_voice_diag.log`, desacoplando `AudioEngine.start()` y `kickstart_voice()` en `_finish_post_join()`.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
 ## 2026-11-23 — Conexión Rápida Discord (IPv4 + Audio Paralelo + Desconexión Acotada) y Tarjetas de Voz Centradas Estilo Discord
 - **Files:** `src/swiftplay/discord_service.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/ui/discord_panel.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

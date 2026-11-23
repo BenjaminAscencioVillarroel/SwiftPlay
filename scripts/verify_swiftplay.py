@@ -306,6 +306,7 @@ def test_storage_config_themes() -> None:
         assert sel in qss, f"Falta selector {sel} en QSS"
     for legacy_hex in ("#10141C", "#171C27", "#1E2534"):
         assert legacy_hex not in qss, f"No debe permanecer tono azulado antiguo {legacy_hex} en QSS Discord"
+    assert "QFrame#DiscordDeckCard QLabel" in qss, "El popover DiscordDeckCard debe forzar fondo transparente en sus controles internos"
     accent_section = qss.split("QPushButton#AccentBtn {{")[1].split("}}")[0] if "QPushButton#AccentBtn {{" in qss else qss.split("QPushButton#AccentBtn {")[1].split("}")[0]
     assert "#F1F3F6" in accent_section, "AccentBtn debe usar texto claro (#F1F3F6) legible"
     pill_section = qss.split("QPushButton#PillBtn {")[1].split("}")[0]
@@ -1074,8 +1075,28 @@ def test_gui_and_libmpv_smoke(
         assert not dp.members_card.isHidden()
         dp._toggle_members_panel()
         assert dp.members_card.isHidden()
+        assert dp.audio_advanced_box.objectName() == "TransparentBox", (
+            "audio_advanced_box no debe pintar rectángulo negro opaco"
+        )
+        assert hasattr(dp, "mic_test_btn") and dp.mic_test_btn.text() == "Probar micrófono"
         dp.toggle_audio_popover(win.discord_mini_card)
         assert not dp.audio_popup.isHidden()
+        prev_st_mt = dp._bot_state
+        dp._bot_state = "connected"
+        dp._muted = False
+        dp._deafened = False
+        try:
+            dp._toggle_mic_test()
+            assert dp._mic_test_active is True and dp._muted is True and dp._deafened is True
+            assert not dp.mic_test_hint_lbl.isHidden()
+            dp._toggle_mic_test()
+            assert dp._mic_test_active is False and dp._muted is False and dp._deafened is False
+            assert dp.mic_test_hint_lbl.isHidden()
+        finally:
+            dp._bot_state = prev_st_mt
+            dp._mic_test_active = False
+            dp._mic_test_prev_flags = None
+            dp._sync_mic_test_ui()
         dp.close_audio_popover()
         assert dp.audio_popup.isHidden()
         dp._toggle_text_channels_section()
@@ -1294,6 +1315,24 @@ def test_gui_and_libmpv_smoke(
                 assert vc_row_hits == [True], f"Clic directo en canal de voz falló: {vc_row_hits}"
                 vc_row_ok.deleteLater()
                 vc_row_blk.deleteLater()
+
+                # Clic en el canal de voz activo mientras se mira el chat debe redirigir al panel Voz
+                dp._render_channels(force=True)
+                app.processEvents()
+                dp.tab_chat_btn.click()
+                app.processEvents()
+                assert dp.voice_pane.isHidden() and not dp.chat_pane.isHidden()
+                active_vc_rows = [
+                    r
+                    for r in dp.vc_list_widget.findChildren(_VoiceChannelRowFrame)
+                    if any("En Voz" in lb.text() for lb in r.findChildren(QLabel))
+                ]
+                assert active_vc_rows, "Debe existir la fila del canal activo en vc_list_widget"
+                QTest.mouseClick(active_vc_rows[0], Qt.MouseButton.LeftButton)
+                app.processEvents()
+                assert not dp.voice_pane.isHidden() and dp.chat_pane.isHidden(), (
+                    "Al pulsar el canal de voz conectado desde Chat debe cambiar al panel de Voz"
+                )
             finally:
                 app.removeEventFilter(d_watcher)
             assert not discord_popups, (
@@ -2687,7 +2726,7 @@ ai_proc.release_dsp()
 assert ai_proc._df_dsp._df_state is None and ai_proc._df_dsp._silero._vad is None
 ai_proc.close()
 
-# Arranque instantáneo sin bloqueo de warmup en modo IA (usa fallback WebRTC hasta que DF3 termine warmup)
+# Arranque instantáneo sin bloqueo de warmup en modo IA (usa fallback WebRTC hasta que DF3 termine warmup y luego auto-activa DF3)
 cold_df = _DfDsp(mode="ai")
 assert cold_df.is_ready is False
 assert cold_df._lock.acquire(blocking=False)
@@ -2702,8 +2741,21 @@ cold_proc = _DspMicProc(
     noise_suppression="ai",
     enable_webrtc=True,
 )
+_t_cold0 = _tm.perf_counter()
 _cold_frames, _cold_lvl, _cold_sp = cold_proc.process_frame(noise_frames[0], now=0.5)
-assert cold_proc._df_dsp.is_ready is False and cold_proc._df_dsp._df_state is None
+assert (_tm.perf_counter() - _t_cold0) < 0.2, "process_frame en frío no debe bloquear el hilo de audio"
+_t_warm_dl = _tm.monotonic() + 3.0
+while not cold_proc._df_dsp.is_ready and _tm.monotonic() < _t_warm_dl:
+    _tm.sleep(0.02)
+assert cold_proc._df_dsp.is_ready is True, "process_frame en modo IA debe auto-precalentar DeepFilterNet3 en segundo plano"
+cold_proc.configure(noise_suppression="off")
+assert cold_proc._df_dsp.is_ready is False
+cold_proc.configure(noise_suppression="ai")
+cold_proc.ensure_warmup_async()
+_t_rewarm_dl = _tm.monotonic() + 3.0
+while not cold_proc._df_dsp.is_ready and _tm.monotonic() < _t_rewarm_dl:
+    _tm.sleep(0.02)
+assert cold_proc._df_dsp.is_ready is True, "Cambiar off -> ai debe reactivar DeepFilterNet3"
 cold_proc.close()
 
 # Prioridad de dispositivos evita WDM-KS si existe alternativa WASAPI/MME
@@ -2968,6 +3020,39 @@ assert snap_app._audio._input_device_name == "Mic Test"
 assert snap_app._audio._output_device_name == "Out Test"
 assert snap_app._audio.is_open_mic is True
 assert snap_app._audio._muted is True
+
+# Prueba local de micrófono (loopback silenciado + ensordecido sin enviar por Discord y restaurando estado)
+_lb_sent = []
+_lb_eng = AudioEngine(
+    mixer=VoiceAudioMixer(),
+    on_send_pcm=lambda b: _lb_sent.append(b),
+    on_speaking_state=lambda _s: None,
+    on_mic_level=lambda _r, _t: None,
+    on_warning=lambda _w: None,
+)
+_lb_eng.configure(muted=True, loopback=True, vad_threshold=0, noise_suppression="off")
+_lb_eng._running = True
+_lb_eng._input_callback(_st.pack("<960h", *([4000] * 960)), 960, None, None)
+_raw_in = _lb_eng._mic_queue.get_nowait()
+_frames_lb, _lvl_lb, _tx_lb = _lb_eng._mic_proc.process_frame(_raw_in, now=1.0)
+assert _tx_lb is True and len(_lb_sent) == 0
+with _lb_eng._loopback_lock:
+    for _m_f in _frames_lb:
+        _lb_eng._loopback_queue.append(_m_f * 2)
+_out_pcm = bytearray(3840)
+_lb_eng._out_channels = 2
+_lb_eng._output_callback(_out_pcm, 960, None, None)
+assert any(b != 0 for b in _out_pcm), "El loopback local debe reproducir señal en salida aunque esté muted"
+_lb_eng.close()
+
+snap_app._muted = False
+snap_app._deafened = False
+_asyncio.run(snap_app._set_mic_test(True))
+assert snap_app._mic_test_active is True and snap_app._muted is True and snap_app._deafened is True
+_asyncio.run(snap_app._set_mic_test(False))
+assert snap_app._mic_test_active is False and snap_app._muted is False and snap_app._deafened is False
+if snap_app._audio is not None:
+    snap_app._audio.close()
 
 print("RTP_DAVE_OK")
 """
