@@ -43,6 +43,8 @@ _HOTKEY_STOP = 1004
 _HOTKEY_DISCORD_MUTE = 2001
 _HOTKEY_DISCORD_DEAFEN = 2002
 _HOTKEY_DISCORD_HANGUP = 2003
+_HOTKEY_DISCORD_SHARE_START = 2004
+_HOTKEY_DISCORD_SHARE_STOP = 2005
 
 _MOD_ALIASES: dict[str, int] = {
     "ctrl": MOD_CONTROL,
@@ -178,6 +180,8 @@ class GlobalMediaKeyFilter(QAbstractNativeEventFilter, QObject):
     discord_mute_pressed = Signal()
     discord_deafen_pressed = Signal()
     discord_hangup_pressed = Signal()
+    discord_share_start_pressed = Signal()
+    discord_share_stop_pressed = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         QAbstractNativeEventFilter.__init__(self)
@@ -355,16 +359,20 @@ class GlobalMediaKeyFilter(QAbstractNativeEventFilter, QObject):
         mute: str,
         deafen: str,
         hangup: str,
+        share_start: str = "",
+        share_stop: str = "",
         *,
         mute_force_priority: bool = True,
     ) -> dict[str, str]:
-        """Configura los 3 atajos globales de Discord; devuelve estado por acción."""
+        """Configura los atajos globales de Discord; devuelve estado por acción."""
         self._clear_discord_bindings()
         statuses: dict[str, str] = {}
         entries = (
             ("mute", _HOTKEY_DISCORD_MUTE, mute, self.discord_mute_pressed, bool(mute_force_priority)),
             ("deafen", _HOTKEY_DISCORD_DEAFEN, deafen, self.discord_deafen_pressed, False),
             ("hangup", _HOTKEY_DISCORD_HANGUP, hangup, self.discord_hangup_pressed, False),
+            ("share_start", _HOTKEY_DISCORD_SHARE_START, share_start, self.discord_share_start_pressed, False),
+            ("share_stop", _HOTKEY_DISCORD_SHARE_STOP, share_stop, self.discord_share_stop_pressed, False),
         )
 
         if sys.platform != "win32":
@@ -459,5 +467,11 @@ class GlobalMediaKeyFilter(QAbstractNativeEventFilter, QObject):
                         return True, 0
                     if hk_id == _HOTKEY_DISCORD_HANGUP:
                         self._emit_debounced("hangup", self.discord_hangup_pressed)
+                        return True, 0
+                    if hk_id == _HOTKEY_DISCORD_SHARE_START:
+                        self._emit_debounced("share_start", self.discord_share_start_pressed)
+                        return True, 0
+                    if hk_id == _HOTKEY_DISCORD_SHARE_STOP:
+                        self._emit_debounced("share_stop", self.discord_share_stop_pressed)
                         return True, 0
         return False, 0

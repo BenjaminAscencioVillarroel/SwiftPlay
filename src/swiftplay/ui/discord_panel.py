@@ -5757,6 +5757,43 @@ class DiscordVoicePanel(QWidget):
             return True
         return False
 
+    def start_screen_share_from_hotkey(self) -> str:
+        if self._screen_share_state in ("starting", "sharing") or self.screen_share_svc.is_sharing:
+            return "already_sharing"
+        if not self.svc.is_connected and self._bot_state != "connected":
+            return "not_connected"
+        if find_ffmpeg() is None:
+            return "no_ffmpeg"
+        if find_cloudflared() is None:
+            return "no_cloudflared"
+        self._screen_share_pending_opts = {
+            "source_id": "monitor:0",
+            "title": "Monitor 1",
+            "quality": "720p",
+            "fps": 30,
+            "include_audio": True,
+            "announce": False,
+            "targets": [],
+        }
+        self.screen_share_btn.setEnabled(False)
+        self.screen_share_btn.setText(" Iniciando...")
+        self.screen_share_svc.start_share(
+            source_id="monitor:0",
+            quality="720p",
+            fps=30,
+            include_audio=True,
+            title="Monitor 1",
+            use_tunnel=True,
+            exclude_pid=int(self.svc.worker_pid or 0),
+        )
+        return "started"
+
+    def stop_screen_share_from_hotkey(self) -> bool:
+        if self._screen_share_state in ("starting", "sharing") or self.screen_share_svc.is_sharing:
+            self._stop_screen_share()
+            return True
+        return False
+
     def _on_join_channel_clicked(self, guild_id: str, channel_id: str, channel_name: str) -> None:
         if self._mic_test_active:
             self._mic_test_active = False

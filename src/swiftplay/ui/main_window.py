@@ -1662,6 +1662,12 @@ class MainWindow(QMainWindow):
         self._media_filter.discord_mute_pressed.connect(self._on_global_discord_mute)
         self._media_filter.discord_deafen_pressed.connect(self._on_global_discord_deafen)
         self._media_filter.discord_hangup_pressed.connect(self._on_global_discord_hangup)
+        self._media_filter.discord_share_start_pressed.connect(
+            self._on_global_discord_share_start
+        )
+        self._media_filter.discord_share_stop_pressed.connect(
+            self._on_global_discord_share_stop
+        )
         app = QApplication.instance()
         if app is not None:
             app.installNativeEventFilter(self._media_filter)
@@ -1673,6 +1679,8 @@ class MainWindow(QMainWindow):
             self.cfg.discord_hotkey_mute,
             self.cfg.discord_hotkey_deafen,
             self.cfg.discord_hotkey_hangup,
+            self.cfg.discord_hotkey_share_start,
+            self.cfg.discord_hotkey_share_stop,
             mute_force_priority=self.cfg.discord_hotkey_mute_priority,
         )
         return dict(self._discord_hotkey_statuses)
@@ -1713,6 +1721,24 @@ class MainWindow(QMainWindow):
         if self.discord_panel.hangup_from_hotkey():
             if self.isVisible() and self.isActiveWindow():
                 self.show_toast("Discord: Saliste del canal de voz")
+
+    def _on_global_discord_share_start(self) -> None:
+        res = self.discord_panel.start_screen_share_from_hotkey()
+        if not (self.isVisible() and self.isActiveWindow()):
+            return
+        if res == "started":
+            self.show_toast("Discord: Iniciando transmisión (Monitor 1 · 720p 30fps)")
+        elif res == "not_connected":
+            self.show_toast("Discord: Conecta el Bot primero para compartir pantalla")
+        elif res == "no_cloudflared":
+            self.show_toast("Falta cloudflared.exe: abre Compartir pantalla para descargarlo")
+        elif res == "no_ffmpeg":
+            self.show_toast("No se encontró bin/ffmpeg.exe para compartir pantalla")
+
+    def _on_global_discord_share_stop(self) -> None:
+        if self.discord_panel.stop_screen_share_from_hotkey():
+            if self.isVisible() and self.isActiveWindow():
+                self.show_toast("Discord: Transmisión detenida")
 
     def _stop_all(self) -> None:
         self._save_current_video_progress(force=True)

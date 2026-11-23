@@ -1017,6 +1017,10 @@ def test_gui_and_libmpv_smoke(
         app.processEvents()
         dlg.select_discord_shortcuts_tab()
         dlg.update_discord_hotkey_statuses(win._discord_hotkey_statuses)
+        assert "share_start" in dlg._hk_edits and "share_stop" in dlg._hk_edits, (
+            "SettingsDialog debe incluir campos editables para iniciar y cortar compartida"
+        )
+        assert "share_start" in dlg._hk_status_labels and "share_stop" in dlg._hk_status_labels
         def _send_outside_click_to_dlg() -> None:
             outside_g = QPointF(float(win.geometry().left() + 8), float(win.geometry().top() + 8))
             ev = QMouseEvent(
@@ -1539,6 +1543,38 @@ def test_gui_and_libmpv_smoke(
                 assert dp._screen_viewer_active is False and dp.screen_viewer_card.isHidden(), (
                     "La vista previa local debe cerrarse al dejar de compartir"
                 )
+
+                # Verificar atajos separados de iniciar (Monitor 1 · 720p · 30fps) y cortar transmisión
+                hotkey_starts: list[dict[str, object]] = []
+                hotkey_stops: list[str] = []
+                orig_start_share = dp.screen_share_svc.start_share
+                orig_stop_share = dp._stop_screen_share
+                prev_bot_state = dp._bot_state
+                try:
+                    dp._bot_state = "connected"
+                    dp._screen_share_state = "idle"
+                    dp.screen_share_svc.start_share = lambda **kw: hotkey_starts.append(dict(kw))  # type: ignore[method-assign]
+                    dp._stop_screen_share = lambda: hotkey_stops.append("stopped")  # type: ignore[method-assign]
+                    assert dp.stop_screen_share_from_hotkey() is False
+                    res_hk_start = dp.start_screen_share_from_hotkey()
+                    if res_hk_start == "started":
+                        assert len(hotkey_starts) == 1
+                        assert hotkey_starts[0]["source_id"] == "monitor:0"
+                        assert hotkey_starts[0]["quality"] == "720p"
+                        assert hotkey_starts[0]["fps"] == 30
+                        assert hotkey_starts[0]["include_audio"] is True
+                        dp._screen_share_state = "sharing"
+                        assert dp.start_screen_share_from_hotkey() == "already_sharing"
+                        assert len(hotkey_starts) == 1, "El atajo de iniciar no debe alternar ni reiniciar una transmisión activa"
+                        assert dp.stop_screen_share_from_hotkey() is True
+                        assert hotkey_stops == ["stopped"]
+                finally:
+                    dp.screen_share_svc.start_share = orig_start_share  # type: ignore[method-assign]
+                    dp._stop_screen_share = orig_stop_share  # type: ignore[method-assign]
+                    dp._bot_state = prev_bot_state
+                    dp._screen_share_state = "idle"
+                    dp.screen_share_btn.setEnabled(True)
+                    dp.screen_share_btn.setText(" Compartir pantalla")
             finally:
                 app.removeEventFilter(d_watcher)
             assert not discord_popups, (
@@ -2483,6 +2519,8 @@ def test_discord_voice_bridge() -> None:
         cfg.discord_hotkey_mute = "F9"
         cfg.discord_hotkey_deafen = "Ctrl+Alt+D"
         cfg.discord_hotkey_hangup = "Pause"
+        cfg.discord_hotkey_share_start = "Ctrl+Alt+F7"
+        cfg.discord_hotkey_share_stop = "Ctrl+Alt+F8"
         cfg.discord_hotkey_mute_priority = False
         cfg.discord_show_locked_channels = True
         cfg.discord_overlay_enabled = False
@@ -2501,6 +2539,8 @@ def test_discord_voice_bridge() -> None:
         assert cfg2.discord_hotkey_mute == "F9"
         assert cfg2.discord_hotkey_deafen == "Ctrl+Alt+D"
         assert cfg2.discord_hotkey_hangup == "Pause"
+        assert cfg2.discord_hotkey_share_start == "Ctrl+Alt+F7"
+        assert cfg2.discord_hotkey_share_stop == "Ctrl+Alt+F8"
         assert cfg2.discord_hotkey_mute_priority is False
         assert cfg2.discord_show_locked_channels is True
         assert cfg2.discord_overlay_enabled is False
@@ -2589,11 +2629,15 @@ def test_discord_voice_bridge() -> None:
             "Ctrl+Shift+M",
             "",
             "InvalidKey",
+            "Ctrl+Alt+F7",
+            "Ctrl+Alt+F8",
             mute_force_priority=True,
         )
         assert st_hk["mute"] in ("global_hook", "global_os")
         assert st_hk["deafen"] == "disabled"
         assert st_hk["hangup"] == "invalid"
+        assert st_hk["share_start"] in ("global_hook", "global_os", "conflict")
+        assert st_hk["share_stop"] in ("global_hook", "global_os", "conflict")
         hk_filter.set_suspended(True)
         hk_filter.set_suspended(False)
         hk_filter.unregister()

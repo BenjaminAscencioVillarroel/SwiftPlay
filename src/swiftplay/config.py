@@ -90,6 +90,8 @@ class AppConfig:
     discord_hotkey_mute: str = "Ctrl+Shift+M"
     discord_hotkey_deafen: str = "Ctrl+Shift+D"
     discord_hotkey_hangup: str = "Ctrl+Shift+H"
+    discord_hotkey_share_start: str = "Ctrl+Alt+S"
+    discord_hotkey_share_stop: str = "Ctrl+Alt+X"
     discord_hotkey_mute_priority: bool = True
     discord_show_locked_channels: bool = False
     discord_overlay_enabled: bool = True
@@ -138,6 +140,8 @@ class AppConfig:
         self.discord_hotkey_mute = str(self.discord_hotkey_mute or "").strip()
         self.discord_hotkey_deafen = str(self.discord_hotkey_deafen or "").strip()
         self.discord_hotkey_hangup = str(self.discord_hotkey_hangup or "").strip()
+        self.discord_hotkey_share_start = str(self.discord_hotkey_share_start or "").strip()
+        self.discord_hotkey_share_stop = str(self.discord_hotkey_share_stop or "").strip()
         self.discord_hotkey_mute_priority = bool(self.discord_hotkey_mute_priority)
         self.discord_show_locked_channels = bool(self.discord_show_locked_channels)
         ov_mode = str(self.discord_overlay_mode or "status").strip().lower()

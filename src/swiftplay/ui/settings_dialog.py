@@ -1119,6 +1119,8 @@ class SettingsDialog(QDialog):
             ("mute", "Silenciar / Activar micrófono (Prioritario)", "discord_hotkey_mute"),
             ("deafen", "Ensordecer / Activar audio Discord", "discord_hotkey_deafen"),
             ("hangup", "Colgar / Salir del canal de voz", "discord_hotkey_hangup"),
+            ("share_start", "Compartir pantalla (Mon. 1 · 720p 30fps)", "discord_hotkey_share_start"),
+            ("share_stop", "Cortar transmisión de pantalla", "discord_hotkey_share_stop"),
         )
         form_card = QFrame()
         form_card.setObjectName("MediaCard")
@@ -1200,6 +1202,8 @@ class SettingsDialog(QDialog):
             "mute": ("discord_hotkey_mute", "Ctrl+Shift+M"),
             "deafen": ("discord_hotkey_deafen", "Ctrl+Shift+D"),
             "hangup": ("discord_hotkey_hangup", "Ctrl+Shift+H"),
+            "share_start": ("discord_hotkey_share_start", "Ctrl+Alt+S"),
+            "share_stop": ("discord_hotkey_share_stop", "Ctrl+Alt+X"),
         }
         for key, (attr, val) in defaults.items():
             setattr(self.cfg, attr, val)

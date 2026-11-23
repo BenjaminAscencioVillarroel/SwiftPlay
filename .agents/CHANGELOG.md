@@ -14,6 +14,13 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-23 — Atajos Globales Separados para Iniciar y Cortar Compartida de Pantalla
+- **Files:** `src/swiftplay/config.py`, `src/swiftplay/media_keys.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/main_window.py`, `src/swiftplay/ui/settings_dialog.py`, `src/swiftplay/ui/shortcuts_dialog.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - Añadidos dos atajos globales independientes configurables en `AppConfig` y `GlobalMediaKeyFilter`: `discord_hotkey_share_start` (`Ctrl+Alt+S` por defecto) y `discord_hotkey_share_stop` (`Ctrl+Alt+X` por defecto), editables desde **Ajustes → Atajos Discord** y visibles en `ShortcutsDialog`.
+  - `DiscordVoicePanel.start_screen_share_from_hotkey()` inicia la transmisión directamente con los valores predeterminados (`monitor:0`, `720p`, `30 fps`, audio del sistema excluyendo Discord, presencia nativa) y no funciona como toggle si ya está compartiendo; `stop_screen_share_from_hotkey()` corta únicamente una transmisión activa.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
 ## 2026-11-23 — Fix Desconexiones Aleatorias de Discord y Caídas de Llamada de Voz
 - **Files:** `src/swiftplay/discord_service.py`, `src/swiftplay/discord_worker.py`, `src/swiftplay/ui/discord_panel.py`, `scripts/verify_swiftplay.py`
 - **Root Causes:** `on_voice_state_update` expulsaba inmediatamente la llamada durante reconexiones transitorias del servidor de voz (`after.channel is None`), `DiscordService.stop_if_idle()` mataba sesiones conectadas fuera de llamada al minimizar a bandeja/mini-barra/trim, `VoiceConnectionState.timeout` quedaba en `7s` en llamadas largas, `on_ready` podía limpiar voz al reconectar el Gateway y `_connect_bot` no tenía bucle automático de reconexión ante caídas transitorias de Gateway.

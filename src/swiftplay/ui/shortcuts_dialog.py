@@ -188,6 +188,12 @@ class ShortcutsDialog(QDialog):
         mute_key = (config.discord_hotkey_mute if config is not None else "Ctrl+Shift+M").strip()
         deaf_key = (config.discord_hotkey_deafen if config is not None else "Ctrl+Shift+D").strip()
         hang_key = (config.discord_hotkey_hangup if config is not None else "Ctrl+Shift+H").strip()
+        share_start_key = (
+            config.discord_hotkey_share_start if config is not None else "Ctrl+Alt+S"
+        ).strip()
+        share_stop_key = (
+            config.discord_hotkey_share_stop if config is not None else "Ctrl+Alt+X"
+        ).strip()
         prio_tag = (
             " (prioritario)"
             if (config is None or config.discord_hotkey_mute_priority)
@@ -204,6 +210,11 @@ class ShortcutsDialog(QDialog):
                     ),
                     (deaf_key or "Desactivado", "Ensordecer / Activar audio Discord"),
                     (hang_key or "Desactivado", "Colgar / Salir del canal de voz"),
+                    (
+                        share_start_key or "Desactivado",
+                        "Compartir pantalla (Monitor 1 · 720p 30fps)",
+                    ),
+                    (share_stop_key or "Desactivado", "Cortar transmisión de pantalla"),
                 ),
             )
         ]
