@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from datetime import datetime
 import html
+import math
 import os
 from pathlib import Path
 import time
@@ -12,6 +13,7 @@ from typing import Any, Literal
 
 import requests
 from PySide6.QtCore import (
+    QEasingCurve,
     QEvent,
     QObject,
     QPoint,
@@ -22,6 +24,7 @@ from PySide6.QtCore import (
     QThreadPool,
     QTimer,
     QUrl,
+    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
@@ -46,6 +49,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -58,6 +62,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -74,6 +79,40 @@ from swiftplay.ui.icons import render_icon
 _IMAGE_EXTS: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 _MAX_CHAT_UPLOAD_BYTES = 25 * 1024 * 1024
 _MAX_CHAT_DOWNLOAD_BYTES = 25 * 1024 * 1024
+
+_PRESENCE_META: dict[str, tuple[str, str]] = {
+    "online": ("#4ADE80", "En línea"),
+    "idle": ("#FACC15", "Ausente"),
+    "dnd": ("#F87171", "No molestar"),
+    "offline": ("#6B7280", "Desconectado"),
+}
+
+
+def _normalize_presence(status: Any) -> str:
+    s = str(status or "offline").strip().lower()
+    return s if s in _PRESENCE_META else "offline"
+
+
+def _presence_color(status: Any) -> str:
+    return _PRESENCE_META[_normalize_presence(status)][0]
+
+
+def _presence_label(status: Any) -> str:
+    return _PRESENCE_META[_normalize_presence(status)][1]
+
+
+def _build_status_dot_pixmap(status: Any, size: int = 10) -> QPixmap:
+    sz = max(6, int(size))
+    pm = QPixmap(sz, sz)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(_presence_color(status)))
+    pad = 1
+    painter.drawEllipse(pad, pad, sz - pad * 2, sz - pad * 2)
+    painter.end()
+    return pm
 
 
 def _format_file_size(size: int) -> str:
@@ -176,6 +215,7 @@ class _ImageLightboxOverlay(QWidget):
         self._sig: _AttachmentSignals | None = None
         self._orig_pixmap: QPixmap | None = None
         self._closed = False
+        self._fade_progress = 0.0
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         if parent is not None:
@@ -189,7 +229,7 @@ class _ImageLightboxOverlay(QWidget):
         self.top_bar = QFrame(self)
         self.top_bar.setObjectName("DiscordDeckCard")
         self.top_bar.setStyleSheet(
-            f"QFrame#DiscordDeckCard {{ background-color: rgba(22, 26, 34, 232); "
+            f"QFrame#DiscordDeckCard {{ background-color: rgba(18, 20, 24, 238); "
             f"border: 1px solid {palette.border_bright}; border-radius: 10px; }}"
         )
         bar_lay = QHBoxLayout(self.top_bar)
@@ -228,13 +268,21 @@ class _ImageLightboxOverlay(QWidget):
         self.img_lbl = QLabel("Cargando imagen...", self)
         self.img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img_lbl.setStyleSheet(
-            f"color: {palette.text2}; font-size: 13px; background: rgba(16, 19, 26, 200); "
+            f"color: {palette.text2}; font-size: 13px; background: rgba(20, 22, 26, 220); "
             f"border-radius: 10px; padding: 14px 20px;"
         )
         img_row.addWidget(self.img_lbl)
         img_row.addStretch(1)
         root.addLayout(img_row)
         root.addStretch(1)
+
+        self._fade_anim = QVariantAnimation(self)
+        self._fade_anim.setDuration(150)
+        self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade_anim.setStartValue(0.0)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.valueChanged.connect(self._on_fade_tick)
+        self._fade_anim.start()
 
         task = _AttachmentFetchTask(url)
         sig = task.signals
@@ -293,10 +341,18 @@ class _ImageLightboxOverlay(QWidget):
         self._release_signal()
         self.img_lbl.setText(f"No se pudo descargar la imagen: {err}")
 
+    def _on_fade_tick(self, val: Any) -> None:
+        self._fade_progress = max(0.0, min(1.0, float(val)))
+        self.update()
+
     def close_overlay(self) -> None:
         if self._closed:
             return
         self._closed = True
+        try:
+            self._fade_anim.stop()
+        except RuntimeError:
+            pass
         self._release_signal()
         p = self.parentWidget()
         if p is not None:
@@ -311,7 +367,8 @@ class _ImageLightboxOverlay(QWidget):
 
     def paintEvent(self, _event: QPaintEvent) -> None:
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 214))
+        alpha = max(30, min(214, int(round(214 * self._fade_progress))))
+        painter.fillRect(self.rect(), QColor(0, 0, 0, alpha))
         painter.end()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
@@ -422,7 +479,7 @@ class _ChatHoverToolbar(QFrame):
         self._msg: dict[str, Any] = {}
         self.setObjectName("ChatHoverToolbar")
         self.setStyleSheet(
-            f"QFrame#ChatHoverToolbar {{ background-color: #1B202C; "
+            f"QFrame#ChatHoverToolbar {{ background-color: #17191E; "
             f"border: 1px solid {palette.border_bright}; border-radius: 8px; }}"
         )
         lay = QHBoxLayout(self)
@@ -467,7 +524,7 @@ class _ChatHoverToolbar(QFrame):
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self.setStyleSheet(
-            f"QFrame#ChatHoverToolbar {{ background-color: #1B202C; "
+            f"QFrame#ChatHoverToolbar {{ background-color: #17191E; "
             f"border: 1px solid {palette.border_bright}; border-radius: 8px; }}"
         )
         self.reply_btn.setIcon(render_icon("reply", palette.text, 14))
@@ -667,7 +724,7 @@ class _ChatMessageRow(QFrame):
             )
             body.setStyleSheet(
                 "QLabel { background: transparent; border: none; color: #D8DEE9; font-size: 13px; "
-                "selection-background-color: #3B4C6B; selection-color: #FFFFFF; }"
+                "selection-background-color: #3A3F4B; selection-color: #FFFFFF; }"
             )
             body.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             body.customContextMenuRequested.connect(
@@ -710,8 +767,8 @@ class _ChatMessageRow(QFrame):
                 else:
                     thumb_lbl.setText(f"🖼️ {meta_txt}  (clic para ver)")
                     thumb_lbl.setStyleSheet(
-                        "background-color: #171B24; color: #B8C0CE; "
-                        "border: 1px solid #2A3244; border-radius: 8px; padding: 6px 10px;"
+                        "background-color: #14161A; color: #B8C0CE; "
+                        "border: 1px solid #272B33; border-radius: 8px; padding: 6px 10px;"
                     )
                     if thumb_registry is not None:
                         thumb_registry.setdefault(raw_url, []).append(thumb_lbl)
@@ -729,7 +786,7 @@ class _ChatMessageRow(QFrame):
                 dl_btn.setFlat(True)
                 dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 dl_btn.setStyleSheet(
-                    "QPushButton { background: transparent; border: none; color: #93C5FD; font-size: 11px; padding: 0 4px; }"
+                    "QPushButton { background: transparent; border: none; color: #CFD5DF; font-size: 11px; padding: 0 4px; }"
                     "QPushButton:hover { text-decoration: underline; }"
                 )
                 dl_btn.clicked.connect(lambda _c=False, ref=att_copy: self.save_attachment_requested.emit(ref))
@@ -739,7 +796,7 @@ class _ChatMessageRow(QFrame):
             else:
                 file_card = QFrame(self)
                 file_card.setStyleSheet(
-                    "QFrame { background-color: #171B24; border: 1px solid #2A3244; border-radius: 8px; }"
+                    "QFrame { background-color: #14161A; border: 1px solid #272B33; border-radius: 8px; }"
                 )
                 fl = QHBoxLayout(file_card)
                 fl.setContentsMargins(10, 5, 10, 5)
@@ -754,7 +811,7 @@ class _ChatMessageRow(QFrame):
                     dl_btn.setFlat(True)
                     dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                     dl_btn.setStyleSheet(
-                        "QPushButton { background: transparent; border: none; color: #93C5FD; font-size: 11.5px; padding: 0 4px; }"
+                        "QPushButton { background: transparent; border: none; color: #CFD5DF; font-size: 11.5px; padding: 0 4px; }"
                         "QPushButton:hover { text-decoration: underline; }"
                     )
                     dl_btn.clicked.connect(
@@ -837,6 +894,12 @@ class _ChatMessagesView(QScrollArea):
         self._thumb_labels_by_url: dict[str, list[QLabel]] = {}
         self._hovered_row: _ChatMessageRow | None = None
         self._toolbar_hovered = False
+        self._stick_to_bottom = True
+        self._stick_until = 0.0
+        self._programmatic_scroll = False
+        self._last_msg_dict: dict[str, Any] | None = None
+        self._last_date_label: str = ""
+        self._msg_by_id: dict[str, dict[str, Any]] = {}
 
         self.setObjectName("TransparentScroll")
         self.setWidgetResizable(True)
@@ -876,7 +939,8 @@ class _ChatMessagesView(QScrollArea):
 
         sb = self.verticalScrollBar()
         if sb is not None:
-            sb.valueChanged.connect(lambda _v: self.clear_hover())
+            sb.valueChanged.connect(self._on_scroll_value_changed)
+            sb.rangeChanged.connect(self._on_scroll_range_changed)
 
     def set_can_send(self, can_send: bool) -> None:
         self._can_send = bool(can_send)
@@ -896,6 +960,20 @@ class _ChatMessagesView(QScrollArea):
             return self.placeholder_lbl.text()
         return "\n".join(r.plain_text_summary() for r in self._rows)
 
+    def show_placeholder(self, text: str) -> None:
+        self._stick_to_bottom = False
+        self._stick_until = 0.0
+        self._clear_rows()
+        self.placeholder_lbl.setText(text)
+        self.placeholder_lbl.setVisible(True)
+        sb = self.verticalScrollBar()
+        if sb is not None:
+            self._programmatic_scroll = True
+            try:
+                sb.setValue(0)
+            finally:
+                self._programmatic_scroll = False
+
     def clear_hover(self) -> None:
         self._hide_timer.stop()
         self._toolbar_hovered = False
@@ -907,10 +985,34 @@ class _ChatMessagesView(QScrollArea):
             self._hovered_row = None
         self._hover_bar.hide()
 
+    def _on_scroll_value_changed(self, value: int) -> None:
+        self.clear_hover()
+        if self._programmatic_scroll:
+            return
+        sb = self.verticalScrollBar()
+        if sb is None:
+            return
+        if time.monotonic() <= self._stick_until:
+            return
+        self._stick_to_bottom = value >= (sb.maximum() - 28)
+
+    def _on_scroll_range_changed(self, _min_v: int, max_v: int) -> None:
+        if self._stick_to_bottom or time.monotonic() <= self._stick_until:
+            sb = self.verticalScrollBar()
+            if sb is not None and max_v > 0:
+                self._programmatic_scroll = True
+                try:
+                    sb.setValue(max_v)
+                finally:
+                    self._programmatic_scroll = False
+
     def _clear_rows(self) -> None:
         self.clear_hover()
         self._avatar_labels_by_url.clear()
         self._thumb_labels_by_url.clear()
+        self._last_msg_dict = None
+        self._last_date_label = ""
+        self._msg_by_id.clear()
         for r in self._rows:
             r.hide()
             self._lay.removeWidget(r)
@@ -926,14 +1028,38 @@ class _ChatMessagesView(QScrollArea):
                 w.setParent(None)
                 w.deleteLater()
 
-    def show_placeholder(self, text: str) -> None:
-        self.setUpdatesEnabled(False)
-        try:
-            self._clear_rows()
-            self.placeholder_lbl.setText(text)
-            self.placeholder_lbl.setVisible(True)
-        finally:
-            self.setUpdatesEnabled(True)
+    def _create_and_insert_row(
+        self,
+        msg: dict[str, Any],
+        *,
+        grouped: bool,
+        first_in_list: bool,
+        thumb_cache: ThumbnailCache | None,
+        fallback_peer_avatar: str,
+        fallback_bot_avatar: str,
+    ) -> _ChatMessageRow:
+        is_self = bool(msg.get("is_self", False))
+        fb_av = fallback_bot_avatar if is_self else fallback_peer_avatar
+        row = _ChatMessageRow(
+            msg,
+            grouped=grouped,
+            first_in_list=first_in_list,
+            palette=self._palette,
+            thumb_cache=thumb_cache,
+            fallback_avatar_url=fb_av,
+            msg_by_id=self._msg_by_id,
+            avatar_registry=self._avatar_labels_by_url,
+            thumb_registry=self._thumb_labels_by_url,
+            parent=self.container,
+        )
+        row.hovered_entered.connect(self.hover_row)
+        row.hovered_left.connect(self._on_row_left)
+        row.context_requested.connect(self.row_context_menu_requested.emit)
+        row.image_clicked.connect(self.image_clicked.emit)
+        row.save_attachment_requested.connect(self.save_attachment_requested.emit)
+        self._rows.append(row)
+        self._lay.insertWidget(self._lay.count() - 1, row)
+        return row
 
     def set_messages(
         self,
@@ -947,14 +1073,18 @@ class _ChatMessagesView(QScrollArea):
         sb = self.verticalScrollBar()
         prev_val = sb.value() if sb is not None else 0
         pending_urls: set[str] = set()
-        msg_by_id = {
-            str(m.get("id") or ""): m for m in messages if str(m.get("id") or "")
-        }
+        if scroll_to_bottom:
+            self._stick_to_bottom = True
+            self._stick_until = time.monotonic() + 0.9
 
         self.setUpdatesEnabled(False)
         try:
             self._clear_rows()
             self.placeholder_lbl.setVisible(False)
+            for m in messages:
+                mid = str(m.get("id") or "")
+                if mid:
+                    self._msg_by_id[mid] = m
             last_date = ""
             prev_msg: dict[str, Any] | None = None
             for idx, msg in enumerate(messages):
@@ -970,45 +1100,116 @@ class _ChatMessagesView(QScrollArea):
                     self._lay.insertWidget(self._lay.count() - 1, div)
 
                 grouped = _should_group_message(prev_msg, msg)
-                is_self = bool(msg.get("is_self", False))
-                fb_av = fallback_bot_avatar if is_self else fallback_peer_avatar
-                row = _ChatMessageRow(
+                self._create_and_insert_row(
                     msg,
                     grouped=grouped,
                     first_in_list=(idx == 0),
-                    palette=self._palette,
                     thumb_cache=thumb_cache,
-                    fallback_avatar_url=fb_av,
-                    msg_by_id=msg_by_id,
-                    avatar_registry=self._avatar_labels_by_url,
-                    thumb_registry=self._thumb_labels_by_url,
-                    parent=self.container,
+                    fallback_peer_avatar=fallback_peer_avatar,
+                    fallback_bot_avatar=fallback_bot_avatar,
                 )
-                row.hovered_entered.connect(self.hover_row)
-                row.hovered_left.connect(self._on_row_left)
-                row.context_requested.connect(self.row_context_menu_requested.emit)
-                row.image_clicked.connect(self.image_clicked.emit)
-                row.save_attachment_requested.connect(self.save_attachment_requested.emit)
-                self._rows.append(row)
-                self._lay.insertWidget(self._lay.count() - 1, row)
                 prev_msg = msg
+            self._last_msg_dict = dict(prev_msg) if prev_msg is not None else None
+            self._last_date_label = last_date
         finally:
             self.setUpdatesEnabled(True)
 
         pending_urls.update(self._avatar_labels_by_url.keys())
         pending_urls.update(self._thumb_labels_by_url.keys())
 
+        self._lay.activate()
+        self.container.adjustSize()
         if sb is not None:
             if scroll_to_bottom:
+                self.scroll_to_bottom()
                 QTimer.singleShot(0, self.scroll_to_bottom)
+                QTimer.singleShot(50, self.scroll_to_bottom)
             else:
-                sb.setValue(min(prev_val, sb.maximum()))
+                self._programmatic_scroll = True
+                try:
+                    sb.setValue(min(prev_val, sb.maximum()))
+                finally:
+                    self._programmatic_scroll = False
         return pending_urls
 
+    def append_message(
+        self,
+        msg: dict[str, Any],
+        *,
+        thumb_cache: ThumbnailCache | None,
+        fallback_peer_avatar: str = "",
+        fallback_bot_avatar: str = "",
+    ) -> set[str]:
+        if not self._rows:
+            return self.set_messages(
+                [msg],
+                thumb_cache=thumb_cache,
+                fallback_peer_avatar=fallback_peer_avatar,
+                fallback_bot_avatar=fallback_bot_avatar,
+                scroll_to_bottom=True,
+            )
+        mid = str(msg.get("id") or "")
+        if mid:
+            self._msg_by_id[mid] = msg
+        force_scroll = self._stick_to_bottom or bool(msg.get("is_self", False))
+        if force_scroll:
+            self._stick_to_bottom = True
+            self._stick_until = time.monotonic() + 0.7
+
+        dlabel = str(msg.get("date_label") or "").strip()
+        if dlabel and dlabel != self._last_date_label:
+            self._last_date_label = dlabel
+            div = QLabel(f"─── {dlabel} ───", self.container)
+            div.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            div.setStyleSheet(
+                "background: transparent; border: none; color: #9299A8; "
+                "font-size: 11px; padding: 6px 0 4px 0;"
+            )
+            self._lay.insertWidget(self._lay.count() - 1, div)
+
+        grouped = _should_group_message(self._last_msg_dict, msg)
+        self._create_and_insert_row(
+            msg,
+            grouped=grouped,
+            first_in_list=False,
+            thumb_cache=thumb_cache,
+            fallback_peer_avatar=fallback_peer_avatar,
+            fallback_bot_avatar=fallback_bot_avatar,
+        )
+        self._last_msg_dict = dict(msg)
+
+        while len(self._rows) > 80:
+            old = self._rows.pop(0)
+            old_id = str(old.msg.get("id") or "")
+            if old_id:
+                self._msg_by_id.pop(old_id, None)
+            old.hide()
+            self._lay.removeWidget(old)
+            old.setParent(None)
+            old.deleteLater()
+
+        self._lay.activate()
+        self.container.adjustSize()
+        if force_scroll:
+            self.scroll_to_bottom()
+            QTimer.singleShot(0, self.scroll_to_bottom)
+            QTimer.singleShot(45, self.scroll_to_bottom)
+
+        pending: set[str] = set()
+        pending.update(self._avatar_labels_by_url.keys())
+        pending.update(self._thumb_labels_by_url.keys())
+        return pending
+
     def scroll_to_bottom(self) -> None:
+        self._lay.activate()
+        self.container.adjustSize()
         sb = self.verticalScrollBar()
         if sb is not None:
-            sb.setValue(sb.maximum())
+            self._programmatic_scroll = True
+            try:
+                sb.setValue(sb.maximum())
+            finally:
+                self._programmatic_scroll = False
 
     def on_image_ready(self, url: str, pix: QPixmap) -> None:
         if pix.isNull():
@@ -1032,6 +1233,10 @@ class _ChatMessagesView(QScrollArea):
                     lbl.setStyleSheet("background: transparent; border: none;")
                 except RuntimeError:
                     pass
+            self._lay.activate()
+            self.container.adjustSize()
+            if self._stick_to_bottom:
+                QTimer.singleShot(0, self.scroll_to_bottom)
 
     def hover_row(self, row: _ChatMessageRow) -> None:
         self._hide_timer.stop()
@@ -1196,6 +1401,77 @@ def _clear_grid_keep_widgets(grid: QGridLayout) -> None:
         grid.takeAt(0)
 
 
+def _compute_voice_row_sizes(count: int, max_cols: int) -> list[int]:
+    """Calcula la distribución balanceada por filas al estilo Discord (1, 2, 2+1, 2+2, 3+2, etc.)."""
+    n = max(0, int(count))
+    if n == 0:
+        return []
+    cap = max(1, int(max_cols))
+    if cap == 1:
+        return [1] * n
+    if n == 1:
+        return [1]
+    if n == 2:
+        return [2]
+    if n == 3:
+        return [2, 1]
+    if n == 4:
+        return [2, 2]
+    if n == 5:
+        return [3, 2] if cap >= 3 else [2, 2, 1]
+    if n == 6:
+        return [3, 3] if cap >= 3 else [2, 2, 2]
+    if n == 7:
+        if cap >= 4:
+            return [4, 3]
+        if cap == 3:
+            return [3, 2, 2]
+        return [2, 2, 2, 1]
+    if n == 8:
+        if cap >= 4:
+            return [4, 4]
+        if cap == 3:
+            return [3, 3, 2]
+        return [2, 2, 2, 2]
+    if n == 9:
+        if cap >= 3:
+            return [3, 3, 3]
+        return [2, 2, 2, 2, 1]
+    rows = math.ceil(n / cap)
+    base, rem = divmod(n, rows)
+    return [base + (1 if i < rem else 0) for i in range(rows)]
+
+
+def _compute_participant_card_size(
+    count: int,
+    row_sizes: list[int],
+    avail_w: int,
+    avail_h: int,
+    spacing: int = 12,
+) -> tuple[int, int]:
+    """Dimensiona las tarjetas según la cantidad de participantes y el viewport disponible."""
+    if count <= 1:
+        pref_w, pref_h = 280, 196
+    elif count == 2:
+        pref_w, pref_h = 260, 186
+    elif count <= 4:
+        pref_w, pref_h = 240, 174
+    elif count <= 6:
+        pref_w, pref_h = 222, 162
+    else:
+        pref_w, pref_h = 205, 154
+
+    max_row = max(row_sizes) if row_sizes else 1
+    num_rows = max(1, len(row_sizes))
+    usable_w = max(190, int(avail_w) - 24)
+    usable_h = max(160, int(avail_h) - 24)
+    max_card_w = max(164, (usable_w - spacing * max(0, max_row - 1)) // max_row)
+    max_card_h = max(142, (usable_h - spacing * max(0, num_rows - 1)) // num_rows)
+    card_w = max(164, min(pref_w, max_card_w))
+    card_h = max(142, min(pref_h, max_card_h))
+    return card_w, card_h
+
+
 def _make_section_toggle_btn(text: str) -> QPushButton:
     btn = QPushButton(text)
     btn.setObjectName("SectionHeader")
@@ -1342,8 +1618,8 @@ class _ParticipantCard(QFrame):
         self._card_bg_hex, self._card_border_hex = _default_card_tint(name)
 
         self.setObjectName("DiscordParticipantCard")
-        self.setMinimumWidth(195)
-        self.setMinimumHeight(148)
+        self.setMinimumWidth(164)
+        self.setMinimumHeight(142)
         if not self._is_self:
             self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.customContextMenuRequested.connect(self._on_context_menu)
@@ -1351,6 +1627,7 @@ class _ParticipantCard(QFrame):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 14, 14, 12)
         lay.setSpacing(8)
+        lay.addStretch(1)
 
         self.avatar = _AvatarCircleWidget(
             name=name,
@@ -1363,6 +1640,13 @@ class _ParticipantCard(QFrame):
         title_row = QHBoxLayout()
         title_row.setSpacing(5)
         title_row.addStretch(1)
+
+        self._status_dot_lbl = QLabel()
+        self._status_dot_lbl.setFixedSize(10, 10)
+        st_init = _normalize_presence(part.get("status") or ("online" if self._is_self else "offline"))
+        self._status_dot_lbl.setPixmap(_build_status_dot_pixmap(st_init, 9))
+        self._status_dot_lbl.setToolTip(_presence_label(st_init))
+        title_row.addWidget(self._status_dot_lbl)
 
         name_lbl = QLabel(name)
         name_lbl.setStyleSheet(
@@ -1423,8 +1707,14 @@ class _ParticipantCard(QFrame):
             self_lbl.setFixedHeight(20)
             lay.addWidget(self_lbl)
 
+        lay.addStretch(1)
         self._load_avatar()
         self.update_theme(palette)
+
+    def set_status(self, status: str) -> None:
+        st = _normalize_presence(status)
+        self._status_dot_lbl.setPixmap(_build_status_dot_pixmap(st, 9))
+        self._status_dot_lbl.setToolTip(_presence_label(st))
 
     def _load_avatar(self) -> None:
         if self._thumb_cache is None or not self._avatar_url:
@@ -1479,6 +1769,11 @@ class _ParticipantCard(QFrame):
             self, self._uid, self._name, self._is_bot, self.mapToGlobal(pos)
         ):
             self.dm_requested.emit(self._uid, self._name, self._avatar_url)
+
+    def set_status(self, status: str) -> None:
+        st = _normalize_presence(status)
+        self._status_dot_lbl.setPixmap(_build_status_dot_pixmap(st, 9))
+        self._status_dot_lbl.setToolTip(_presence_label(st))
 
     def set_speaking(self, speaking: bool) -> None:
         val = bool(speaking)
@@ -1556,6 +1851,8 @@ class DiscordVoicePanel(QWidget):
         self._participant_cards: dict[str, _ParticipantCard] = {}
         self._participant_cards_order: list[_ParticipantCard] = []
         self._last_grid_cols: int = 0
+        self._last_voice_row_sizes: list[int] = []
+        self._last_voice_layout_key: tuple[int, int, int] = (0, 0, 0)
         self._populating_devices = False
         self._selected_guild_id = ""
         self._active_chat_kind = ""
@@ -1589,6 +1886,7 @@ class DiscordVoicePanel(QWidget):
         self._channel_members_loaded: bool = False
         self._members_scope: Literal["channel", "server"] = "channel"
         self._member_row_by_url: dict[str, list[QListWidgetItem]] = {}
+        self._user_statuses: dict[str, str] = {}
         self._unread_channels: dict[str, int] = {}
         self._unread_dms: dict[str, int] = {}
         self._tc_buttons: dict[str, QPushButton] = {}
@@ -1601,7 +1899,7 @@ class DiscordVoicePanel(QWidget):
         self._worker_ws_mb = 0.0
         self._worker_priv_mb = 0.0
 
-        # Estado de acordeones y vistas (mockup limpio sin espacio muerto)
+        # Estado de acordeones y vista exclusiva central (Voz o Chat)
         self._channels_visible = True
         self._members_visible = False
         self._audio_drawer_open = False
@@ -1610,7 +1908,15 @@ class DiscordVoicePanel(QWidget):
         self._dm_section_open = True
         self._locked_vc_expanded = False
         self._voice_pane_visible = True
-        self._chat_pane_visible = True
+        self._chat_pane_visible = False
+        self._fade_target_widget: QWidget | None = None
+        self._center_fade_anim = QVariantAnimation(self)
+        self._center_fade_anim.setDuration(130)
+        self._center_fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._center_fade_anim.setStartValue(0.84)
+        self._center_fade_anim.setEndValue(1.0)
+        self._center_fade_anim.valueChanged.connect(self._on_center_fade_value)
+        self._center_fade_anim.finished.connect(self._on_center_fade_finished)
 
         self._build_ui()
         self._render_dm_threads()
@@ -1848,15 +2154,10 @@ class DiscordVoicePanel(QWidget):
         chdr.addWidget(self.active_channel_lbl, 1)
         right_col.addWidget(center_hdr_card)
 
-        # Splitter vertical: área oscura de voz (arriba) + línea separadora + tarjeta de chat (abajo)
-        self.center_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.center_splitter.setChildrenCollapsible(False)
-        self.center_splitter.setHandleWidth(8)
-        self.center_splitter.setStyleSheet(
-            "QSplitter::handle { background: rgba(207, 213, 223, 38); border-radius: 2px; margin: 2px 24px; }"
-        )
+        # Área central exclusiva: Voz o Chat según selección (sin dividir la pantalla)
+        self.center_stack = QStackedWidget()
 
-        # Panel superior: Fondo propio de Voz + cabecera colapsable + tarjetas de participantes
+        # Panel superior: Fondo propio de Voz + tarjetas de participantes
         self.voice_pane = QFrame()
         self.voice_pane.setObjectName("DiscordVoiceArea")
         vp_lay = QVBoxLayout(self.voice_pane)
@@ -1878,9 +2179,10 @@ class DiscordVoicePanel(QWidget):
         self.close_voice_btn = QPushButton()
         self.close_voice_btn.setObjectName("IconBtn")
         self.close_voice_btn.setFixedSize(24, 24)
-        self.close_voice_btn.setToolTip("Ocultar panel de voz (reabrir con 'Voz')")
+        self.close_voice_btn.setToolTip("Ir al panel de Chat")
         self.close_voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.close_voice_btn.clicked.connect(lambda: self._set_pane_visible("voice", False))
+        self.close_voice_btn.clicked.connect(lambda: self._set_pane_visible("chat", True))
+        self.close_voice_btn.setVisible(False)
         vh_lay.addWidget(self.close_voice_btn)
         vp_lay.addWidget(voice_hdr_frame)
 
@@ -1894,14 +2196,17 @@ class DiscordVoicePanel(QWidget):
         self.participants_scroll.viewport().setAutoFillBackground(False)
         part_container = QWidget()
         part_container.setObjectName("TransparentBox")
+        self.participants_container = part_container
         part_outer = QVBoxLayout(part_container)
-        part_outer.setContentsMargins(0, 0, 0, 0)
-        part_outer.setSpacing(8)
+        part_outer.setContentsMargins(16, 16, 16, 16)
+        part_outer.setSpacing(12)
+        part_outer.addStretch(1)
 
-        self.participants_grid = QGridLayout()
-        self.participants_grid.setContentsMargins(0, 0, 0, 0)
-        self.participants_grid.setSpacing(10)
-        part_outer.addLayout(self.participants_grid)
+        self.participants_rows_layout = QVBoxLayout()
+        self.participants_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.participants_rows_layout.setSpacing(12)
+        self.participants_grid = self.participants_rows_layout
+        part_outer.addLayout(self.participants_rows_layout)
 
         self.participants_empty_lbl = QLabel(
             "Elige un canal de voz a la izquierda para conectarte y hablar en tiempo real."
@@ -1915,9 +2220,9 @@ class DiscordVoicePanel(QWidget):
 
         self.participants_scroll.setWidget(part_container)
         vp_lay.addWidget(self.participants_scroll, 1)
-        self.center_splitter.addWidget(self.voice_pane)
+        self.center_stack.addWidget(self.voice_pane)
 
-        # Panel inferior: Chat con cabecera propia y fondo diferenciado
+        # Panel inferior: Chat con cabecera propia y estado de usuario en DM
         self.chat_pane = QFrame()
         self.chat_pane.setObjectName("DiscordChatCard")
         chat_lay = QVBoxLayout(self.chat_pane)
@@ -1928,10 +2233,15 @@ class DiscordVoicePanel(QWidget):
         chat_hdr_frame.setObjectName("DiscordChatHeader")
         chat_hdr = QHBoxLayout(chat_hdr_frame)
         chat_hdr.setContentsMargins(14, 8, 14, 8)
-        chat_hdr.setSpacing(6)
+        chat_hdr.setSpacing(8)
         self.chat_title_lbl = QLabel("Sin chat seleccionado")
         self.chat_title_lbl.setStyleSheet("font-size: 14px; font-weight: 700;")
         chat_hdr.addWidget(self.chat_title_lbl)
+
+        self.chat_status_pill = QLabel("")
+        self.chat_status_pill.setObjectName("DeckTag")
+        self.chat_status_pill.setVisible(False)
+        chat_hdr.addWidget(self.chat_status_pill)
 
         chat_hdr.addStretch()
 
@@ -1945,9 +2255,10 @@ class DiscordVoicePanel(QWidget):
         self.close_chat_btn = QPushButton()
         self.close_chat_btn.setObjectName("IconBtn")
         self.close_chat_btn.setFixedSize(24, 24)
-        self.close_chat_btn.setToolTip("Ocultar panel de chat (reabrir con 'Chat')")
+        self.close_chat_btn.setToolTip("Ir al panel de Voz")
         self.close_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.close_chat_btn.clicked.connect(lambda: self._set_pane_visible("chat", False))
+        self.close_chat_btn.clicked.connect(lambda: self._set_pane_visible("voice", True))
+        self.close_chat_btn.setVisible(False)
         chat_hdr.addWidget(self.close_chat_btn)
         chat_lay.addWidget(chat_hdr_frame)
 
@@ -2051,12 +2362,8 @@ class DiscordVoicePanel(QWidget):
         self.chat_pane.setAcceptDrops(True)
         self.chat_pane.installEventFilter(self)
 
-        self.center_splitter.addWidget(self.chat_pane)
-        self.center_splitter.setStretchFactor(0, 4)
-        self.center_splitter.setStretchFactor(1, 5)
-        self.center_splitter.setSizes([215, 275])
-
-        right_col.addWidget(self.center_splitter, 1)
+        self.center_stack.addWidget(self.chat_pane)
+        right_col.addWidget(self.center_stack, 1)
 
         self.center_collapsed_card = QFrame()
         self.center_collapsed_card.setObjectName("DiscordVoiceArea")
@@ -2281,7 +2588,7 @@ class DiscordVoicePanel(QWidget):
         self.members_list.setStyleSheet(
             "QListWidget { background: transparent; border: none; outline: none; }"
             "QListWidget::item { padding: 5px 6px; border-radius: 7px; border: 1px solid transparent; }"
-            "QListWidget::item:selected { background-color: #2D3647; color: #F1F3F6; "
+            "QListWidget::item:selected { background-color: #262A32; color: #F1F3F6; "
             "border: 1px solid #CFD5DF; font-weight: 700; }"
         )
         self.members_list.setToolTip("Miembros del canal o servidor (clic derecho o doble clic para DM)")
@@ -2316,6 +2623,7 @@ class DiscordVoicePanel(QWidget):
         self.svc.state_changed.connect(self._on_bot_state_changed)
         self.svc.guilds_updated.connect(self._on_guilds_updated)
         self.svc.guild_members_updated.connect(self._on_guild_members_updated)
+        self.svc.presence_updated.connect(self._on_presence_updated)
         self.svc.chat_history_loaded.connect(self._on_chat_history_loaded)
         self.svc.chat_message_received.connect(self._on_chat_message_received)
         self.svc.chat_message_edited.connect(self._on_chat_message_edited)
@@ -2591,12 +2899,57 @@ class DiscordVoicePanel(QWidget):
         self._last_channels_sig = self._channels_signature(gid, guild)
         return found_active or not self._active_chat_id
 
-    def _sync_center_panes(self) -> None:
-        self.voice_pane.setVisible(self._voice_pane_visible)
-        self.chat_pane.setVisible(self._chat_pane_visible)
-        any_center = bool(self._voice_pane_visible or self._chat_pane_visible)
-        self.center_splitter.setVisible(any_center)
-        self.center_collapsed_card.setVisible(not any_center)
+    def _on_center_fade_value(self, val: Any) -> None:
+        w = self._fade_target_widget
+        if w is None:
+            return
+        eff = w.graphicsEffect()
+        if isinstance(eff, QGraphicsOpacityEffect):
+            eff.setOpacity(max(0.0, min(1.0, float(val))))
+
+    def _on_center_fade_finished(self) -> None:
+        w = self._fade_target_widget
+        self._fade_target_widget = None
+        if w is not None:
+            try:
+                w.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+
+    def _animate_center_widget(self, widget: QWidget | None) -> None:
+        if widget is None or not self.isVisible():
+            return
+        try:
+            self._center_fade_anim.stop()
+        except RuntimeError:
+            pass
+        if self._fade_target_widget is not None:
+            try:
+                self._fade_target_widget.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+            self._fade_target_widget = None
+        eff = QGraphicsOpacityEffect(widget)
+        eff.setOpacity(0.84)
+        widget.setGraphicsEffect(eff)
+        self._fade_target_widget = widget
+        self._center_fade_anim.start()
+
+    def _sync_center_panes(self, *, animate: bool = False) -> None:
+        if self._chat_pane_visible:
+            self._voice_pane_visible = False
+        else:
+            self._voice_pane_visible = True
+            self._chat_pane_visible = False
+        target = self.voice_pane if self._voice_pane_visible else self.chat_pane
+        changed = self.center_stack.currentWidget() is not target
+        self.center_stack.setVisible(True)
+        self.center_collapsed_card.setVisible(False)
+        self.center_stack.setCurrentWidget(target)
+        if target is self.voice_pane and self._participant_cards_order:
+            QTimer.singleShot(0, self._relayout_participant_cards_if_needed)
+        if animate and changed:
+            self._animate_center_widget(target)
         self.tab_voice_btn.setProperty("active", "true" if self._voice_pane_visible else "false")
         self.tab_chat_btn.setProperty("active", "true" if self._chat_pane_visible else "false")
         for b in (self.tab_voice_btn, self.tab_chat_btn):
@@ -2606,17 +2959,17 @@ class DiscordVoicePanel(QWidget):
 
     def _set_pane_visible(self, which: Literal["voice", "chat"], visible: bool) -> None:
         if which == "voice":
-            self._voice_pane_visible = bool(visible)
+            show_voice = bool(visible)
         else:
-            self._chat_pane_visible = bool(visible)
-        self._sync_center_panes()
+            show_voice = not bool(visible)
+        self._voice_pane_visible = show_voice
+        self._chat_pane_visible = not show_voice
+        self._sync_center_panes(animate=True)
 
     def _on_center_tab_toggled(self, which: Literal["voice", "chat"]) -> None:
-        if which == "voice":
-            self._voice_pane_visible = not self._voice_pane_visible
-        else:
-            self._chat_pane_visible = not self._chat_pane_visible
-        self._sync_center_panes()
+        self._voice_pane_visible = which == "voice"
+        self._chat_pane_visible = which == "chat"
+        self._sync_center_panes(animate=True)
 
     def get_available_channels_for_settings(self) -> list[tuple[str, str]]:
         """Retorna [(channel_id, etiqueta)] de los canales conocidos para la gestión en Ajustes."""
@@ -2667,22 +3020,20 @@ class DiscordVoicePanel(QWidget):
 
     def _ensure_chat_pane_visible(self) -> None:
         if not self._chat_pane_visible:
+            self._voice_pane_visible = False
             self._chat_pane_visible = True
-            self._sync_center_panes()
+            self._sync_center_panes(animate=True)
 
     def _set_center_tab(self, idx: int) -> None:
-        """Compatibilidad: 0 = solo voz, 1 = solo chat, 2 = vista dividida."""
+        """Compatibilidad: 0 = solo voz, 1 = solo chat."""
         val = int(idx)
-        if val == 0:
-            self._voice_pane_visible = True
-            self._chat_pane_visible = False
-        elif val == 1:
+        if val == 1:
             self._voice_pane_visible = False
             self._chat_pane_visible = True
         else:
             self._voice_pane_visible = True
-            self._chat_pane_visible = True
-        self._sync_center_panes()
+            self._chat_pane_visible = False
+        self._sync_center_panes(animate=True)
 
     def _update_info_pill(self) -> None:
         if self._bot_state != "connected" and not self.svc.is_connected:
@@ -2709,8 +3060,10 @@ class DiscordVoicePanel(QWidget):
                 if dave_active and dave_code
                 else ("Cifrado E2EE DAVE activo" if dave_active else "Negociando cifrado DAVE E2EE...")
             )
+            diag_line = str(self._voice_state.get("connect_diag") or "").strip()
+            extra_diag = f"\n{diag_line}" if diag_line else ""
             self.info_pill.setToolTip(
-                f"{dave_line}\n"
+                f"{dave_line}{extra_diag}\n"
                 f"Worker: {self._worker_ws_mb:.1f} MB (Priv: {self._worker_priv_mb:.1f} MB)\n"
                 f"Paquetes: TX {tx_pkt} · RX {rx_pkt} (Err TX:{tx_err} RX:{rx_err})"
             )
@@ -2785,6 +3138,11 @@ class DiscordVoicePanel(QWidget):
             self.connect_btn.setObjectName("DangerBtn")
             priv_ok = bool(data.get("privileged_intents_ok", False))
             self.intents_banner.setVisible(not priv_ok)
+            pres = data.get("presences")
+            if isinstance(pres, dict):
+                self._user_statuses.update({str(k): _normalize_presence(v) for k, v in pres.items()})
+                self._render_dm_threads()
+                self._sync_dm_header_status()
             self._update_info_pill()
             self.sync_notify_channels()
         elif state == "error":
@@ -2819,6 +3177,8 @@ class DiscordVoicePanel(QWidget):
             self._channel_online_count = 0
             self._channel_members_loaded = False
             self._member_row_by_url.clear()
+            self._user_statuses.clear()
+            self.chat_status_pill.setVisible(False)
             self.members_list.clear()
             self.members_online_lbl.setText("0 en línea")
             self.toggle_members_btn.setText("Miembros")
@@ -2887,6 +3247,7 @@ class DiscordVoicePanel(QWidget):
             self._active_chat_id = cid
             self._unread_channels.pop(cid, None)
             self.chat_title_lbl.setText(f"# {cname}")
+            self._sync_dm_header_status()
             self.chat_input.setPlaceholderText(
                 self._format_chat_placeholder("channel", cname, self.svc.is_connected)
             )
@@ -2898,6 +3259,17 @@ class DiscordVoicePanel(QWidget):
 
     def _on_guilds_updated(self, guilds: list[dict[str, Any]]) -> None:
         self._guilds = guilds
+        status_changed = False
+        for g in guilds:
+            for vc in g.get("voice_channels") or ():
+                for vm in vc.get("members") or ():
+                    uid = str(vm.get("id") or "")
+                    st_raw = vm.get("status")
+                    if uid and st_raw:
+                        norm_st = _normalize_presence(st_raw)
+                        if self._user_statuses.get(uid) != norm_st:
+                            self._user_statuses[uid] = norm_st
+                            status_changed = True
         prev_gid = self.guild_combo.currentData()
         self.guild_combo.blockSignals(True)
         self.guild_combo.clear()
@@ -2909,6 +3281,9 @@ class DiscordVoicePanel(QWidget):
                 self.guild_combo.setCurrentIndex(idx)
         self.guild_combo.blockSignals(False)
         self._render_channels()
+        if status_changed:
+            self._render_dm_threads()
+            self._sync_dm_header_status()
         gid = str(self.guild_combo.currentData() or "")
         if gid and self.svc.is_connected and gid != self._selected_guild_id:
             self._selected_guild_id = gid
@@ -2931,6 +3306,8 @@ class DiscordVoicePanel(QWidget):
         if gid and self.svc.is_connected and gid != self._selected_guild_id:
             self._selected_guild_id = gid
             self._member_row_by_url.clear()
+            self._user_statuses.clear()
+            self.chat_status_pill.setVisible(False)
             self.members_list.clear()
             self.members_online_lbl.setText("Cargando...")
             self.dm_btn.setEnabled(False)
@@ -3027,11 +3404,9 @@ class DiscordVoicePanel(QWidget):
                 m_row.setSpacing(5)
 
                 dot = QLabel("●")
-                dot.setStyleSheet(
-                    "color: #4ADE80; font-size: 9px;"
-                    if is_cur
-                    else f"color: {self.palette.text2}; font-size: 9px;"
-                )
+                m_st = _normalize_presence(m.get("status") or self._user_statuses.get(m_id) or ("online" if is_cur else "offline"))
+                dot.setStyleSheet(f"color: {_presence_color(m_st)}; font-size: 9px;")
+                mrow_w.setToolTip(f"{m_name} · {_presence_label(m_st)}")
                 m_row.addWidget(dot)
 
                 mlbl = QLabel(m_name)
@@ -3311,6 +3686,7 @@ class DiscordVoicePanel(QWidget):
         self._unread_channels.pop(channel_id, None)
         self._chat_pending_img_urls.clear()
         self.chat_title_lbl.setText(f"# {name}")
+        self._sync_dm_header_status()
         cached = self._chat_history_cache.get(("channel", channel_id))
         if cached is not None:
             can_send = bool(cached.get("can_send", False))
@@ -3345,8 +3721,49 @@ class DiscordVoicePanel(QWidget):
         self._emit_unread_count()
         self.channel_alert_requested.emit(data)
 
+    def _sync_dm_header_status(self) -> None:
+        if not hasattr(self, "chat_status_pill"):
+            return
+        if self._active_chat_kind != "dm" or not self._active_chat_id:
+            self.chat_status_pill.setVisible(False)
+            return
+        st = _normalize_presence(self._user_statuses.get(self._active_chat_id, "offline"))
+        col = _presence_color(st)
+        lbl = _presence_label(st)
+        self.chat_status_pill.setText(f"● {lbl}")
+        self.chat_status_pill.setStyleSheet(
+            f"background-color: {self.palette.surface1}; color: {col}; "
+            f"border: 1px solid {self.palette.border}; border-radius: 6px; "
+            "padding: 2px 7px; font-size: 11px; font-weight: 600;"
+        )
+        self.chat_status_pill.setVisible(True)
+
+    def _on_presence_updated(self, data: dict[str, Any]) -> None:
+        uid = str(data.get("user_id") or "").strip()
+        if not uid:
+            return
+        st = _normalize_presence(data.get("status"))
+        prev = self._user_statuses.get(uid)
+        self._user_statuses[uid] = st
+        if prev != st:
+            self._render_dm_threads()
+            if self._active_chat_kind == "dm" and self._active_chat_id == uid:
+                self._sync_dm_header_status()
+            card = self._participant_cards.get(uid)
+            if card is not None:
+                card.set_status(st)
+
     def _on_guild_members_updated(self, data: dict[str, Any]) -> None:
         cur_gid = str(self.guild_combo.currentData() or "")
+        for m in data.get("members") or ():
+            uid = str(m.get("id") or "")
+            if uid and m.get("status") is not None:
+                self._user_statuses[uid] = _normalize_presence(m.get("status"))
+        self._render_dm_threads()
+        self._sync_dm_header_status()
+        for uid, card in self._participant_cards.items():
+            if uid != "local" and uid in self._user_statuses:
+                card.set_status(self._user_statuses[uid])
         if cur_gid and str(data.get("guild_id") or "") != cur_gid:
             return
         self._members = list(data.get("members") or [])
@@ -3428,20 +3845,22 @@ class DiscordVoicePanel(QWidget):
             name = str(m.get("name") or uid)
             is_bot = bool(m.get("is_bot", False))
             av_url = str(m.get("avatar_url") or "")
-            st = str(m.get("status") or "offline")
+            st = _normalize_presence(m.get("status") or self._user_statuses.get(uid) or "offline")
             full_act = str(m.get("activity") or "").strip()
             short_act = full_act[:33] + "..." if len(full_act) > 36 else full_act
             dot = status_dots.get(st, "⚪")
+            st_lbl = status_names.get(st, _presence_label(st))
             tag = " [APP]" if is_bot else ""
             text = f"{dot} {name}{tag}"
             if short_act:
-                text += f"\n    {short_act}"
+                text += f"\n    {st_lbl} · {short_act}"
+            elif st != "offline":
+                text += f"\n    {st_lbl}"
             item = QListWidgetItem(text)
             item.setData(
                 Qt.ItemDataRole.UserRole,
                 {"id": uid, "name": name, "is_bot": is_bot, "avatar_url": av_url},
             )
-            st_lbl = status_names.get(st, st)
             item.setToolTip(f"{name} ({st_lbl})" + (f" · {full_act}" if full_act else ""))
             if av_url and self._thumb_cache is not None:
                 self._member_row_by_url.setdefault(av_url, []).append(item)
@@ -3645,12 +4064,15 @@ class DiscordVoicePanel(QWidget):
             row_lay.setContentsMargins(0, 0, 0, 0)
             row_lay.setSpacing(4)
 
+            st_dm = _normalize_presence(self._user_statuses.get(uid, "offline"))
             btn = QPushButton(f"  @ {uname}")
             btn.setObjectName("NavBtn")
+            btn.setIcon(QIcon(_build_status_dot_pixmap(st_dm, 9)))
+            btn.setIconSize(QSize(10, 10))
             btn.setProperty("unread", "true" if has_unread else "false")
             btn.setProperty("active", "true" if is_act else "false")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            tip = f"DM con {uname}" + (f"\nÚltimo: {prev}" if prev else "")
+            tip = f"DM con {uname} · {_presence_label(st_dm)}" + (f"\nÚltimo: {prev}" if prev else "")
             btn.setToolTip(tip)
             btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             btn.customContextMenuRequested.connect(
@@ -3686,6 +4108,7 @@ class DiscordVoicePanel(QWidget):
         self._active_dm_peer_name = peer_name
         self._active_dm_peer_avatar = str(avatar_url or "").strip()
         self.chat_title_lbl.setText(f"DM · {peer_name}")
+        self._sync_dm_header_status()
 
         self._upsert_dm_thread_local(
             clean_id, peer_name, self._active_dm_peer_avatar, touch_timestamp=False
@@ -3793,17 +4216,34 @@ class DiscordVoicePanel(QWidget):
             self._channel_members_loaded = True
             self._refresh_members_list()
 
+        self._sync_dm_header_status()
         self._sync_chat_composer_state(
             kind,
             self._active_dm_peer_name if kind == "dm" else clean_title,
             can_send,
             can_attach,
         )
-        self._ensure_chat_pane_visible()
         if not self._sync_chat_selection_in_place():
             self._render_channels(force=True)
             self._render_dm_threads()
         self._render_chat_messages(can_read=can_read)
+
+    def _append_live_chat_message(self, msg: dict[str, Any]) -> None:
+        if not self.chat_browser.message_rows():
+            self._render_chat_messages(can_read=True)
+            return
+        self._chat_last_can_read = True
+        for a in msg.get("attachments") or ():
+            if isinstance(a, dict):
+                self._chat_attachment_refs.append(dict(a))
+        pending = self.chat_browser.append_message(
+            msg,
+            thumb_cache=self._thumb_cache,
+            fallback_peer_avatar=self._active_dm_peer_avatar if self._active_chat_kind == "dm" else "",
+            fallback_bot_avatar=self.svc.bot_avatar_url,
+        )
+        if pending:
+            self._chat_pending_img_urls.update(pending)
 
     def _on_chat_message_received(self, data: dict[str, Any]) -> None:
         kind = str(data.get("kind") or "")
@@ -3832,7 +4272,7 @@ class DiscordVoicePanel(QWidget):
         if mid and any(str(x.get("id") or "") == mid for x in self._chat_messages):
             return
         self._chat_messages.append(msg)
-        self._render_chat_messages(can_read=True)
+        self._append_live_chat_message(msg)
 
     def _on_chat_message_edited(self, data: dict[str, Any]) -> None:
         kind = str(data.get("kind") or "")
@@ -3910,7 +4350,7 @@ class DiscordVoicePanel(QWidget):
                 mid = str(raw_msg.get("id") or "")
                 if not mid or not any(str(x.get("id") or "") == mid for x in self._chat_messages):
                     self._chat_messages.append(raw_msg)
-                    self._render_chat_messages(can_read=True)
+                    self._append_live_chat_message(raw_msg)
         elif uid:
             self._upsert_dm_thread_local(uid, peer_name, peer_av, preview)
 
@@ -4553,6 +4993,7 @@ class DiscordVoicePanel(QWidget):
     def _on_join_channel_clicked(self, guild_id: str, channel_id: str, channel_name: str) -> None:
         self._joining_channel_id = channel_id
         self.status_pill.setText(f"Conectando a {channel_name}...")
+        self._set_pane_visible("voice", True)
         self._render_channels(force=True)
         self.svc.sync_audio_config(self.cfg, muted=self._muted, deafened=self._deafened)
         self.svc.join_channel(guild_id, channel_id)
@@ -4613,28 +5054,68 @@ class DiscordVoicePanel(QWidget):
         w = vp.width() if vp is not None else self.width()
         if w <= 0:
             w = 680
-        if w >= 660:
-            return 3
-        if w >= 420:
-            return 2
-        return 1
+        return max(1, min(4, (max(190, w - 24) + 12) // 176))
+
+    def _voice_viewport_size(self) -> tuple[int, int]:
+        vp = self.participants_scroll.viewport()
+        w = vp.width() if vp is not None else self.width()
+        h = vp.height() if vp is not None else self.height()
+        return (w if w > 0 else 680), (h if h > 0 else 420)
+
+    def _detach_participant_rows(self) -> None:
+        while self.participants_rows_layout.count() > 0:
+            item = self.participants_rows_layout.takeAt(0)
+            if item is None:
+                continue
+            sub = item.layout()
+            if sub is not None:
+                while sub.count() > 0:
+                    sub.takeAt(0)
+                sub.deleteLater()
+
+    def _relayout_participant_cards_if_needed(self) -> None:
+        if not self._participant_cards_order:
+            return
+        avail_w, avail_h = self._voice_viewport_size()
+        key = (len(self._participant_cards_order), avail_w // 20, avail_h // 20)
+        if key != self._last_voice_layout_key:
+            self._relayout_participant_cards()
 
     def _relayout_participant_cards(self) -> None:
         if not self._participant_cards_order:
             return
-        cols = self._compute_grid_cols()
-        self._last_grid_cols = cols
-        _clear_grid_keep_widgets(self.participants_grid)
-        for c in range(3):
-            self.participants_grid.setColumnStretch(c, 1 if c < cols else 0)
-        for idx, card in enumerate(self._participant_cards_order):
-            r, c = divmod(idx, cols)
-            self.participants_grid.addWidget(card, r, c)
+        avail_w, avail_h = self._voice_viewport_size()
+        max_cols = self._compute_grid_cols()
+        self._last_grid_cols = max_cols
+        count = len(self._participant_cards_order)
+        row_sizes = _compute_voice_row_sizes(count, max_cols)
+        card_w, card_h = _compute_participant_card_size(
+            count, row_sizes, avail_w, avail_h, spacing=12
+        )
+        self._last_voice_row_sizes = row_sizes
+        self._last_voice_layout_key = (count, avail_w // 20, avail_h // 20)
+
+        self._detach_participant_rows()
+        idx = 0
+        for rc in row_sizes:
+            row_lay = QHBoxLayout()
+            row_lay.setContentsMargins(0, 0, 0, 0)
+            row_lay.setSpacing(12)
+            row_lay.addStretch(1)
+            for _ in range(rc):
+                if idx >= count:
+                    break
+                card = self._participant_cards_order[idx]
+                idx += 1
+                card.setFixedSize(card_w, card_h)
+                card.show()
+                row_lay.addWidget(card)
+            row_lay.addStretch(1)
+            self.participants_rows_layout.addLayout(row_lay)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        if self._participant_cards_order and self._compute_grid_cols() != self._last_grid_cols:
-            self._relayout_participant_cards()
+        self._relayout_participant_cards_if_needed()
 
     def _participants_signature(self) -> Any:
         in_voice = bool(self._voice_state.get("in_voice", False))
@@ -4661,9 +5142,22 @@ class DiscordVoicePanel(QWidget):
             return
         self._last_participants_sig = sig
 
+        for old_card in self._participant_cards_order:
+            rel = getattr(old_card, "release_resources", None)
+            if callable(rel):
+                try:
+                    rel()
+                except Exception:
+                    pass
+            old_card.hide()
+            old_card.setParent(None)
+            old_card.deleteLater()
         self._participant_cards.clear()
         self._participant_cards_order.clear()
-        _clear_layout(self.participants_grid)
+        self._last_voice_row_sizes = []
+        self._last_voice_layout_key = (0, 0, 0)
+        _clear_layout(self.participants_rows_layout)
+
         parts = self._voice_state.get("participants") or []
         if not self._voice_state.get("in_voice") or not parts:
             self.participants_empty_lbl.setVisible(True)
@@ -4676,12 +5170,16 @@ class DiscordVoicePanel(QWidget):
             key = "local" if is_self else uid
             speaking = bool(self._speaking.get(key, False))
             vol = self._user_volumes.get(uid, 100)
+            part_with_status = dict(part)
+            if uid in self._user_statuses:
+                part_with_status["status"] = self._user_statuses[uid]
             card = _ParticipantCard(
-                part,
+                part_with_status,
                 vol,
                 speaking,
                 self.palette,
                 thumb_cache=self._thumb_cache,
+                parent=self.participants_container,
             )
             card.volume_changed.connect(self._on_user_vol_value_changed)
             card.dm_requested.connect(self._open_dm_with_user)

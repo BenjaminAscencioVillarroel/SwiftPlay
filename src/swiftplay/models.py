@@ -61,6 +61,7 @@ class MediaItem:
     is_live: bool = False
     game_name: str = ""
     viewer_count: int = 0
+    channel_id: str = ""
 
     def normalized_thumb(self) -> str:
         if self.thumb_url:
@@ -86,6 +87,7 @@ class MediaItem:
             "is_live": bool(self.is_live),
             "game_name": self.game_name,
             "viewer_count": int(self.viewer_count or 0),
+            "channel_id": self.channel_id,
         }
 
     @classmethod
@@ -125,7 +127,19 @@ class MediaItem:
             is_live=bool(data.get("is_live", False)),
             game_name=str(data.get("game_name") or "").strip(),
             viewer_count=viewers,
+            channel_id=str(data.get("channel_id") or "").strip(),
         )
+
+
+@dataclass(slots=True)
+class ChannelInfo:
+    channel_id: str
+    name: str = ""
+    handle: str = ""
+    subscribers: str = ""
+    avatar_url: str = ""
+    videos_params: str = "EgZ2aWRlb3PyBgQKAjoA"
+    streams_params: str = "EgdzdHJlYW1z8gYECgJ6AA=="
 
 
 @dataclass(slots=True)

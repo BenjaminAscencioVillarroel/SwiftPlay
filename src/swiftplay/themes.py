@@ -817,53 +817,53 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QFrame#DiscordVoiceHeader {{
-        background-color: #171C28;
-        border: 1px solid #2B3446;
+        background-color: {p.surface2};
+        border: 1px solid {p.border};
         border-radius: 10px;
     }}
 
     QFrame#DiscordSidebarCard {{
-        background-color: #12161E;
-        border: 1px solid #283040;
+        background-color: {p.surface1};
+        border: 1px solid {p.border};
         border-radius: 12px;
     }}
 
     QFrame#DiscordHeaderBar {{
-        background-color: #151A24;
-        border: 1px solid #293244;
+        background-color: {p.surface1};
+        border: 1px solid {p.border};
         border-radius: 10px;
     }}
 
     QFrame#DiscordVoiceArea {{
-        background-color: #10141C;
-        border: 1px solid #252E3E;
+        background-color: {p.base};
+        border: 1px solid {p.border};
         border-radius: 12px;
     }}
 
     QFrame#DiscordParticipantCard {{
-        background-color: #1C212B;
-        border: 1px solid #2E3646;
+        background-color: {p.surface1};
+        border: 1px solid {p.border};
         border-radius: 12px;
     }}
 
     QFrame#DiscordChatCard {{
-        background-color: #171C27;
-        border: 1px solid #2E374A;
+        background-color: {p.surface1};
+        border: 1px solid {p.border};
         border-radius: 12px;
     }}
 
     QFrame#DiscordChatHeader {{
-        background-color: #1E2534;
+        background-color: {p.surface2};
         border: none;
-        border-bottom: 1px solid #303A4E;
+        border-bottom: 1px solid {p.border};
         border-top-left-radius: 11px;
         border-top-right-radius: 11px;
     }}
 
     QLineEdit#DiscordChatInput {{
-        background-color: #0F1218;
+        background-color: {p.base};
         color: {p.text};
-        border: 1px solid #283040;
+        border: 1px solid {p.border};
         border-radius: 9px;
         padding: 7px 12px;
     }}
@@ -873,20 +873,20 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QFrame#DiscordDeckCard {{
-        background-color: #1A202D;
-        border: 1px solid #313B50;
+        background-color: {p.surface2};
+        border: 1px solid {p.border_bright};
         border-radius: 14px;
     }}
 
     QFrame#DiscordSidebarMiniCard {{
-        background-color: #161B25;
-        border: 1px solid #2B3446;
+        background-color: {p.surface2};
+        border: 1px solid {p.border};
         border-radius: 10px;
     }}
 
     QFrame#DiscordChannelRow {{
-        background-color: #171B24;
-        border: 1px solid #252C3A;
+        background-color: {p.surface2};
+        border: 1px solid {p.border};
         border-radius: 9px;
     }}
 
@@ -895,12 +895,12 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QFrame#DiscordChannelRow[clickable="true"]:hover {{
-        background-color: #202736;
+        background-color: #24272F;
         border-color: {p.border_bright};
     }}
 
     QFrame#DiscordChannelRow[active="true"] {{
-        background-color: #182422;
+        background-color: #16221B;
         border: 1px solid #2F6F52;
     }}
     """

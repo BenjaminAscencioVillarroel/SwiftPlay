@@ -406,6 +406,10 @@ class _DeepFilterMicDsp:
             self._failed = True
             return False
 
+    @property
+    def is_ready(self) -> bool:
+        return bool(self._df_state)
+
     def warmup(self) -> bool:
         with self._lock:
             return self._ensure_ready_locked()
@@ -423,6 +427,8 @@ class _DeepFilterMicDsp:
                 self._apply_params_locked()
 
     def reset(self) -> None:
+        if not self._df_state:
+            return
         with self._lock:
             self._hp_prev_x = 0.0
             self._hp_prev_y = 0.0
@@ -611,7 +617,7 @@ class MicProcessor:
         use_dsp = False
         voice_ok = True
 
-        if df_dsp is not None and ns_mode in ("ai", "ai_max"):
+        if df_dsp is not None and ns_mode in ("ai", "ai_max") and df_dsp.is_ready:
             df_res = df_dsp.process_20ms(raw_mono_frame)
             if df_res is not None:
                 work_frame, lsnr_db, silero_prob = df_res
@@ -639,7 +645,7 @@ class MicProcessor:
                 use_dsp = True
                 open_prob, hold_prob = _NS_SPEECH_PROB_THRESHOLDS["webrtc"]
                 voice_ok = speech_prob >= (hold_prob if speaking else open_prob)
-        elif webrtc_dsp is not None and ns_mode == "webrtc":
+        elif webrtc_dsp is not None and ns_mode in ("webrtc", "ai", "ai_max"):
             work_frame, speech_prob = webrtc_dsp.process_20ms(raw_mono_frame)
             use_dsp = True
             open_prob, hold_prob = _NS_SPEECH_PROB_THRESHOLDS["webrtc"]
@@ -909,7 +915,14 @@ def decrypt_discord_rtp_packet(
         try:
             payload = dave_session.decrypt(user_id, dave_media_type, payload)
         except Exception:
-            return None
+            try:
+                can_pt = getattr(dave_session, "can_passthrough", None)
+                if callable(can_pt) and can_pt(user_id):
+                    pass
+                else:
+                    return None
+            except Exception:
+                return None
 
     if not payload:
         return None
@@ -1366,7 +1379,9 @@ def resolve_device_candidates(
             scored.append((tier, _hostapi_rank(api_name), idx))
 
         scored.sort()
-        for _, _, idx in scored:
+        non_wdm = [item for item in scored if item[1] < 4]
+        chosen = non_wdm if non_wdm else scored
+        for _, _, idx in chosen:
             if idx not in seen:
                 seen.add(idx)
                 ordered.append(idx)
@@ -1847,7 +1862,6 @@ class AudioEngine:
                 pass
 
     def _mic_sender_loop(self) -> None:
-        self._mic_proc.warmup()
         aop = _get_audioop()
         while self._running:
             try:
@@ -1904,7 +1918,7 @@ class AudioEngine:
                     self._on_mic_level(level, False)
 
 
-def _make_voice_client_cls():
+def _make_voice_client_cls(on_init: Callable[[Any], None] | None = None):
     """Construye dinámicamente SwiftVoiceClient sin importar discord al nivel de módulo."""
     import davey
     import discord
@@ -1916,6 +1930,7 @@ def _make_voice_client_cls():
         def __init__(self, client: discord.Client, channel: Any) -> None:
             super().__init__(client, channel)
             self.ssrc_to_user: dict[int, int] = {}
+            self.connected_user_ids: set[int] = set()
             self._decoders: dict[int, discord.opus.Decoder] = {}
             self._decoder_lock = threading.Lock()
             self._send_lock = threading.Lock()
@@ -1923,6 +1938,7 @@ def _make_voice_client_cls():
             self._listener_registered = False
             self._self_user_id = int(client.user.id) if client.user else 0
             self.deafened = False
+            self._speaking_announced = False
 
             self.tx_packets = 0
             self.rx_packets = 0
@@ -1936,6 +1952,11 @@ def _make_voice_client_cls():
             self.on_speaking_change: Callable[[int, bool], None] | None = None
             self.on_dave_change: Callable[[bool, str], None] | None = None
             self.on_warning: Callable[[str], None] | None = None
+            if on_init is not None:
+                try:
+                    on_init(self)
+                except Exception:
+                    pass
 
         def _ensure_voice_encoder(self) -> None:
             if self.encoder is discord.utils.MISSING:
@@ -1959,6 +1980,11 @@ def _make_voice_client_cls():
             self_mute: bool = False,
         ) -> None:
             self.deafened = bool(self_deaf)
+            if self.channel is not None and getattr(self.channel, "voice_states", None):
+                for raw_uid in self.channel.voice_states:
+                    u = _safe_int(raw_uid)
+                    if u and u != self._self_user_id:
+                        self.connected_user_ids.add(u)
             await super().connect(
                 timeout=timeout,
                 reconnect=reconnect,
@@ -1969,10 +1995,24 @@ def _make_voice_client_cls():
             if not self._listener_registered:
                 self._connection.add_socket_listener(self._on_udp_packet)
                 self._listener_registered = True
+            try:
+                sr = getattr(self._connection, "_socket_reader", None)
+                if sr is not None:
+                    sr.resume(force=True)
+            except Exception:
+                pass
 
         async def kickstart_voice(self, *, keep_speaking: bool = False) -> None:
-            """Envía un pulso breve de silencio Opus tras iniciar el motor de audio/DAVE."""
+            """Espera breve a DAVE MLS si aplica y envía silencio Opus sin cifrar para abrir flujo UDP."""
             try:
+                if not self.is_connected():
+                    return
+                dave_proto = int(getattr(self._connection, "dave_protocol_version", 0) or 0)
+                if dave_proto > 0 and not self._connection.can_encrypt:
+                    for _ in range(12):
+                        if not self.is_connected() or self._connection.can_encrypt:
+                            break
+                        await asyncio.sleep(0.05)
                 if not self.is_connected():
                     return
                 self._ensure_voice_encoder()
@@ -1987,6 +2027,7 @@ def _make_voice_client_cls():
                     and self.ws is not discord.utils.MISSING
                 ):
                     await self.ws.speak(discord.SpeakingState.none)
+                self._speaking_announced = bool(keep_speaking)
             except Exception:
                 pass
             self._emit_dave_status()
@@ -2012,18 +2053,28 @@ def _make_voice_client_cls():
             if op == 5:  # SPEAKING
                 uid = _safe_int(data.get("user_id"))
                 ssrc = _safe_int(data.get("ssrc"))
+                if uid and uid != self._self_user_id:
+                    self.connected_user_ids.add(uid)
                 if uid and ssrc:
                     self.ssrc_to_user[ssrc] = uid
                 if uid and self.on_speaking_change is not None:
                     self.on_speaking_change(uid, bool(data.get("speaking")))
+            elif op == 11:  # CLIENTS_CONNECT
+                for raw_u in data.get("user_ids") or ():
+                    u = _safe_int(raw_u)
+                    if u and u != self._self_user_id:
+                        self.connected_user_ids.add(u)
             elif op == 12:  # CLIENT_CONNECT
                 uid = _safe_int(data.get("user_id"))
                 ssrc = _safe_int(data.get("audio_ssrc"))
+                if uid and uid != self._self_user_id:
+                    self.connected_user_ids.add(uid)
                 if uid and ssrc:
                     self.ssrc_to_user[ssrc] = uid
             elif op == 13:  # CLIENT_DISCONNECT
                 uid = _safe_int(data.get("user_id"))
                 if uid:
+                    self.connected_user_ids.discard(uid)
                     stale_ssrcs = [s for s, u in self.ssrc_to_user.items() if u == uid]
                     for s in stale_ssrcs:
                         self.ssrc_to_user.pop(s, None)
@@ -2045,6 +2096,27 @@ def _make_voice_client_cls():
             self._aead_cache = (key_bytes, box)
             return box
 
+        def _collect_unmapped_remote_users(self, ds: Any) -> list[int]:
+            mapped_uids = set(self.ssrc_to_user.values())
+            cands: list[int] = []
+            if ds is not None and hasattr(ds, "get_user_ids"):
+                try:
+                    for raw_u in ds.get_user_ids():
+                        u = _safe_int(raw_u)
+                        if u and u != self._self_user_id and u not in mapped_uids and u not in cands:
+                            cands.append(u)
+                except Exception:
+                    pass
+            for u in self.connected_user_ids:
+                if u and u != self._self_user_id and u not in mapped_uids and u not in cands:
+                    cands.append(u)
+            if not cands and self.channel is not None and getattr(self.channel, "voice_states", None):
+                for raw_u in self.channel.voice_states:
+                    u = _safe_int(raw_u)
+                    if u and u != self._self_user_id and u not in mapped_uids and u not in cands:
+                        cands.append(u)
+            return cands
+
         def _on_udp_packet(self, data: bytes) -> None:
             if self.deafened or not self.is_connected() or len(data) < 16:
                 return
@@ -2056,25 +2128,48 @@ def _make_voice_client_cls():
             b1 = data[1]
             is_opus_rtp = ((data[0] >> 6) & 0x03) == 2 and not (192 <= b1 <= 223) and (b1 & 0x7F) == 120
             seq = struct.unpack_from(">H", data, 2)[0]
+            ssrc = struct.unpack_from(">I", data, 8)[0] if is_opus_rtp else 0
             key_bytes = bytes(sk)
             aead_box = (
                 self._get_aead_box(key_bytes)
                 if mode == "aead_xchacha20_poly1305_rtpsize"
                 else None
             )
+            ds = self._connection.dave_session
+            dave_active = bool(self._connection.can_encrypt)
+
+            if is_opus_rtp and ssrc and ssrc not in self.ssrc_to_user:
+                cands = self._collect_unmapped_remote_users(ds)
+                if len(cands) == 1:
+                    self.ssrc_to_user[ssrc] = cands[0]
+                elif 1 < len(cands) <= 6 and dave_active and ds is not None and getattr(ds, "ready", False):
+                    for cand_uid in cands:
+                        probe_res = decrypt_discord_rtp_packet(
+                            data=data,
+                            mode=str(mode),
+                            secret_key=key_bytes,
+                            ssrc_to_user={ssrc: cand_uid},
+                            dave_session=ds,
+                            dave_active=True,
+                            aead_box=aead_box,
+                            dave_media_type=davey.MediaType.audio,
+                        )
+                        if probe_res is not None and probe_res[2] != OPUS_SILENCE:
+                            self.ssrc_to_user[ssrc] = cand_uid
+                            break
+
             res = decrypt_discord_rtp_packet(
                 data=data,
                 mode=str(mode),
                 secret_key=key_bytes,
                 ssrc_to_user=self.ssrc_to_user,
-                dave_session=self._connection.dave_session,
-                dave_active=bool(self._connection.can_encrypt),
+                dave_session=ds,
+                dave_active=dave_active,
                 aead_box=aead_box,
                 dave_media_type=davey.MediaType.audio,
             )
             if res is None:
                 if is_opus_rtp:
-                    ssrc = struct.unpack_from(">I", data, 8)[0]
                     if ssrc in self.ssrc_to_user:
                         self.rx_decrypt_errors += 1
                 return
@@ -2133,7 +2228,19 @@ def _make_voice_client_cls():
                 if not self.is_connected():
                     return
                 try:
-                    self.send_audio_packet(OPUS_SILENCE, encode=False)
+                    self.checked_add("sequence", 1, 65535)
+                    header = bytearray(12)
+                    header[0] = 0x80
+                    header[1] = 0x78
+                    struct.pack_into(">H", header, 2, self.sequence)
+                    struct.pack_into(">I", header, 4, self.timestamp)
+                    struct.pack_into(">I", header, 8, self.ssrc)
+                    enc_fn = getattr(self, "_encrypt_" + self.mode)
+                    packet = enc_fn(header, OPUS_SILENCE)
+                    self._connection.send_packet(packet)
+                    self.checked_add(
+                        "timestamp", discord.opus.Encoder.SAMPLES_PER_FRAME, 4294967295
+                    )
                 except Exception:
                     pass
 
@@ -2391,6 +2498,7 @@ class DiscordWorkerApp:
         self._vc: Any = None
         self._voice_cls: Any = None
         self._joining_channel_id: str = ""
+        self._last_join_diag: str = ""
 
         self._mixer = VoiceAudioMixer()
         self._audio: AudioEngine | None = None
@@ -2592,6 +2700,34 @@ class DiscordWorkerApp:
             self._member_name_cache[uid] = (name, is_bot, av_url)
         return uid, name, is_bot, av_url
 
+    def _resolve_member_status(self, guild: Any, uid: int) -> str:
+        m = guild.get_member(uid) if guild is not None else None
+        if m is None:
+            return "offline"
+        raw_st = getattr(m, "status", "offline")
+        st = str(getattr(raw_st, "value", raw_st) or "offline").strip().lower()
+        return st if st in _STATUS_ORDER else "offline"
+
+    def _collect_known_presences(self) -> dict[str, str]:
+        client = self._client
+        out: dict[str, str] = {}
+        if client is None or not client.is_ready():
+            return out
+        for g in list(getattr(client, "guilds", None) or ()):
+            for m in list(getattr(g, "members", None) or ()):
+                uid = _safe_int(getattr(m, "id", 0))
+                if not uid:
+                    continue
+                raw_st = getattr(m, "status", "offline")
+                st = str(getattr(raw_st, "value", raw_st) or "offline").strip().lower()
+                if st not in _STATUS_ORDER:
+                    st = "offline"
+                k = str(uid)
+                prev = out.get(k)
+                if prev is None or _STATUS_ORDER.get(st, 3) < _STATUS_ORDER.get(prev, 3):
+                    out[k] = st
+        return out
+
     def _build_guilds_snapshot(self) -> list[dict[str, Any]]:
         client = self._client
         if client is None or not client.is_ready():
@@ -2609,6 +2745,7 @@ class DiscordWorkerApp:
                             "name": name,
                             "is_bot": is_bot,
                             "avatar_url": av_url,
+                            "status": self._resolve_member_status(g, uid),
                             "muted": bool(getattr(vs, "self_mute", False) or getattr(vs, "mute", False)),
                             "deafened": bool(getattr(vs, "self_deaf", False) or getattr(vs, "deaf", False)),
                         }
@@ -2667,6 +2804,7 @@ class DiscordWorkerApp:
                 "deafened": self._deafened,
                 "dave_active": False,
                 "dave_code": "",
+                "connect_diag": self._last_join_diag,
                 "participants": [],
             }
 
@@ -2681,6 +2819,7 @@ class DiscordWorkerApp:
                     "name": name,
                     "is_bot": is_bot,
                     "avatar_url": av_url,
+                    "status": self._resolve_member_status(g, uid),
                     "is_self": bool(self._client and self._client.user and uid == self._client.user.id),
                     "muted": bool(getattr(vs, "self_mute", False) or getattr(vs, "mute", False)),
                     "deafened": bool(getattr(vs, "self_deaf", False) or getattr(vs, "deaf", False)),
@@ -2701,6 +2840,7 @@ class DiscordWorkerApp:
             "rx_packets": int(getattr(self._vc, "rx_packets", 0)),
             "rx_decrypt_errors": int(getattr(self._vc, "rx_decrypt_errors", 0)),
             "tx_errors": int(getattr(self._vc, "tx_errors", 0)),
+            "connect_diag": self._last_join_diag,
             "participants": participants,
         }
 
@@ -2727,6 +2867,8 @@ class DiscordWorkerApp:
         )
 
     def _build_client(self, use_privileged: bool) -> Any:
+        import socket
+        import aiohttp
         import discord
 
         intents = discord.Intents.none()
@@ -2738,11 +2880,20 @@ class DiscordWorkerApp:
             intents.members = True
             intents.presences = True
             intents.message_content = True
-        return discord.Client(
-            intents=intents,
-            max_messages=None,
-            chunk_guilds_at_startup=False,
-        )
+        connector: Any = None
+        try:
+            asyncio.get_running_loop()
+            connector = aiohttp.TCPConnector(limit=0, family=socket.AF_INET)
+        except RuntimeError:
+            connector = None
+        kwargs: dict[str, Any] = {
+            "intents": intents,
+            "max_messages": None,
+            "chunk_guilds_at_startup": False,
+        }
+        if connector is not None:
+            kwargs["connector"] = connector
+        return discord.Client(**kwargs)
 
     def _attach_client_events(self, client: Any) -> None:
         @client.event
@@ -2757,6 +2908,7 @@ class DiscordWorkerApp:
                     "bot_name": str(user.display_name or user.name) if user else "Bot",
                     "bot_avatar_url": _member_avatar_url(user) if user else "",
                     "privileged_intents_ok": bool(self._privileged_intents_ok),
+                    "presences": self._collect_known_presences(),
                 },
             )
             self._emit_snapshots()
@@ -2804,6 +2956,13 @@ class DiscordWorkerApp:
             g = getattr(after, "guild", None)
             if g is not None and int(g.id) == self._active_guild_id:
                 self._presence_dirty_guilds.add(int(g.id))
+            uid = _safe_int(getattr(after, "id", 0))
+            if uid:
+                raw_st = getattr(after, "status", "offline")
+                st = str(getattr(raw_st, "value", raw_st) or "offline").strip().lower()
+                if st not in _STATUS_ORDER:
+                    st = "offline"
+                self.emit_event("presence", {"user_id": str(uid), "status": st})
 
         @client.event
         async def on_member_join(member: Any) -> None:
@@ -2966,7 +3125,7 @@ class DiscordWorkerApp:
 
         self._state = "connecting"
         self.emit_event("state", {"state": "connecting"})
-        self._voice_cls = _make_voice_client_cls()
+        self._voice_cls = _make_voice_client_cls(on_init=self._wire_voice_client)
 
         async def _runner() -> None:
             try:
@@ -3033,8 +3192,20 @@ class DiscordWorkerApp:
                 pass
         self._joining_channel_id = ""
 
-    async def _leave_channel_internal(self) -> None:
-        self._stop_voice_audio_only()
+    async def _leave_channel_internal(self, *, trim_memory: bool = True) -> None:
+        self._mixer.clear()
+        with self._speaking_lock:
+            self._speaking_timestamps.clear()
+        self._emit_speaking_snapshot()
+        audio = self._audio
+        if audio is not None:
+            try:
+                if audio._running:
+                    await asyncio.to_thread(audio.stop)
+                else:
+                    audio.stop()
+            except Exception:
+                pass
         candidates: list[Any] = []
         if self._vc is not None:
             candidates.append(self._vc)
@@ -3045,7 +3216,7 @@ class DiscordWorkerApp:
                     candidates.append(existing)
         for vc in candidates:
             try:
-                await vc.disconnect(force=True)
+                await asyncio.wait_for(vc.disconnect(force=True), timeout=2.5)
             except Exception:
                 pass
         self._joining_channel_id = ""
@@ -3053,12 +3224,13 @@ class DiscordWorkerApp:
         self._dave_code = ""
         if self._audio is not None:
             self._audio.release_dsp_idle()
-        try:
-            from swiftplay.windows_os import trim_process_memory
+        if trim_memory:
+            try:
+                from swiftplay.windows_os import trim_process_memory
 
-            trim_process_memory(collect_gc=True)
-        except Exception:
-            pass
+                trim_process_memory(collect_gc=True)
+            except Exception:
+                pass
         self._emit_snapshots()
 
     async def _disconnect_bot(self) -> None:
@@ -3367,6 +3539,19 @@ class DiscordWorkerApp:
             },
         )
 
+    def _wire_voice_client(self, vc: Any) -> None:
+        import discord.opus
+
+        vc.deafened = self._deafened
+        vc.on_opus = lambda uid, seq, pkt, _dec=discord.opus.Decoder: self._mixer.push_opus(
+            uid, seq, pkt, decoder_factory=_dec
+        )
+        vc.on_pcm = self._mixer.push_pcm
+        vc.on_user_removed = self._mixer.remove_user
+        vc.on_speaking_change = self._on_remote_speaking
+        vc.on_dave_change = self._on_dave_change
+        vc.on_warning = lambda msg: self.emit_event("warning", {"message": msg})
+
     async def _join_channel(self, guild_id: int, channel_id: int) -> None:
         async with self._voice_lock:
             if self._client is None or not self._client.is_ready():
@@ -3397,6 +3582,7 @@ class DiscordWorkerApp:
                     )
 
             existing_vc = self._vc or guild.voice_client
+            t_start = time.perf_counter()
             if (
                 existing_vc is not None
                 and self._voice_cls is not None
@@ -3409,46 +3595,74 @@ class DiscordWorkerApp:
                 if existing_vc.channel.id == channel_id:
                     engine = self._ensure_audio_engine()
                     engine.configure(muted=self._muted)
-                    engine.start()
+                    await asyncio.to_thread(engine.start)
+                    self._last_join_diag = "Conexión: ya activo en sala"
                     self._emit_snapshots()
                     return
                 self._joining_channel_id = str(channel_id)
                 self._emit_snapshots()
                 try:
-                    await existing_vc.move_to(channel)
+                    await existing_vc.move_to(channel, timeout=10.0)
+                    t_end = time.perf_counter()
+                    self._last_join_diag = f"Cambio de sala: {int((t_end - t_start) * 1000)} ms"
                 finally:
                     self._joining_channel_id = ""
             else:
-                await self._leave_channel_internal()
+                await self._leave_channel_internal(trim_memory=False)
                 self._joining_channel_id = str(channel_id)
                 self._emit_snapshots()
+                engine = self._ensure_audio_engine()
+                engine.configure(muted=self._muted)
+                audio_task = asyncio.create_task(asyncio.to_thread(engine.start))
+                engine.warmup_async()
+                t_audio_done = t_start
+                t_ws_done = t_start
                 try:
-                    import discord.opus
+                    async def _do_audio() -> None:
+                        nonlocal t_audio_done
+                        await audio_task
+                        t_audio_done = time.perf_counter()
 
-                    vc = await channel.connect(
-                        cls=self._voice_cls,
-                        self_mute=self._muted,
-                        self_deaf=self._deafened,
-                        timeout=12.0,
-                    )
-                    vc.deafened = self._deafened
-                    vc.on_opus = lambda uid, seq, pkt, _dec=discord.opus.Decoder: self._mixer.push_opus(
-                        uid, seq, pkt, decoder_factory=_dec
-                    )
-                    vc.on_pcm = self._mixer.push_pcm
-                    vc.on_user_removed = self._mixer.remove_user
-                    vc.on_speaking_change = self._on_remote_speaking
-                    vc.on_dave_change = self._on_dave_change
-                    vc.on_warning = lambda msg: self.emit_event("warning", {"message": msg})
+                    async def _do_voice() -> Any:
+                        nonlocal t_ws_done
+                        res_vc = await channel.connect(
+                            cls=self._voice_cls,
+                            self_mute=self._muted,
+                            self_deaf=self._deafened,
+                            timeout=12.0,
+                        )
+                        t_ws_done = time.perf_counter()
+                        return res_vc
+
+                    _, vc = await asyncio.gather(_do_audio(), _do_voice())
+                    self._wire_voice_client(vc)
                     self._vc = vc
+                    ws_ms = max(0, int((t_ws_done - t_start) * 1000))
+                    audio_ms = max(0, int((t_audio_done - t_start) * 1000))
+                    tot_ms = max(0, int((time.perf_counter() - t_start) * 1000))
+                    self._last_join_diag = (
+                        f"Conexión: {tot_ms} ms (voz {ws_ms} ms · audio {audio_ms} ms)"
+                    )
                 except asyncio.TimeoutError as exc:
-                    await self._leave_channel_internal()
+                    if not audio_task.done():
+                        audio_task.cancel()
+                    try:
+                        await audio_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    await self._leave_channel_internal(trim_memory=False)
                     raise RuntimeError(
                         f"Tiempo de espera agotado al entrar en '{channel.name}'. "
                         "Revisa permisos del canal o conexión UDP."
                     ) from exc
                 except Exception:
-                    await self._leave_channel_internal()
+                    if not audio_task.done():
+                        audio_task.cancel()
+                    try:
+                        await audio_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    await self._leave_channel_internal(trim_memory=False)
                     raise
                 finally:
                     self._joining_channel_id = ""
@@ -3456,23 +3670,32 @@ class DiscordWorkerApp:
             self._mixer.clear()
             engine = self._ensure_audio_engine()
             engine.configure(muted=self._muted)
-            engine.start()
+            if not engine._running:
+                await asyncio.to_thread(engine.start)
             engine.warmup_async()
             vc = self._vc
+            prev_dave_state = (self._dave_active, self._dave_code)
             if vc is not None and vc.is_connected():
                 already_dave = bool(vc._connection.can_encrypt)
                 self._dave_was_active = already_dave
                 self._dave_active = already_dave
                 self._dave_code = str(vc.voice_privacy_code or "")
+                self._emit_snapshots()
                 keep_speaking = bool(
                     not self._muted and (engine.is_speaking or engine.is_open_mic)
                 )
                 await vc.kickstart_voice(keep_speaking=keep_speaking)
+                cur_dave_state = (bool(vc._connection.can_encrypt), str(vc.voice_privacy_code or ""))
+                if cur_dave_state != (self._dave_active, self._dave_code) or cur_dave_state != prev_dave_state:
+                    self._dave_active, self._dave_code = cur_dave_state
+                    if self._dave_active:
+                        self._dave_was_active = True
+                    self._emit_snapshots()
             else:
                 self._dave_was_active = False
                 self._dave_active = False
                 self._dave_code = ""
-            self._emit_snapshots()
+                self._emit_snapshots()
 
     async def _sync_voice_flags(self) -> None:
         vc = self._vc
@@ -3566,7 +3789,7 @@ class DiscordWorkerApp:
                 return
 
             if cmd == "list_devices":
-                devices = list_audio_devices()
+                devices = await asyncio.to_thread(list_audio_devices)
                 self.emit_event("devices", devices)
                 if req_id is not None:
                     self.emit_result(req_id, True, devices)

@@ -59,6 +59,7 @@ class DiscordService(QObject):
     devices_updated = Signal(dict)
     worker_ram_updated = Signal(float, float)
     guild_members_updated = Signal(dict)
+    presence_updated = Signal(dict)
     chat_history_loaded = Signal(dict)
     chat_message_received = Signal(dict)
     chat_message_edited = Signal(dict)
@@ -247,6 +248,8 @@ class DiscordService(QObject):
                 )
             elif event == "guild_members" and isinstance(data, dict):
                 self.guild_members_updated.emit(data)
+            elif event == "presence" and isinstance(data, dict):
+                self.presence_updated.emit(data)
             elif event == "chat_history" and isinstance(data, dict):
                 self.chat_history_loaded.emit(data)
             elif event == "chat_message" and isinstance(data, dict):
@@ -339,10 +342,10 @@ class DiscordService(QObject):
         self._state = "connecting"
         self.state_changed.emit("connecting", {})
         self._ensure_worker()
-        self._send_command("list_devices")
+        self._send_command("connect_bot")
         self.sync_audio_config(cfg)
         self.set_notify_channels(cfg.discord_notify_channels)
-        self._send_command("connect_bot")
+        self._send_command("list_devices")
 
     def set_notify_channels(self, channel_ids: list[str]) -> None:
         clean = [str(cid).strip() for cid in (channel_ids or []) if str(cid or "").strip()]

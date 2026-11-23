@@ -16,14 +16,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPointF, QPropertyAnimation, QSize, Qt, QTimer, QUrl  # noqa: E402
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPointF, QPropertyAnimation, QSize, Qt, QTimer, QUrl, QVariantAnimation  # noqa: E402
 from PySide6.QtGui import QImage, QMouseEvent, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton  # noqa: E402
 
 from swiftplay.config import AppConfig, VALID_SPEEDS, load_config, save_config  # noqa: E402
 from swiftplay.discord_service import DiscordService  # noqa: E402
 from swiftplay.discord_worker import PCM_FRAME_BYTES, SILENCE_PCM, VoiceAudioMixer  # noqa: E402
-from swiftplay.models import AccountProfile, MediaItem, ResolvedStream, upgrade_thumb_url  # noqa: E402
+from swiftplay.models import AccountProfile, ChannelInfo, MediaItem, ResolvedStream, upgrade_thumb_url  # noqa: E402
 from swiftplay.security import (  # noqa: E402
     clear_credentials,
     clear_discord_token,
@@ -49,7 +49,7 @@ from swiftplay.ui.icons import render_icon  # noqa: E402
 from swiftplay.ui.main_window import MainWindow  # noqa: E402
 from swiftplay.ui.settings_dialog import SettingsDialog  # noqa: E402
 from swiftplay.ui.shortcuts_dialog import ShortcutsDialog  # noqa: E402
-from swiftplay.ui.widgets import VideoGridCard  # noqa: E402
+from swiftplay.ui.widgets import ResponsiveGridWidget, VideoGridCard  # noqa: E402
 from swiftplay.windows_os import (  # noqa: E402
     SystemResourceMonitor,
     apply_window_taskbar_properties,
@@ -304,6 +304,8 @@ def test_storage_config_themes() -> None:
     assert qss.count("{") == qss.count("}"), "QSS tiene llaves desbalanceadas"
     for sel in ("QFrame#DiscordChatCard", "QFrame#DiscordVoiceArea", "QFrame#DiscordDeckCard", "QFrame#DiscordSidebarMiniCard"):
         assert sel in qss, f"Falta selector {sel} en QSS"
+    for legacy_hex in ("#10141C", "#171C27", "#1E2534"):
+        assert legacy_hex not in qss, f"No debe permanecer tono azulado antiguo {legacy_hex} en QSS Discord"
     accent_section = qss.split("QPushButton#AccentBtn {{")[1].split("}}")[0] if "QPushButton#AccentBtn {{" in qss else qss.split("QPushButton#AccentBtn {")[1].split("}")[0]
     assert "#F1F3F6" in accent_section, "AccentBtn debe usar texto claro (#F1F3F6) legible"
     pill_section = qss.split("QPushButton#PillBtn {")[1].split("}")[0]
@@ -430,7 +432,25 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
     )
     new_on_refresh = {x.video_id for x in feed_refresh} - recent_sample
     assert len(new_on_refresh) >= 1, "Refrescar el feed debe traer videos nuevos"
-    print(f"   Feed de video sin Shorts OK ({len(feed)} videos, {dur_count} con duración/live, {dated_count} con fecha, refresh +{len(new_on_refresh)} nuevos).")
+    assert any(x.channel_id for x in feed), "El feed debe extraer channel_id para abrir canales"
+    feed_append = yt.get_video_home_feed(
+        limit=12,
+        watched_ids=watched_sample,
+        recent_shown_ids={x.video_id for x in feed_refresh},
+        append=True,
+    )
+    assert isinstance(feed_append, list)
+    print(f"   Feed de video sin Shorts OK ({len(feed)} videos, {dur_count} con duración/live, {dated_count} con fecha, refresh +{len(new_on_refresh)} nuevos, append +{len(feed_append)}).")
+
+    ch_info, ch_vids, _ch_cont = yt.get_channel_page("UC_x5XG1OV2P6uZZ5FSM9Ttw", tab="videos", limit=5)
+    assert isinstance(ch_info, ChannelInfo) and ch_info.channel_id == "UC_x5XG1OV2P6uZZ5FSM9Ttw"
+    assert len(ch_vids) >= 1, "La vista de canal debe devolver videos"
+    assert all(not is_short_video(x.duration_sec, title=x.title, is_live=x.is_live) for x in ch_vids)
+    ch_info_s, ch_streams, _ = yt.get_channel_page("UC_x5XG1OV2P6uZZ5FSM9Ttw", tab="streams", limit=5)
+    assert isinstance(ch_info_s, ChannelInfo) and isinstance(ch_streams, list)
+    resolved_ch = yt.resolve_channel_id_for_video(videos[0].video_id)
+    assert resolved_ch.startswith("UC"), f"No se resolvió channel_id UC... para video {videos[0].video_id}: {resolved_ch}"
+    print(f"   Vista de canal YT OK ({ch_info.name}: {len(ch_vids)} videos, {len(ch_streams)} directos).")
 
     songs = yt.search_music("daft punk", search_filter="songs", limit=10)
     assert len(songs) >= 5, f"Se esperaban >= 5 canciones, llegaron {len(songs)}"
@@ -438,7 +458,13 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
 
     music_secs = yt.get_music_home_sections(local_listen_again=songs[:2])
     assert len(music_secs) >= 2, f"Se esperaban >= 2 secciones de música, llegaron {len(music_secs)}"
-    print(f"   Secciones YT Music OK: {[s.title for s in music_secs]}")
+    more_music = yt.get_music_home_more_sections(
+        local_listen_again=songs[:2],
+        exclude_titles={s.title for s in music_secs},
+        batch_size=3,
+    )
+    assert isinstance(more_music, list)
+    print(f"   Secciones YT Music OK: {[s.title for s in music_secs]} (+{len(more_music)} extra)")
 
     audio_stream = yt.resolve_stream(songs[0].video_id, audio_only=True)
     assert audio_stream.primary_url.startswith("http"), "URL de audio inválida"
@@ -1038,8 +1064,8 @@ def test_gui_and_libmpv_smoke(
         )
         assert dp.audio_popup.isHidden(), "El popover flotante de audio debe iniciar oculto por defecto"
         assert not dp.left_card.isHidden(), "Los canales deben iniciar visibles"
-        assert not dp.voice_pane.isHidden() and not dp.chat_pane.isHidden(), (
-            "La vista dividida (Voz arriba + Chat abajo) debe iniciar activa por defecto"
+        assert not dp.voice_pane.isHidden() and dp.chat_pane.isHidden(), (
+            "La vista exclusiva de Voz (sin chat simultáneo) debe iniciar activa por defecto"
         )
         assert not dp.text_channels_scroll.isHidden(), (
             "Los canales de texto unificados deben iniciar visibles bajo Voz"
@@ -1062,13 +1088,15 @@ def test_gui_and_libmpv_smoke(
         assert dp.left_card.isHidden()
         dp.toggle_channels_btn.click()
         assert not dp.left_card.isHidden()
+        dp.tab_chat_btn.click()
+        assert dp.voice_pane.isHidden() and not dp.chat_pane.isHidden()
+        dp.tab_voice_btn.click()
+        assert not dp.voice_pane.isHidden() and dp.chat_pane.isHidden()
         dp.close_voice_btn.click()
         assert dp.voice_pane.isHidden() and not dp.chat_pane.isHidden()
         dp.close_chat_btn.click()
-        assert dp.center_splitter.isHidden() and not dp.center_collapsed_card.isHidden()
-        dp.reopen_voice_btn.click()
-        dp.tab_chat_btn.click()
-        assert not dp.voice_pane.isHidden() and not dp.chat_pane.isHidden() and dp.center_collapsed_card.isHidden()
+        assert not dp.voice_pane.isHidden() and dp.chat_pane.isHidden()
+        assert not dp.center_stack.isHidden() and dp.center_collapsed_card.isHidden()
 
         # Verificar canales sin permiso ocultos por defecto y visibles al activarlo + miembros por canal + overlay
         assert win.cfg.discord_show_locked_channels is False
@@ -1183,6 +1211,70 @@ def test_gui_and_libmpv_smoke(
                 dp._render_participants(force=True)
                 dp._render_channels(force=True)
                 app.processEvents()
+
+                # Verificar distribución centrada estilo Discord (1, 2, 2+1, 2+2, 3+2, 3+3, 4+3, 4+4, 3+3+3)
+                from swiftplay.ui.discord_panel import _compute_voice_row_sizes
+                expected_rows = {
+                    1: [1],
+                    2: [2],
+                    3: [2, 1],
+                    4: [2, 2],
+                    5: [3, 2],
+                    6: [3, 3],
+                    7: [4, 3],
+                    8: [4, 4],
+                    9: [3, 3, 3],
+                }
+                for n_part, exp_layout in expected_rows.items():
+                    assert _compute_voice_row_sizes(n_part, 4) == exp_layout, (
+                        f"Distribución esperada para {n_part}: {exp_layout}"
+                    )
+                prev_bot_st = dp._bot_state
+                orig_win_size = win.size()
+                dp._bot_state = "connected"
+                try:
+                    win.resize(max(win.width(), 1240), max(win.height(), 720))
+                    app.processEvents()
+                    for n_test, exp_r in ((1, [1]), (3, [2, 1]), (5, [3, 2])):
+                        demo_parts = [
+                            {
+                                "id": str(i + 1),
+                                "name": f"User{i + 1}",
+                                "is_bot": False,
+                                "avatar_url": "",
+                                "is_self": (i == 0),
+                                "muted": False,
+                                "deafened": False,
+                            }
+                            for i in range(n_test)
+                        ]
+                        dp._on_voice_state_updated(
+                            {
+                                "in_voice": True,
+                                "guild_id": "10",
+                                "guild_name": "SrvDemo",
+                                "channel_id": "101",
+                                "channel_name": "Sala",
+                                "connect_diag": "Conexión: 120 ms (voz 90 ms · audio 110 ms)",
+                                "participants": demo_parts,
+                            }
+                        )
+                        dp._render_participants(force=True)
+                        app.processEvents()
+                        row_counts = [
+                            dp.participants_rows_layout.itemAt(r).layout().count() - 2
+                            for r in range(dp.participants_rows_layout.count())
+                            if dp.participants_rows_layout.itemAt(r).layout() is not None
+                        ]
+                        assert len(dp._participant_cards_order) == n_test
+                        assert row_counts == exp_r, f"Esperaba {exp_r}, obtenido {row_counts}"
+                        assert "Conexión: 120 ms" in dp.info_pill.toolTip()
+                finally:
+                    dp._bot_state = prev_bot_st
+                    win.resize(orig_win_size)
+                    app.processEvents()
+                    dp._update_info_pill()
+
                 from PySide6.QtTest import QTest
                 from swiftplay.ui.discord_panel import _VoiceChannelRowFrame
                 vc_btns = [b.text().strip() for b in dp.vc_list_widget.findChildren(QPushButton)]
@@ -1829,6 +1921,33 @@ def test_gui_and_libmpv_smoke(
                 assert added_cnt == 1 and len(dp._pending_attachments) == 1
                 dp._clear_pending_attachments(delete_temp=False)
 
+            # Presencia en DM y append incremental sin perder auto-scroll
+            dp._on_presence_updated({"user_id": "u_old", "status": "dnd"})
+            assert "No molestar" in dp.chat_status_pill.text() and not dp.chat_status_pill.isHidden()
+
+            prev_row_cnt = len(dp.chat_browser.message_rows())
+            dp._on_chat_message_received(
+                {
+                    "kind": "dm",
+                    "target_id": "u_old",
+                    "message": {
+                        "id": "m_live_append",
+                        "author_id": "u_old",
+                        "author_name": "Antiguo",
+                        "is_self": False,
+                        "is_bot": False,
+                        "content": "Mensaje incremental con auto-scroll",
+                        "timestamp": "21:15",
+                        "created_ts": 1700000700.0,
+                        "attachments": [],
+                    },
+                }
+            )
+            app.processEvents()
+            assert len(dp.chat_browser.message_rows()) == prev_row_cnt + 1
+            assert "Mensaje incremental con auto-scroll" in dp.chat_browser.toPlainText()
+            assert dp.chat_browser._stick_to_bottom is True
+
             # Regla de avisos: chat cerrado o ventana sin foco deben notificar igualmente
             win._switch_page(MainWindow.PAGE_DISCORD)
             dp._unread_dms.clear()
@@ -1905,21 +2024,60 @@ def test_gui_and_libmpv_smoke(
             win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
             app.processEvents()
 
-        # Verificar caché instantánea de pestañas y limpieza diferida en free_memory_now
+        # Verificar caché instantánea de pestañas, scroll infinito (120), canal YT y limpieza en free_memory_now
+        assert MainWindow.MAX_FEED_ITEMS == 120 and MainWindow.PAGE_CHANNEL == 10
+        assert hasattr(win, "video_scroll") and hasattr(win, "music_scroll") and hasattr(win, "channel_scroll")
+        assert isinstance(win._page_fade_anim, QVariantAnimation) and not isinstance(win._page_fade_anim, QPropertyAnimation)
+
         win._render_video_cards(
-            [MediaItem("v_cache", "Video Caché", "Canal", "3:00", 180, "", "video")]
+            [MediaItem("v_cache", "Video Caché", "Canal", "3:00", 180, "", "video", channel_id="UC_cache123")]
         )
         assert not win._video_page_dirty and len(win.video_grid._widgets) == 1
+        extra_card = VideoGridCard(
+            MediaItem("v_app1", "Video Extra", "Canal", "2:30", 150, "", "video", channel_id="UC_cache123"),
+            in_watch_later=False,
+            thumb_cache=win.thumb_cache,
+            palette=THEMES["matte_silver"],
+        )
+        win.video_grid.append_widgets([extra_card])
+        assert len(win.video_grid._widgets) == 2
+        extra_card.set_offscreen_unloaded(True)
+        extra_card.set_offscreen_unloaded(False)
+
+        from unittest.mock import patch as _mock_patch
+        fake_ch_info = ChannelInfo(channel_id="UC_cache123", name="Canal Prueba", subscribers="10 K suscriptores")
+        fake_ch_vids = [MediaItem("v_ch1", "Video Canal", "Canal Prueba", "4:10", 250, "", "video", channel_id="UC_cache123")]
+        with _mock_patch.object(win.yt, "get_channel_page", return_value=(fake_ch_info, fake_ch_vids, None)):
+            win.open_youtube_channel(fake_ch_vids[0])
+            t_ch_deadline = time.monotonic() + 3.0
+            while (
+                (win.stack.currentIndex() == MainWindow.PAGE_CHANNEL and (len(win.channel_grid._widgets) == 0 or getattr(win, "_channel_loading", False)))
+                and time.monotonic() < t_ch_deadline
+            ):
+                app.processEvents()
+                time.sleep(0.02)
+            assert win.stack.currentIndex() == MainWindow.PAGE_CHANNEL
+            assert win.channel_title_lbl.text() == "Canal Prueba"
+            win._set_channel_tab("streams")
+            t_st_deadline = time.monotonic() + 3.0
+            while (win._channel_tab != "streams" or getattr(win, "_channel_loading", False)) and time.monotonic() < t_st_deadline:
+                app.processEvents()
+                time.sleep(0.02)
+            assert win._channel_tab == "streams"
+            win._on_channel_back()
+            app.processEvents()
+            assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH
+
         win._switch_page(MainWindow.PAGE_WATCH_LATER)
         app.processEvents()
         assert not win._wl_page_dirty
-        assert len(win.video_grid._widgets) == 1, "Los widgets ocultos no deben destruirse al cambiar de pestaña"
+        assert len(win.video_grid._widgets) == 2, "Los widgets ocultos no deben destruirse al cambiar de pestaña"
         win._switch_page(MainWindow.PAGE_HISTORY)
         app.processEvents()
         assert not win._history_page_dirty
         win._switch_page(MainWindow.PAGE_VIDEO_SEARCH)
         app.processEvents()
-        assert not win._video_page_dirty and len(win.video_grid._widgets) == 1
+        assert not win._video_page_dirty and len(win.video_grid._widgets) == 2
         win._switch_page(MainWindow.PAGE_DISCORD)
         app.processEvents()
         win.free_memory_now()
@@ -2344,6 +2502,23 @@ out_s = decrypt_discord_rtp_packet(bytes(hdr_s) + ct_s + nonce2[:4], "aead_xchac
 assert out_s == (999, 424242, OPUS_SILENCE)
 assert dave.calls == 1, "OPUS_SILENCE no debe pasar por dave.decrypt"
 
+# Caso B2: can_passthrough durante transición DAVE cuando decrypt falla
+class PassthroughDave(MockDaveSession):
+    def decrypt(self, user_id, media_type, payload):
+        raise RuntimeError("not encrypted yet")
+    def can_passthrough(self, user_id):
+        return user_id == 424242
+
+dave_pt = PassthroughDave()
+hdr_pt = bytearray(12)
+hdr_pt[0] = 0x80
+hdr_pt[1] = 0x78
+struct.pack_into(">HII", hdr_pt, 2, 3, 2880, 999)
+nonce_pt = struct.pack(">I", 79) + (b"\\x00" * 20)
+ct_pt = box.encrypt(b"RAW_OPUS_PT", bytes(hdr_pt), nonce_pt).ciphertext
+out_pt = decrypt_discord_rtp_packet(bytes(hdr_pt) + ct_pt + nonce_pt[:4], "aead_xchacha20_poly1305_rtpsize", key, ssrc_map, dave_pt, True, box)
+assert out_pt == (999, 424242, b"RAW_OPUS_PT"), f"Passthrough DAVE falló: {out_pt}"
+
 # Caso C: RTCP ignorado
 rtcp = bytearray(24)
 rtcp[0] = 0x80
@@ -2511,6 +2686,38 @@ print(f"DF_AI_OK mean_ms={mean_proc_ms:.2f} ws={ws_ai:.1f} priv={priv_ai:.1f}")
 ai_proc.release_dsp()
 assert ai_proc._df_dsp._df_state is None and ai_proc._df_dsp._silero._vad is None
 ai_proc.close()
+
+# Arranque instantáneo sin bloqueo de warmup en modo IA (usa fallback WebRTC hasta que DF3 termine warmup)
+cold_df = _DfDsp(mode="ai")
+assert cold_df.is_ready is False
+assert cold_df._lock.acquire(blocking=False)
+try:
+    cold_df.reset()  # No debe intentar bloquear en _lock si aún no hay _df_state
+finally:
+    cold_df._lock.release()
+cold_proc = _DspMicProc(
+    mic_gain_pct=100,
+    agc_enabled=True,
+    vad_threshold=20,
+    noise_suppression="ai",
+    enable_webrtc=True,
+)
+_cold_frames, _cold_lvl, _cold_sp = cold_proc.process_frame(noise_frames[0], now=0.5)
+assert cold_proc._df_dsp.is_ready is False and cold_proc._df_dsp._df_state is None
+cold_proc.close()
+
+# Prioridad de dispositivos evita WDM-KS si existe alternativa WASAPI/MME
+from unittest.mock import patch as _sd_patch
+import sounddevice as _sd_mod
+from swiftplay.discord_worker import resolve_device_candidates as _res_cands
+_fake_apis = [{"name": "Windows WASAPI"}, {"name": "Windows WDM-KS"}]
+_fake_devs = [
+    {"name": "Mic Realtek", "hostapi": 0, "max_input_channels": 2, "max_output_channels": 0},
+    {"name": "Mic Realtek", "hostapi": 1, "max_input_channels": 2, "max_output_channels": 0},
+]
+with _sd_patch.object(_sd_mod, "query_hostapis", return_value=_fake_apis), _sd_patch.object(_sd_mod, "query_devices", return_value=_fake_devs):
+    _cands = _res_cands("Mic Realtek", "input")
+    assert _cands == [0, None], f"WDM-KS no debe incluirse si hay WASAPI: {_cands}"
 
 # Señal modulada de voz + ruido en modo ai
 speech_proc = _DspMicProc(
@@ -2699,7 +2906,7 @@ _prev_sd = _sys.modules.get("sounddevice")
 _sys.modules["sounddevice"] = _fake_sd
 try:
     in_cands = resolve_device_candidates("Micrófono (HyperX Cloud III)", "input")
-    assert in_cands == [3, 2, 1, 0, None], f"Prioridad HostAPI inesperada: {in_cands}"
+    assert in_cands == [3, 2, 1, None], f"Prioridad HostAPI inesperada: {in_cands}"
     assert resolve_device_candidates("", "input") == [None]
 
     _FakeStreamLog.clear()

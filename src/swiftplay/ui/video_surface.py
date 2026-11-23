@@ -127,6 +127,7 @@ class VideoPlayerPanel(QWidget):
     theater_toggled = Signal()
     wheel_scrolled = Signal(int)
     reload_live_requested = Signal()
+    channel_clicked = Signal()
 
     def __init__(
         self,
@@ -176,7 +177,16 @@ class VideoPlayerPanel(QWidget):
         self.channel_avatar_lbl.setFixedSize(24, 24)
         self.channel_avatar_lbl.setScaledContents(True)
         self.channel_avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.channel_avatar_lbl.installEventFilter(self)
         header_lay.addWidget(self.channel_avatar_lbl)
+
+        self.channel_btn = QPushButton("")
+        self.channel_btn.setObjectName("PillBtn")
+        self.channel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.channel_btn.setVisible(False)
+        self.channel_btn.setToolTip("Abrir canal de YouTube")
+        self.channel_btn.clicked.connect(self.channel_clicked.emit)
+        header_lay.addWidget(self.channel_btn)
 
         self.video_title_lbl = ElidedLabel("Selecciona un video", max_lines=1)
         self.video_title_lbl.setStyleSheet("font-size: 14px; font-weight: 600;")
@@ -507,7 +517,18 @@ class VideoPlayerPanel(QWidget):
         self.media_stack.setCurrentIndex(2)
 
     def set_item(self, item: MediaItem, in_watch_later: bool) -> None:
-        self.video_title_lbl.setText(f"{item.title}  —  {item.author}" if item.author else item.title)
+        show_chan = bool(item.kind == "video" and (item.author or item.channel_id))
+        if show_chan:
+            self.channel_btn.setText(item.author or "Canal")
+            self.channel_btn.setVisible(True)
+            self.channel_avatar_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.channel_avatar_lbl.setToolTip(f"Ver canal: {item.author or 'YouTube'}")
+            self.video_title_lbl.setText(item.title)
+        else:
+            self.channel_btn.setVisible(False)
+            self.channel_avatar_lbl.setCursor(Qt.CursorShape.ArrowCursor)
+            self.channel_avatar_lbl.setToolTip("")
+            self.video_title_lbl.setText(f"{item.title}  —  {item.author}" if item.author else item.title)
         self.audio_title.setText(f"{item.title}\n{item.author}" if item.author else item.title)
         self.loading_title.setText(f"{item.title}\n{item.author}" if item.author else item.title)
         self._current_thumb_url = item.normalized_thumb()
@@ -688,8 +709,15 @@ class VideoPlayerPanel(QWidget):
         )
 
     def eventFilter(self, obj, event) -> bool:
-        if event.type() == QEvent.Type.MouseButtonPress:
+        try:
+            etype = event.type()
+        except RuntimeError:
+            return False
+        if etype == QEvent.Type.MouseButtonPress:
             if isinstance(event, QMouseEvent) and event.button() == Qt.MouseButton.LeftButton:
+                if obj is self.channel_avatar_lbl and not self.channel_btn.isHidden():
+                    self.channel_clicked.emit()
+                    return True
                 if obj is self.audio_banner or (
                     obj is self.loading_thumb and self._is_resume_preview
                 ):

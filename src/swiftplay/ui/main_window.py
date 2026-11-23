@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCompleter,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -61,7 +62,7 @@ from PySide6.QtWidgets import (
 from swiftplay.config import AppConfig, load_config, save_config
 from swiftplay.discord_service import DiscordService
 from swiftplay.media_keys import GlobalMediaKeyFilter
-from swiftplay.models import FeedSection, MediaItem, ResolvedStream, format_duration
+from swiftplay.models import ChannelInfo, FeedSection, MediaItem, ResolvedStream, format_duration
 from swiftplay.paths import APP_NAME, ICON_ICO_PATH, ICON_PNG_PATH, RAM_LOG_PATH, SESSION_STATE_PATH
 from swiftplay.player import MediaPlayer
 from swiftplay.ram_logger import RamLogger
@@ -196,6 +197,8 @@ class MainWindow(QMainWindow):
     PAGE_MUSIC_HISTORY = 7
     PAGE_TWITCH = 8
     PAGE_DISCORD = 9
+    PAGE_CHANNEL = 10
+    MAX_FEED_ITEMS = 120
 
     def __init__(
         self,
@@ -233,7 +236,22 @@ class MainWindow(QMainWindow):
         self._search_gen = 0
         self._video_feed_gen = 0
         self._video_feed_shown_ids: deque[str] = deque(maxlen=160)
+        self._video_feed_loading_more = False
+        self._video_feed_exhausted = False
         self._music_home_gen = 0
+        self._music_home_loading_more = False
+        self._music_home_exhausted = False
+        self._channel_gen = 0
+        self._channel_return_page: int = self.PAGE_VIDEO_SEARCH
+        self._channel_id: str = ""
+        self._channel_info: ChannelInfo | None = None
+        self._channel_tab: Literal["videos", "streams"] = "videos"
+        self._channel_items: list[MediaItem] = []
+        self._channel_continuation: str | None = None
+        self._channel_loading_more: bool = False
+        self._channel_cards: list[VideoGridCard] = []
+        self._channel_page_dirty: bool = True
+        self._channel_avatar_url: str = ""
         self._video_play_gen = 0
         self._music_play_gen = 0
         self._radio_gen = 0
@@ -254,6 +272,20 @@ class MainWindow(QMainWindow):
         self._account_avatar_url = ""
         self._bb_thumb_url = ""
         self._cleaned_up = False
+
+        self._video_viewport_timer = QTimer(self)
+        self._video_viewport_timer.setSingleShot(True)
+        self._video_viewport_timer.setInterval(140)
+        self._video_viewport_timer.timeout.connect(
+            lambda: self._refresh_offscreen_grid_thumbs(self.video_scroll, self._video_cards)
+        )
+
+        self._channel_viewport_timer = QTimer(self)
+        self._channel_viewport_timer.setSingleShot(True)
+        self._channel_viewport_timer.setInterval(140)
+        self._channel_viewport_timer.timeout.connect(
+            lambda: self._refresh_offscreen_grid_thumbs(self.channel_scroll, self._channel_cards)
+        )
 
         # Debounce clic simple vs doble clic en la superficie de video
         self._video_click_timer = QTimer(self)
@@ -343,6 +375,15 @@ class MainWindow(QMainWindow):
         self._bottom_bar_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._bottom_bar_anim.valueChanged.connect(self._on_bottom_bar_anim_step)
         self._bottom_bar_anim.finished.connect(self._on_bottom_bar_anim_finished)
+
+        self._page_fade_target: QWidget | None = None
+        self._page_fade_anim = QVariantAnimation(self)
+        self._page_fade_anim.setDuration(140)
+        self._page_fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._page_fade_anim.setStartValue(0.86)
+        self._page_fade_anim.setEndValue(1.0)
+        self._page_fade_anim.valueChanged.connect(self._on_page_fade_step)
+        self._page_fade_anim.finished.connect(self._on_page_fade_finished)
 
         # Dos instancias ligeras lazy de libmpv en paralelo (Video GPU + Música Solo-Audio)
         self.video_player = MediaPlayer(
@@ -839,6 +880,11 @@ class MainWindow(QMainWindow):
         if v_lay is not None:
             v_lay.insertWidget(0, self.continue_banner)
 
+        self.video_scroll: QScrollArea = self.video_search_page._scroll_area  # type: ignore[attr-defined]
+        vsb = self.video_scroll.verticalScrollBar()
+        if vsb is not None:
+            vsb.valueChanged.connect(self._on_video_scroll_changed)
+
         self.stack.addWidget(self.video_search_page)
 
         # Pág 1: Reproductor de Video embebido
@@ -873,7 +919,7 @@ class MainWindow(QMainWindow):
             "Cargando música...",
             header_actions=[
                 ("Música", self._show_music_home_view, False),
-                ("", self._load_music_home, False),
+                ("", lambda _c=False: self._load_music_home(refresh=True), False),
             ],
             return_header=True,
         )
@@ -883,6 +929,10 @@ class MainWindow(QMainWindow):
         self.music_refresh_btn.setObjectName("IconBtn")
         self.music_refresh_btn.setFixedSize(32, 32)
         self.music_refresh_btn.setToolTip("Actualizar")
+        self.music_scroll: QScrollArea = self.music_search_page._scroll_area  # type: ignore[attr-defined]
+        msb = self.music_scroll.verticalScrollBar()
+        if msb is not None:
+            msb.valueChanged.connect(self._on_music_scroll_changed)
         self.stack.addWidget(self.music_search_page)
 
         # Pág 4: Mi música
@@ -1007,6 +1057,77 @@ class MainWindow(QMainWindow):
         self.discord_panel.toast_requested.connect(self.show_toast)
         self.stack.addWidget(self.discord_panel)
 
+        # Pág 10: Canal de YouTube (Videos y Directos sin Shorts)
+        (
+            self.channel_page,
+            self.channel_grid,
+            self.channel_empty_lbl,
+            self.channel_title_lbl,
+            chan_hdr_btns,
+        ) = self._make_grid_page(
+            "Canal",
+            "Cargando canal...",
+            header_actions=[("", self._reload_channel_page, False)],
+            return_header=True,
+        )
+        self.channel_refresh_btn = chan_hdr_btns[0]
+        self.channel_refresh_btn.setObjectName("IconBtn")
+        self.channel_refresh_btn.setFixedSize(32, 32)
+        self.channel_refresh_btn.setToolTip("Actualizar canal")
+
+        ch_hdr = self.channel_page.layout().itemAt(0).layout()
+        if ch_hdr is not None:
+            self.channel_back_btn = QPushButton(" Volver")
+            self.channel_back_btn.setObjectName("PillBtn")
+            self.channel_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.channel_back_btn.clicked.connect(self._on_channel_back)
+
+            self.channel_avatar_lbl = QLabel()
+            self.channel_avatar_lbl.setFixedSize(40, 40)
+            self.channel_avatar_lbl.setScaledContents(True)
+            self.channel_avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            meta_box = QWidget()
+            meta_lay = QVBoxLayout(meta_box)
+            meta_lay.setContentsMargins(0, 0, 0, 0)
+            meta_lay.setSpacing(1)
+            ch_hdr.removeWidget(self.channel_title_lbl)
+            meta_lay.addWidget(self.channel_title_lbl)
+            self.channel_meta_lbl = QLabel("")
+            self.channel_meta_lbl.setObjectName("MutedLabel")
+            self.channel_meta_lbl.setVisible(False)
+            meta_lay.addWidget(self.channel_meta_lbl)
+
+            self.channel_videos_btn = QPushButton("Videos")
+            self.channel_videos_btn.setObjectName("PillBtn")
+            self.channel_videos_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.channel_videos_btn.clicked.connect(lambda: self._set_channel_tab("videos"))
+
+            self.channel_streams_btn = QPushButton("Directos")
+            self.channel_streams_btn.setObjectName("PillBtn")
+            self.channel_streams_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.channel_streams_btn.clicked.connect(lambda: self._set_channel_tab("streams"))
+
+            ch_hdr.insertWidget(0, self.channel_back_btn)
+            ch_hdr.insertWidget(1, self.channel_avatar_lbl)
+            ch_hdr.insertWidget(2, meta_box)
+            ch_hdr.insertWidget(3, self.channel_videos_btn)
+            ch_hdr.insertWidget(4, self.channel_streams_btn)
+        else:
+            self.channel_back_btn = QPushButton(" Volver")
+            self.channel_avatar_lbl = QLabel()
+            self.channel_meta_lbl = QLabel("")
+            self.channel_videos_btn = QPushButton("Videos")
+            self.channel_streams_btn = QPushButton("Directos")
+
+        self.channel_scroll: QScrollArea = self.channel_page._scroll_area  # type: ignore[attr-defined]
+        csb = self.channel_scroll.verticalScrollBar()
+        if csb is not None:
+            csb.valueChanged.connect(self._on_channel_scroll_changed)
+        self.thumb_cache.ready.connect(self._on_channel_avatar_ready)
+        self._refresh_channel_tab_pills()
+        self.stack.addWidget(self.channel_page)
+
         right_col.addWidget(self.stack, 1)
         body_row.addLayout(right_col, 1)
         outer.addLayout(body_row, 1)
@@ -1090,6 +1211,7 @@ class MainWindow(QMainWindow):
 
         scroll.setWidget(container)
         root.addWidget(scroll, 1)
+        page._scroll_area = scroll  # type: ignore[attr-defined]
         if return_header:
             return page, items_lay, empty_lbl, title_lbl, created_btns
         return page, items_lay, empty_lbl
@@ -1150,6 +1272,7 @@ class MainWindow(QMainWindow):
 
         scroll.setWidget(container)
         root.addWidget(scroll, 1)
+        page._scroll_area = scroll  # type: ignore[attr-defined]
         if return_header:
             return page, grid, empty_lbl, title_lbl, created_btns
         return page, grid, empty_lbl
@@ -1343,6 +1466,7 @@ class MainWindow(QMainWindow):
         p.video_clicked.connect(self._on_video_surface_clicked)
         p.video_double_clicked.connect(self._on_video_surface_double_clicked)
         p.theater_toggled.connect(self.toggle_sidebar)
+        p.channel_clicked.connect(self._open_current_video_channel)
         p.wheel_scrolled.connect(self._on_video_wheel_volume)
         p.video_surface.mouse_moved.connect(self._on_video_mouse_moved)
         p.video_surface.surface_shown.connect(
@@ -1657,10 +1781,22 @@ class MainWindow(QMainWindow):
             self.music_refresh_btn.setIcon(render_icon("refresh", p.text, 15))
         if self.twitch_refresh_btn is not None:
             self.twitch_refresh_btn.setIcon(render_icon("refresh", p.text, 15))
+        if hasattr(self, "channel_back_btn"):
+            self.channel_back_btn.setIcon(render_icon("back", p.text, 15))
+        if hasattr(self, "channel_refresh_btn") and self.channel_refresh_btn is not None:
+            self.channel_refresh_btn.setIcon(render_icon("refresh", p.text, 15))
+        if hasattr(self, "channel_avatar_lbl") and not self._channel_avatar_url:
+            self.channel_avatar_lbl.setStyleSheet(
+                f"background-color: {p.surface2}; color: {p.text2}; "
+                f"border-radius: 20px; border: 1px solid {p.border}; "
+                "font-size: 16px; font-weight: 700;"
+            )
         self._refresh_account_badge()
         self._sync_bottom_bar()
         self._clear_hidden_browse_pages(clear_all=False)
         for card in self._video_cards:
+            card.update_theme(p)
+        for card in self._channel_cards:
             card.update_theme(p)
         for card in self.wl_grid._widgets:
             if hasattr(card, "update_theme"):
@@ -2295,6 +2431,7 @@ class MainWindow(QMainWindow):
             self.PAGE_WATCH_LATER,
             self.PAGE_HISTORY,
             self.PAGE_TWITCH,
+            self.PAGE_CHANNEL,
         )
         if in_video:
             if not (
@@ -2365,6 +2502,10 @@ class MainWindow(QMainWindow):
             self.twitch_grid.clear_widgets()
             self._twitch_cards.clear()
             self._twitch_page_dirty = True
+        if cur != self.PAGE_CHANNEL and self.channel_grid._widgets:
+            self.channel_grid.clear_widgets()
+            self._channel_cards.clear()
+            self._channel_page_dirty = True
 
     def _refresh_video_surface_output(self) -> None:
         if self._cleaned_up or self.stack.currentIndex() != self.PAGE_VIDEO_PLAYER:
@@ -2380,6 +2521,42 @@ class MainWindow(QMainWindow):
         self.video_panel.video_surface.force_native_redraw()
         if not self.cfg.video_audio_only and self.video_player.has_active_stream:
             self.video_player.refresh_video_output()
+
+    def _on_page_fade_step(self, val: object) -> None:
+        w = self._page_fade_target
+        if w is None:
+            return
+        eff = w.graphicsEffect()
+        if isinstance(eff, QGraphicsOpacityEffect):
+            eff.setOpacity(max(0.0, min(1.0, float(val))))
+
+    def _on_page_fade_finished(self) -> None:
+        w = self._page_fade_target
+        self._page_fade_target = None
+        if w is not None:
+            try:
+                w.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+
+    def _animate_page_fade(self, widget: QWidget | None) -> None:
+        if widget is None or not self.isVisible() or self._cleaned_up:
+            return
+        try:
+            self._page_fade_anim.stop()
+        except RuntimeError:
+            pass
+        if self._page_fade_target is not None:
+            try:
+                self._page_fade_target.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+            self._page_fade_target = None
+        eff = QGraphicsOpacityEffect(widget)
+        eff.setOpacity(0.86)
+        widget.setGraphicsEffect(eff)
+        self._page_fade_target = widget
+        self._page_fade_anim.start()
 
     def _switch_page(self, page_idx: int) -> None:
         if self._is_fullscreen and page_idx != self.PAGE_VIDEO_PLAYER:
@@ -2430,6 +2607,7 @@ class MainWindow(QMainWindow):
                 self.PAGE_MUSIC_HISTORY: self.nav_music_history,
                 self.PAGE_TWITCH: self.nav_twitch,
                 self.PAGE_DISCORD: self.nav_discord,
+                self.PAGE_CHANNEL: self.nav_yt,
             }
             active_btn = nav_map.get(page_idx)
             for btn in (
@@ -2467,6 +2645,7 @@ class MainWindow(QMainWindow):
                 self.PAGE_VIDEO_PLAYER,
                 self.PAGE_WATCH_LATER,
                 self.PAGE_HISTORY,
+                self.PAGE_CHANNEL,
             ):
                 self._search_mode = "video"
                 self._last_video_page = page_idx
@@ -2536,6 +2715,11 @@ class MainWindow(QMainWindow):
                         self._render_twitch_cards(cached_tw[1], hint_width=hint_w)
                     else:
                         trigger_twitch_load = True
+            elif page_idx == self.PAGE_CHANNEL:
+                if self._channel_page_dirty and self._channel_items:
+                    self._render_channel_cards(self._channel_items, hint_width=hint_w)
+                else:
+                    self._maybe_relayout_grid(self.channel_grid, hint_w)
 
             self.stack.setCurrentIndex(page_idx)
         finally:
@@ -2551,6 +2735,12 @@ class MainWindow(QMainWindow):
             self.music_panel.play_entrance_animation()
         elif page_idx == self.PAGE_VIDEO_PLAYER and self._video_item is not None:
             QTimer.singleShot(25, self._refresh_video_surface_output)
+        elif page_idx != self.PAGE_VIDEO_PLAYER and page_idx != prev_idx:
+            self._animate_page_fade(self.stack.currentWidget())
+        if page_idx == self.PAGE_VIDEO_SEARCH:
+            self._video_viewport_timer.start()
+        elif page_idx == self.PAGE_CHANNEL:
+            self._channel_viewport_timer.start()
 
         self.back_to_video_btn.setText(
             " Directo"
@@ -2652,6 +2842,44 @@ class MainWindow(QMainWindow):
                 on_error=lambda err: self._on_search_error(gen, "music", err),
             )
 
+    def _refresh_offscreen_grid_thumbs(
+        self, scroll: QScrollArea, cards: list[Any]
+    ) -> None:
+        if not cards:
+            return
+        vp = scroll.viewport()
+        if vp is None or vp.height() <= 0:
+            return
+        vp_h = vp.height()
+        margin = 1500
+        for card in cards:
+            set_off = getattr(card, "set_offscreen_unloaded", None)
+            if not callable(set_off):
+                continue
+            try:
+                top_y = card.mapTo(vp, QPoint(0, 0)).y()
+                bot_y = top_y + card.height()
+                offscreen = (top_y > vp_h + margin) or (bot_y < -margin)
+                set_off(offscreen)
+            except RuntimeError:
+                pass
+
+    def _on_video_scroll_changed(self, value: int) -> None:
+        self._video_viewport_timer.start()
+        if (
+            self._video_showing_search
+            or self._video_feed_loading_more
+            or self._video_feed_exhausted
+            or self.stack.currentIndex() != self.PAGE_VIDEO_SEARCH
+            or len(self._video_feed_items) >= self.MAX_FEED_ITEMS
+        ):
+            return
+        sb = self.video_scroll.verticalScrollBar()
+        if sb is None or sb.maximum() <= 0:
+            return
+        if value >= int(sb.maximum() * 0.80):
+            self._load_more_video_feed()
+
     def _render_video_cards(
         self, items: list[MediaItem], empty_text: str = "", hint_width: int = 0
     ) -> None:
@@ -2673,6 +2901,72 @@ class MainWindow(QMainWindow):
         hint_w = hint_width if hint_width > 0 else max(480, self.stack.width() - 52)
         self.video_grid.set_items_widgets(cards, hint_width=hint_w)
         self.video_grid.setProperty("_rendered_hint_w", int(hint_w))
+        self._video_viewport_timer.start()
+
+    def _load_more_video_feed(self) -> None:
+        if (
+            self._cleaned_up
+            or self._video_feed_loading_more
+            or self._video_feed_exhausted
+            or self._video_showing_search
+        ):
+            return
+        remaining = self.MAX_FEED_ITEMS - len(self._video_feed_items)
+        if remaining <= 0:
+            return
+        self._video_feed_loading_more = True
+        self._set_page_loading(self.video_search_page, True)
+        gen = self._video_feed_gen
+        existing_ids = {it.video_id for it in self._video_feed_items if it.video_id}
+        watched_ids = self.db.list_watched_video_ids()
+        recent_ids = set(self._video_feed_shown_ids) | existing_ids
+        fallback_q = self.db.get_search_history("video")
+        batch_limit = min(24, remaining)
+        self._run_async(
+            lambda: self.yt.get_video_home_feed(
+                limit=batch_limit,
+                fallback_queries=fallback_q,
+                watched_ids=watched_ids,
+                recent_shown_ids=recent_ids,
+                refresh=False,
+                append=True,
+            ),
+            on_done=lambda items: self._on_video_feed_more_done(gen, items),
+            on_error=lambda _err: self._on_video_feed_more_error(gen),
+        )
+
+    def _on_video_feed_more_done(self, gen: int, items: list[MediaItem]) -> None:
+        if gen != self._video_feed_gen:
+            return
+        self._video_feed_loading_more = False
+        self._set_page_loading(self.video_search_page, False)
+        seen = {it.video_id for it in self._video_feed_items if it.video_id}
+        cap_left = max(0, self.MAX_FEED_ITEMS - len(self._video_feed_items))
+        new_items = [it for it in items if it.video_id and it.video_id not in seen][:cap_left]
+        if not new_items:
+            self._video_feed_exhausted = True
+            return
+        self._video_feed_items.extend(new_items)
+        if len(self._video_feed_items) >= self.MAX_FEED_ITEMS:
+            self._video_feed_exhausted = True
+        if self._video_showing_search or self.stack.currentIndex() != self.PAGE_VIDEO_SEARCH:
+            self._video_page_dirty = True
+            return
+        wl_ids = self.db.list_watch_later_ids()
+        new_cards: list[QWidget] = []
+        for it in new_items:
+            card = self._create_video_card(it, wl_ids=wl_ids)
+            self._video_cards.append(card)
+            new_cards.append(card)
+        hint_w = max(480, self.stack.width() - 52)
+        self.video_grid.append_widgets(new_cards, hint_width=hint_w)
+        self._video_viewport_timer.start()
+
+    def _on_video_feed_more_error(self, gen: int) -> None:
+        if gen != self._video_feed_gen:
+            return
+        self._video_feed_loading_more = False
+        self._set_page_loading(self.video_search_page, False)
 
     def _render_music_home_sections(
         self, sections: list[FeedSection], empty_text: str = ""
@@ -2739,6 +3033,8 @@ class MainWindow(QMainWindow):
                     self._video_feed_shown_ids.append(prev_it.video_id)
         self._video_showing_search = False
         self._video_feed_items = []
+        self._video_feed_loading_more = False
+        self._video_feed_exhausted = False
         self._video_page_dirty = True
         self.video_view_title.setText("Inicio")
         if self.video_back_feed_btn is not None:
@@ -2749,6 +3045,10 @@ class MainWindow(QMainWindow):
         self.video_empty_lbl.setVisible(True)
         self.video_grid.clear_widgets()
         self._video_cards.clear()
+        if refresh:
+            self.thumb_cache.clear()
+            QPixmapCache.clear()
+            trim_process_memory(collect_gc=True)
         self._set_page_loading(self.video_search_page, True)
 
         self._video_feed_gen += 1
@@ -2758,7 +3058,7 @@ class MainWindow(QMainWindow):
         recent_ids = set(self._video_feed_shown_ids) if refresh else None
         self._run_async(
             lambda: self.yt.get_video_home_feed(
-                limit=36,
+                limit=24,
                 fallback_queries=fallback_q,
                 watched_ids=watched_ids,
                 recent_shown_ids=recent_ids,
@@ -2774,7 +3074,8 @@ class MainWindow(QMainWindow):
         if self.video_refresh_btn is not None:
             self.video_refresh_btn.setEnabled(True)
         self._set_page_loading(self.video_search_page, False)
-        self._video_feed_items = list(items)
+        self._video_feed_loading_more = False
+        self._video_feed_items = list(items[: self.MAX_FEED_ITEMS])
         self._video_page_dirty = True
         if self._video_showing_search or self.stack.currentIndex() != self.PAGE_VIDEO_SEARCH:
             return
@@ -2789,6 +3090,7 @@ class MainWindow(QMainWindow):
             return
         if self.video_refresh_btn is not None:
             self.video_refresh_btn.setEnabled(True)
+        self._video_feed_loading_more = False
         self._set_page_loading(self.video_search_page, False)
         if not self._video_showing_search:
             self.video_empty_lbl.setText(f"No se pudo cargar el feed: {err}")
@@ -2804,9 +3106,11 @@ class MainWindow(QMainWindow):
         else:
             self._load_music_home()
 
-    def _load_music_home(self) -> None:
+    def _load_music_home(self, refresh: bool = False) -> None:
         self._music_showing_search = False
         self._music_home_sections = []
+        self._music_home_loading_more = False
+        self._music_home_exhausted = False
         self._music_search_page_dirty = True
         self.music_view_title.setText("Música")
         if self.music_back_home_btn is not None:
@@ -2819,6 +3123,10 @@ class MainWindow(QMainWindow):
         self._music_rows.clear()
         self._music_tiles.clear()
         self._music_shelves.clear()
+        if refresh:
+            self.thumb_cache.clear()
+            QPixmapCache.clear()
+            trim_process_memory(collect_gc=True)
         self._set_page_loading(self.music_search_page, True)
 
         self._music_home_gen += 1
@@ -2836,6 +3144,7 @@ class MainWindow(QMainWindow):
         if self.music_refresh_btn is not None:
             self.music_refresh_btn.setEnabled(True)
         self._set_page_loading(self.music_search_page, False)
+        self._music_home_loading_more = False
         self._music_home_loaded = True
         self._music_home_sections = list(sections)
         self._music_search_page_dirty = True
@@ -2852,10 +3161,342 @@ class MainWindow(QMainWindow):
             return
         if self.music_refresh_btn is not None:
             self.music_refresh_btn.setEnabled(True)
+        self._music_home_loading_more = False
         self._set_page_loading(self.music_search_page, False)
         if not self._music_showing_search:
             self.music_empty_lbl.setText(f"No se pudo cargar inicio musical: {err}")
             self.music_empty_lbl.setVisible(True)
+
+    def _on_music_scroll_changed(self, value: int) -> None:
+        if (
+            self._music_showing_search
+            or self._music_home_loading_more
+            or self._music_home_exhausted
+            or not self._music_home_loaded
+            or self.stack.currentIndex() != self.PAGE_MUSIC_SEARCH
+            or len(self._music_tiles) >= self.MAX_FEED_ITEMS
+        ):
+            return
+        sb = self.music_scroll.verticalScrollBar()
+        if sb is None or sb.maximum() <= 0:
+            return
+        if value >= int(sb.maximum() * 0.80):
+            self._load_more_music_home()
+
+    def _load_more_music_home(self) -> None:
+        if (
+            self._cleaned_up
+            or self._music_home_loading_more
+            or self._music_home_exhausted
+            or self._music_showing_search
+            or len(self._music_tiles) >= self.MAX_FEED_ITEMS
+        ):
+            return
+        self._music_home_loading_more = True
+        self._set_page_loading(self.music_search_page, True)
+        gen = self._music_home_gen
+        ex_titles = {s.title for s in self._music_home_sections if s.title}
+        ex_ids = {it.video_id for s in self._music_home_sections for it in s.items if it.video_id}
+        local_recent = self.db.list_listen_again(kind="music", limit=12)
+        self._run_async(
+            lambda: self.yt.get_music_home_more_sections(
+                local_recent, exclude_titles=ex_titles, exclude_ids=ex_ids, batch_size=3
+            ),
+            on_done=lambda secs: self._on_music_home_more_done(gen, secs),
+            on_error=lambda _err: self._on_music_home_more_error(gen),
+        )
+
+    def _on_music_home_more_done(self, gen: int, sections: list[FeedSection]) -> None:
+        if gen != self._music_home_gen:
+            return
+        self._music_home_loading_more = False
+        self._set_page_loading(self.music_search_page, False)
+        if not sections:
+            self._music_home_exhausted = True
+            return
+        cur_count = sum(len(s.items) for s in self._music_home_sections)
+        added_secs: list[FeedSection] = []
+        for sec in sections:
+            if cur_count >= self.MAX_FEED_ITEMS:
+                break
+            take = sec.items[: max(0, self.MAX_FEED_ITEMS - cur_count)]
+            if take:
+                trimmed_sec = FeedSection(title=sec.title, items=take)
+                self._music_home_sections.append(trimmed_sec)
+                added_secs.append(trimmed_sec)
+                cur_count += len(take)
+        if not added_secs or cur_count >= self.MAX_FEED_ITEMS:
+            if cur_count >= self.MAX_FEED_ITEMS:
+                self._music_home_exhausted = True
+        if self._music_showing_search or self.stack.currentIndex() != self.PAGE_MUSIC_SEARCH:
+            self._music_search_page_dirty = True
+            return
+        mm_ids = self.db.list_my_music_ids()
+        for sec in added_secs:
+            tiles: list[MusicTileWidget] = []
+            for item in sec.items:
+                tile = self._create_music_tile(item, mm_ids=mm_ids)
+                self._music_tiles.append(tile)
+                tiles.append(tile)
+            shelf = MusicShelfWidget(sec.title, tiles, self.palette)
+            self._music_shelves.append(shelf)
+            self.music_results_lay.insertWidget(self.music_results_lay.count() - 1, shelf)
+
+    def _on_music_home_more_error(self, gen: int) -> None:
+        if gen != self._music_home_gen:
+            return
+        self._music_home_loading_more = False
+        self._set_page_loading(self.music_search_page, False)
+
+    # ------------------------------------------------------------------
+    # Vista de Canal de YouTube (Videos y Directos sin Shorts)
+    # ------------------------------------------------------------------
+
+    def _refresh_channel_tab_pills(self) -> None:
+        if not hasattr(self, "channel_videos_btn"):
+            return
+        for btn, active in (
+            (self.channel_videos_btn, self._channel_tab == "videos"),
+            (self.channel_streams_btn, self._channel_tab == "streams"),
+        ):
+            btn.setProperty("active", "true" if active else "false")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def _on_channel_avatar_ready(self, url: str, pix: QPixmap) -> None:
+        if url and url == self._channel_avatar_url and pix.size() == QSize(40, 40):
+            self.channel_avatar_lbl.setText("")
+            self.channel_avatar_lbl.setPixmap(pix)
+            self.channel_avatar_lbl.setStyleSheet("background-color: transparent; border: none;")
+
+    def _apply_channel_header(self, name: str, avatar_url: str, sub_info: str = "") -> None:
+        self.channel_title_lbl.setText(name or "Canal de YouTube")
+        if sub_info:
+            self.channel_meta_lbl.setText(sub_info)
+            self.channel_meta_lbl.setVisible(True)
+        else:
+            self.channel_meta_lbl.setVisible(False)
+        self._channel_avatar_url = avatar_url or ""
+        if self._channel_avatar_url:
+            pix = self.thumb_cache.get_or_fetch(self._channel_avatar_url, QSize(40, 40), circular=True)
+            if pix is not None and not pix.isNull():
+                self.channel_avatar_lbl.setText("")
+                self.channel_avatar_lbl.setPixmap(pix)
+                self.channel_avatar_lbl.setStyleSheet("background-color: transparent; border: none;")
+                return
+        self.channel_avatar_lbl.clear()
+        self.channel_avatar_lbl.setText((name or "Y").strip()[:1].upper())
+        self.channel_avatar_lbl.setStyleSheet(
+            f"background-color: {self.palette.surface2}; color: {self.palette.text2}; "
+            f"border-radius: 20px; border: 1px solid {self.palette.border}; "
+            "font-size: 16px; font-weight: 700;"
+        )
+
+    def _open_current_video_channel(self) -> None:
+        if self._video_item is not None and self._video_item.kind == "video":
+            self.open_youtube_channel(self._video_item)
+
+    def open_youtube_channel(self, item: MediaItem) -> None:
+        if self._cleaned_up or item.kind != "video":
+            return
+        cur = self.stack.currentIndex()
+        if cur != self.PAGE_CHANNEL:
+            self._channel_return_page = cur
+        self._channel_tab = "videos"
+        self._channel_info = None
+        self._channel_id = item.channel_id.strip()
+        self._channel_items = []
+        self._channel_continuation = None
+        self._channel_loading_more = False
+        self._refresh_channel_tab_pills()
+        self._apply_channel_header(item.author or "Canal de YouTube", item.channel_avatar_url)
+        self._switch_page(self.PAGE_CHANNEL)
+        self._fetch_channel_tab(refresh=False, seed_video_id=item.video_id)
+
+    def _set_channel_tab(self, tab: Literal["videos", "streams"]) -> None:
+        if self._channel_tab == tab:
+            return
+        self._channel_tab = tab
+        self._refresh_channel_tab_pills()
+        self._fetch_channel_tab(refresh=False)
+
+    def _reload_channel_page(self) -> None:
+        self._fetch_channel_tab(refresh=True)
+
+    def _fetch_channel_tab(self, *, refresh: bool, seed_video_id: str = "") -> None:
+        self._channel_gen += 1
+        gen = self._channel_gen
+        self._channel_items = []
+        self._channel_continuation = None
+        self._channel_loading_more = False
+        self._channel_page_dirty = True
+        self.channel_grid.clear_widgets()
+        self._channel_cards.clear()
+        if refresh:
+            self.thumb_cache.clear()
+            QPixmapCache.clear()
+            trim_process_memory(collect_gc=True)
+        self.channel_empty_lbl.setText(
+            "Cargando directos del canal..." if self._channel_tab == "streams" else "Cargando videos del canal..."
+        )
+        self.channel_empty_lbl.setVisible(True)
+        self._set_page_loading(self.channel_page, True)
+
+        cid = self._channel_id
+        tab = self._channel_tab
+        tab_params = None
+        if self._channel_info is not None:
+            tab_params = (
+                self._channel_info.streams_params
+                if tab == "streams"
+                else self._channel_info.videos_params
+            )
+        fb_name = self.channel_title_lbl.text()
+        fb_av = self._channel_avatar_url
+
+        def _worker() -> tuple[ChannelInfo, list[MediaItem], str | None]:
+            resolved_cid = cid
+            if not resolved_cid and seed_video_id:
+                resolved_cid = self.yt.resolve_channel_id_for_video(seed_video_id)
+            if not resolved_cid:
+                raise RuntimeError("No se pudo identificar el canal de este video.")
+            return self.yt.get_channel_page(
+                resolved_cid,
+                tab=tab,
+                limit=24,
+                params=tab_params,
+                fallback_name=fb_name,
+                fallback_avatar=fb_av,
+            )
+
+        self._run_async(
+            _worker,
+            on_done=lambda res: self._on_channel_loaded(gen, res, append=False),
+            on_error=lambda err: self._on_channel_error(gen, err, append=False),
+        )
+
+    def _on_channel_loaded(
+        self,
+        gen: int,
+        res: tuple[ChannelInfo, list[MediaItem], str | None],
+        *,
+        append: bool,
+    ) -> None:
+        if gen != self._channel_gen:
+            return
+        self._set_page_loading(self.channel_page, False)
+        self._channel_loading_more = False
+        info, items, next_tok = res
+        if not append:
+            self._channel_id = info.channel_id
+            self._channel_info = info
+            meta_parts = [x for x in (info.handle, info.subscribers) if x]
+            self._apply_channel_header(info.name, info.avatar_url, " · ".join(meta_parts))
+            self._channel_items = list(items[: self.MAX_FEED_ITEMS])
+            self._channel_continuation = next_tok if len(self._channel_items) < self.MAX_FEED_ITEMS else None
+            self._channel_page_dirty = True
+            if self.stack.currentIndex() == self.PAGE_CHANNEL:
+                empty_msg = (
+                    "Este canal no tiene directos recientes."
+                    if self._channel_tab == "streams"
+                    else "No se encontraron videos en este canal."
+                )
+                self._render_channel_cards(self._channel_items, empty_text=empty_msg)
+            return
+
+        seen = {it.video_id for it in self._channel_items if it.video_id}
+        cap_left = max(0, self.MAX_FEED_ITEMS - len(self._channel_items))
+        new_items = [it for it in items if it.video_id and it.video_id not in seen][:cap_left]
+        self._channel_continuation = next_tok if (new_items and len(self._channel_items) + len(new_items) < self.MAX_FEED_ITEMS) else None
+        if not new_items:
+            return
+        self._channel_items.extend(new_items)
+        if self.stack.currentIndex() != self.PAGE_CHANNEL:
+            self._channel_page_dirty = True
+            return
+        wl_ids = self.db.list_watch_later_ids()
+        new_cards: list[QWidget] = []
+        for it in new_items:
+            card = self._create_video_card(it, wl_ids=wl_ids)
+            self._channel_cards.append(card)
+            new_cards.append(card)
+        hint_w = max(480, self.stack.width() - 52)
+        self.channel_grid.append_widgets(new_cards, hint_width=hint_w)
+        self._channel_viewport_timer.start()
+
+    def _on_channel_error(self, gen: int, err: str, *, append: bool) -> None:
+        if gen != self._channel_gen:
+            return
+        self._set_page_loading(self.channel_page, False)
+        self._channel_loading_more = False
+        if not append:
+            self.channel_empty_lbl.setText(f"No se pudo cargar el canal: {err}")
+            self.channel_empty_lbl.setVisible(True)
+
+    def _render_channel_cards(
+        self, items: list[MediaItem], empty_text: str = "", hint_width: int = 0
+    ) -> None:
+        self.channel_grid.clear_widgets()
+        self._channel_cards.clear()
+        self._channel_page_dirty = False
+        if not items:
+            if empty_text:
+                self.channel_empty_lbl.setText(empty_text)
+            self.channel_empty_lbl.setVisible(True)
+            return
+        self.channel_empty_lbl.setVisible(False)
+        wl_ids = self.db.list_watch_later_ids()
+        cards: list[QWidget] = []
+        for it in items:
+            card = self._create_video_card(it, wl_ids=wl_ids)
+            self._channel_cards.append(card)
+            cards.append(card)
+        hint_w = hint_width if hint_width > 0 else max(480, self.stack.width() - 52)
+        self.channel_grid.set_items_widgets(cards, hint_width=hint_w)
+        self.channel_grid.setProperty("_rendered_hint_w", int(hint_w))
+        self._channel_viewport_timer.start()
+
+    def _on_channel_scroll_changed(self, value: int) -> None:
+        self._channel_viewport_timer.start()
+        if (
+            self._channel_loading_more
+            or not self._channel_continuation
+            or not self._channel_id
+            or self.stack.currentIndex() != self.PAGE_CHANNEL
+            or len(self._channel_items) >= self.MAX_FEED_ITEMS
+        ):
+            return
+        sb = self.channel_scroll.verticalScrollBar()
+        if sb is None or sb.maximum() <= 0:
+            return
+        if value >= int(sb.maximum() * 0.80):
+            self._channel_loading_more = True
+            self._set_page_loading(self.channel_page, True)
+            gen = self._channel_gen
+            cid = self._channel_id
+            tab = self._channel_tab
+            tok = self._channel_continuation
+            fb_name = self.channel_title_lbl.text()
+            fb_av = self._channel_avatar_url
+            rem = min(24, self.MAX_FEED_ITEMS - len(self._channel_items))
+            self._run_async(
+                lambda: self.yt.get_channel_page(
+                    cid,
+                    tab=tab,
+                    continuation=tok,
+                    limit=rem,
+                    fallback_name=fb_name,
+                    fallback_avatar=fb_av,
+                ),
+                on_done=lambda res: self._on_channel_loaded(gen, res, append=True),
+                on_error=lambda err: self._on_channel_error(gen, err, append=True),
+            )
+
+    def _on_channel_back(self) -> None:
+        target = getattr(self, "_channel_return_page", self.PAGE_VIDEO_SEARCH)
+        if not isinstance(target, int) or target < 0 or target >= self.stack.count() or target == self.PAGE_CHANNEL:
+            target = self.PAGE_VIDEO_SEARCH
+        self._switch_page(target)
 
     # ------------------------------------------------------------------
     # Cuenta e ícono superior de perfil
@@ -3206,6 +3847,7 @@ class MainWindow(QMainWindow):
             show_remove=show_remove,
         )
         card.play_requested.connect(self.play_video)
+        card.channel_clicked.connect(self.open_youtube_channel)
         card.watch_later_toggled.connect(self._toggle_watch_later_item)
         card.download_requested.connect(lambda it: self._download_item(it, "video"))
         if show_remove:
@@ -5231,6 +5873,9 @@ class MainWindow(QMainWindow):
         self._cleaned_up = True
         try:
             self._bottom_bar_anim.stop()
+            self._page_fade_anim.stop()
+            self._video_viewport_timer.stop()
+            self._channel_viewport_timer.stop()
             for shimmer in self._page_shimmers:
                 shimmer.stop()
         except Exception:

@@ -19,6 +19,7 @@ from requests.adapters import HTTPAdapter
 
 from swiftplay.models import (
     AccountProfile,
+    ChannelInfo,
     FeedSection,
     MediaItem,
     ResolvedStream,
@@ -179,6 +180,28 @@ def _innertube_web_context() -> dict[str, Any]:
             }
         }
     }
+
+
+def _find_channel_id_in_node(node: Any) -> str:
+    """Extrae el primer browseId de canal YouTube ('UC...') desde cualquier subárbol InnerTube."""
+    if isinstance(node, list):
+        for el in node:
+            found = _find_channel_id_in_node(el)
+            if found:
+                return found
+        return ""
+    if not isinstance(node, dict):
+        return ""
+    be = node.get("browseEndpoint")
+    if isinstance(be, dict):
+        bid = str(be.get("browseId") or "").strip()
+        if bid.startswith("UC"):
+            return bid
+    for v in node.values():
+        found = _find_channel_id_in_node(v)
+        if found:
+            return found
+    return ""
 
 
 def _extract_feed_continuation_token(root: Any) -> str | None:
@@ -354,6 +377,12 @@ def _extract_innertube_videos(
                         .get("sources")
                     )
                     published = _normalize_space(_extract_text(vr.get("publishedTimeText")))
+                    chan_id = (
+                        _find_channel_id_in_node(vr.get("channelThumbnailSupportedRenderers"))
+                        or _find_channel_id_in_node(vr.get("ownerText"))
+                        or _find_channel_id_in_node(vr.get("longBylineText"))
+                        or _find_channel_id_in_node(vr.get("shortBylineText"))
+                    )
                     results.append(
                         MediaItem(
                             video_id=vid,
@@ -366,6 +395,7 @@ def _extract_innertube_videos(
                             is_live=is_live,
                             channel_avatar_url=avatar,
                             published_text=published,
+                            channel_id=chan_id,
                         )
                     )
             return
@@ -469,6 +499,7 @@ def _extract_innertube_videos(
                         .get("sources")
                     )
                     published = _extract_published_from_lockup_rows(rows)
+                    chan_id = _find_channel_id_in_node(meta_vm)
                     results.append(
                         MediaItem(
                             video_id=vid,
@@ -481,6 +512,7 @@ def _extract_innertube_videos(
                             is_live=is_live,
                             channel_avatar_url=avatar,
                             published_text=published,
+                            channel_id=chan_id,
                         )
                     )
             return
@@ -508,7 +540,10 @@ class YouTubeService:
         self._worker = YtdlpWorkerClient()
         self._feed_lock = threading.Lock()
         self._feed_continuation: str | None = None
+        self._feed_used_fallback: bool = False
         self._fallback_seed_idx: int = 0
+        self._music_home_pool: list[FeedSection] = []
+        self._music_guest_seed_idx: int = 0
         self._stream_lock = threading.Lock()
         self._stream_cache: OrderedDict[tuple[str, bool, str], tuple[float, ResolvedStream]] = OrderedDict()
         self._inflight_streams: dict[
@@ -547,9 +582,11 @@ class YouTubeService:
             self._stream_cache.clear()
         with self._feed_lock:
             self._feed_continuation = None
+            self._feed_used_fallback = False
         with self._ytm_lock:
             self._ytmusic = None
             self._ytmusic_search = None
+            self._music_home_pool.clear()
 
     def reload_auth(self) -> None:
         """Recarga estado de autenticación DPAPI y limpia cachés sin instanciar YTMusic hasta usarse."""
@@ -560,6 +597,10 @@ class YouTubeService:
             self._stream_cache.clear()
         with self._feed_lock:
             self._feed_continuation = None
+            self._feed_used_fallback = False
+        with self._ytm_lock:
+            self._music_home_pool.clear()
+            self._music_guest_seed_idx = 0
         self._worker.reset_for_auth()
 
         raw = load_cookies_decrypted()
@@ -692,14 +733,25 @@ class YouTubeService:
     # Feeds de Inicio (Video sin Shorts & Música en 2-3 secciones)
     # ------------------------------------------------------------------
 
+    @property
+    def has_more_video_feed(self) -> bool:
+        with self._feed_lock:
+            return bool(self._feed_continuation or self._feed_used_fallback)
+
     def _fetch_browse_page(
-        self, headers: dict[str, str], continuation: str | None = None
+        self,
+        headers: dict[str, str],
+        continuation: str | None = None,
+        browse_id: str = "FEwhat_to_watch",
+        params: str | None = None,
     ) -> dict[str, Any] | None:
         payload = _innertube_web_context()
         if continuation:
             payload["continuation"] = continuation
         else:
-            payload["browseId"] = "FEwhat_to_watch"
+            payload["browseId"] = browse_id
+            if params:
+                payload["params"] = params
         try:
             with self._get_session().post(
                 "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false",
@@ -721,8 +773,9 @@ class YouTubeService:
         watched_ids: set[str] | None = None,
         recent_shown_ids: set[str] | None = None,
         refresh: bool = False,
+        append: bool = False,
     ) -> list[MediaItem]:
-        """Feed de YouTube sin Shorts, paginado, sin videos ya vistos y renovado al refrescar."""
+        """Feed de YouTube sin Shorts, paginado incrementalmente y renovado al refrescar."""
         headers = _build_innertube_headers("https://www.youtube.com")
         hard_skip = {str(x) for x in (watched_ids or ()) if x}
         soft_skip = {str(x) for x in (recent_shown_ids or ()) if x}
@@ -730,33 +783,29 @@ class YouTubeService:
         seen_ids: set[str] = set()
 
         with self._feed_lock:
-            token = self._feed_continuation if refresh else None
-        latest_token: str | None = None
+            token = self._feed_continuation if (refresh or append) else None
+            used_fallback = self._feed_used_fallback
 
-        for page_idx in range(4):
-            if len(collected) >= limit:
-                break
-            used_token = token
-            data = self._fetch_browse_page(headers, continuation=used_token)
-            if data is None and used_token is not None and page_idx == 0:
-                token = None
-                data = self._fetch_browse_page(headers, continuation=None)
-                used_token = None
-            if data is None:
-                break
+        if append and not token and not used_fallback:
+            return []
 
-            batch = _extract_innertube_videos(
-                data,
-                limit=limit - len(collected),
-                block_shorts=True,
-                exclude_ids=hard_skip | soft_skip | seen_ids,
-                exclude_watched=True,
-            )
-            if not batch and used_token is not None and page_idx == 0:
-                # Si el token de continuación ya se agotó, reintentar feed inicial fresco
-                data = self._fetch_browse_page(headers, continuation=None)
+        if not (append and used_fallback):
+            latest_token: str | None = None
+            max_pages = 2 if append else 4
+            for page_idx in range(max_pages):
+                if len(collected) >= limit:
+                    break
+                used_token = token
+                if append and not used_token:
+                    break
+                data = self._fetch_browse_page(headers, continuation=used_token)
+                if data is None and used_token is not None and page_idx == 0 and not append:
+                    token = None
+                    data = self._fetch_browse_page(headers, continuation=None)
+                    used_token = None
                 if data is None:
                     break
+
                 batch = _extract_innertube_videos(
                     data,
                     limit=limit - len(collected),
@@ -764,42 +813,59 @@ class YouTubeService:
                     exclude_ids=hard_skip | soft_skip | seen_ids,
                     exclude_watched=True,
                 )
+                if not batch and used_token is not None and page_idx == 0 and not append:
+                    data = self._fetch_browse_page(headers, continuation=None)
+                    if data is None:
+                        break
+                    batch = _extract_innertube_videos(
+                        data,
+                        limit=limit - len(collected),
+                        block_shorts=True,
+                        exclude_ids=hard_skip | soft_skip | seen_ids,
+                        exclude_watched=True,
+                    )
 
-            for item in batch:
-                if item.video_id and item.video_id not in seen_ids:
-                    seen_ids.add(item.video_id)
-                    collected.append(item)
-
-            next_tok = _extract_feed_continuation_token(data)
-            if next_tok:
-                latest_token = next_tok
-            token = next_tok
-            if not token:
-                break
-
-        if len(collected) < min(8, limit) and soft_skip:
-            fresh_data = self._fetch_browse_page(headers, continuation=None)
-            if fresh_data is not None:
-                extra = _extract_innertube_videos(
-                    fresh_data,
-                    limit=limit - len(collected),
-                    block_shorts=True,
-                    exclude_ids=hard_skip | seen_ids,
-                    exclude_watched=True,
-                )
-                for item in extra:
+                for item in batch:
                     if item.video_id and item.video_id not in seen_ids:
                         seen_ids.add(item.video_id)
                         collected.append(item)
-                if not latest_token:
-                    latest_token = _extract_feed_continuation_token(fresh_data)
 
-        if latest_token is not None:
+                next_tok = _extract_feed_continuation_token(data)
+                if next_tok:
+                    latest_token = next_tok
+                token = next_tok
+                if not token:
+                    break
+
+            if not append and len(collected) < min(8, limit) and soft_skip:
+                fresh_data = self._fetch_browse_page(headers, continuation=None)
+                if fresh_data is not None:
+                    extra = _extract_innertube_videos(
+                        fresh_data,
+                        limit=limit - len(collected),
+                        block_shorts=True,
+                        exclude_ids=hard_skip | seen_ids,
+                        exclude_watched=True,
+                    )
+                    for item in extra:
+                        if item.video_id and item.video_id not in seen_ids:
+                            seen_ids.add(item.video_id)
+                            collected.append(item)
+                    if not latest_token:
+                        latest_token = _extract_feed_continuation_token(fresh_data)
+
             with self._feed_lock:
-                self._feed_continuation = latest_token
+                if append:
+                    self._feed_continuation = token
+                elif latest_token is not None:
+                    self._feed_continuation = latest_token
+                if collected:
+                    self._feed_used_fallback = False
 
-        if collected:
-            return collected[:limit]
+            if collected:
+                return collected[:limit]
+            if append and token is None:
+                return []
 
         # Respaldo liviano si no hay sesión o FEwhat_to_watch vino vacío
         defaults = [
@@ -807,24 +873,27 @@ class YouTubeService:
             "programacion ia desarrollo",
             "conciertos musica en vivo",
             "naturaleza historia 4k",
+            "astronomia espacio documental",
+            "arquitectura ingenieria moderna",
         ]
         pool = [q.strip() for q in (fallback_queries or []) if q and q.strip()]
         for d in defaults:
             if d not in pool:
                 pool.append(d)
         with self._feed_lock:
-            if refresh:
+            if refresh or append:
                 self._fallback_seed_idx = (self._fallback_seed_idx + 1) % len(pool)
             seed = pool[self._fallback_seed_idx % len(pool)]
+            self._feed_used_fallback = True
         raw_items = self.search_videos(
-            seed, limit=min(50, limit + len(hard_skip) + 6), block_shorts=True
+            seed, limit=min(50, limit + len(hard_skip) + 8), block_shorts=True
         )
         fresh_items = [
             it
             for it in raw_items
             if it.video_id not in hard_skip and it.video_id not in soft_skip
         ]
-        if len(fresh_items) < min(8, limit):
+        if not append and len(fresh_items) < min(8, limit):
             fresh_ids = {it.video_id for it in fresh_items}
             fresh_items.extend(
                 it
@@ -836,14 +905,15 @@ class YouTubeService:
     def get_music_home_sections(
         self, local_listen_again: list[MediaItem]
     ) -> list[FeedSection]:
-        """Obtiene 2-3 secciones livianas para YT Music ('Volver a escuchar', etc.)."""
+        """Obtiene 2-3 secciones livianas iniciales para YT Music y guarda el resto en pool para scroll."""
         sections: list[FeedSection] = []
+        pool_sections: list[FeedSection] = []
 
         if self._ytmusic_authenticated:
             ytm = self._get_ytmusic()
             if self._ytmusic_authenticated:
                 try:
-                    home = ytm.get_home(limit=5)
+                    home = ytm.get_home(limit=12)
                     for shelf in home or []:
                         if not isinstance(shelf, dict):
                             continue
@@ -851,9 +921,10 @@ class YouTubeService:
                         contents = shelf.get("contents") or []
                         tracks = self._parse_ytm_items(contents, limit=12)
                         if title and tracks:
-                            sections.append(FeedSection(title=title, items=tracks))
-                        if len(sections) >= 3:
-                            break
+                            sec = FeedSection(title=title, items=tracks)
+                            pool_sections.append(sec)
+                            if len(sections) < 3:
+                                sections.append(sec)
                 except Exception:
                     pass
 
@@ -867,12 +938,16 @@ class YouTubeService:
                         hist = ytm.get_history()
                         hist_tracks = self._parse_ytm_items(hist or [], limit=12)
                         if hist_tracks:
-                            sections.insert(
-                                0, FeedSection(title="Volver a escuchar", items=hist_tracks)
-                            )
+                            la_sec = FeedSection(title="Volver a escuchar", items=hist_tracks)
+                            sections.insert(0, la_sec)
                             sections = sections[:3]
+                            pool_sections.insert(0, la_sec)
                     except Exception:
                         pass
+
+        with self._ytm_lock:
+            self._music_home_pool = pool_sections
+            self._music_guest_seed_idx = 0
 
         if not sections:
             if local_listen_again:
@@ -927,6 +1002,230 @@ class YouTubeService:
                     pass
 
         return sections[:3]
+
+    def get_music_home_more_sections(
+        self,
+        local_listen_again: list[MediaItem],
+        *,
+        exclude_titles: set[str] | None = None,
+        exclude_ids: set[str] | None = None,
+        batch_size: int = 3,
+    ) -> list[FeedSection]:
+        """Carga más estanterías de YT Music al hacer scroll infinito sin sobrecargar el arranque."""
+        seen_titles = {str(t).strip().lower() for t in (exclude_titles or ()) if t}
+        seen_ids = {str(x).strip() for x in (exclude_ids or ()) if x}
+        out: list[FeedSection] = []
+
+        with self._ytm_lock:
+            pool_copy = list(self._music_home_pool)
+
+        for sec in pool_copy:
+            if len(out) >= batch_size:
+                break
+            tkey = sec.title.strip().lower()
+            if tkey in seen_titles:
+                continue
+            unique_items = [it for it in sec.items if it.video_id and it.video_id not in seen_ids]
+            if unique_items:
+                seen_titles.add(tkey)
+                for it in unique_items:
+                    seen_ids.add(it.video_id)
+                out.append(FeedSection(title=sec.title, items=unique_items[:12]))
+
+        if out:
+            return out
+
+        guest_themes: list[tuple[str, str]] = [
+            ("Ritmos electrónicos", "electronic synthwave chill"),
+            ("Rock y Alternativo", "indie alternative rock hits"),
+            ("Concentración y Jazz", "jazz instrumental study music"),
+            ("Clásicos del recuerdo", "classic greatest hits"),
+            ("Pop y Urbano", "latin urban pop music"),
+            ("Bandas sonoras", "epic soundtrack orchestral"),
+        ]
+        # Primero probar con semillas locales recientes si quedan
+        for local_it in local_listen_again[2:]:
+            if len(out) >= batch_size:
+                break
+            title_cand = f"Similar a {local_it.title[:28]}"
+            if title_cand.lower() in seen_titles:
+                continue
+            try:
+                recs = self.get_music_radio_queue(
+                    local_it.video_id, limit=14, exclude_ids=seen_ids
+                )
+            except Exception:
+                recs = []
+            if recs:
+                seen_titles.add(title_cand.lower())
+                for it in recs:
+                    seen_ids.add(it.video_id)
+                out.append(FeedSection(title=title_cand, items=recs[:12]))
+
+        while len(out) < batch_size:
+            with self._ytm_lock:
+                idx = self._music_guest_seed_idx
+                if idx >= len(guest_themes):
+                    break
+                self._music_guest_seed_idx = idx + 1
+            sec_title, query = guest_themes[idx]
+            if sec_title.lower() in seen_titles:
+                continue
+            try:
+                found = [
+                    it
+                    for it in self.search_music(query, limit=16)
+                    if it.video_id and it.video_id not in seen_ids
+                ]
+            except Exception:
+                found = []
+            if found:
+                seen_titles.add(sec_title.lower())
+                for it in found:
+                    seen_ids.add(it.video_id)
+                out.append(FeedSection(title=sec_title, items=found[:12]))
+
+        return out[:batch_size]
+
+    def resolve_channel_id_for_video(self, video_id: str) -> str:
+        """Resuelve el ID UC... de canal a partir de un videoId cuando no está cacheado."""
+        vid = str(video_id or "").strip()
+        if not vid:
+            return ""
+        headers = _build_innertube_headers("https://www.youtube.com")
+        payload = _innertube_web_context()
+        payload["videoId"] = vid
+        try:
+            with self._get_session().post(
+                "https://www.youtube.com/youtubei/v1/next?prettyPrint=false",
+                headers=headers,
+                json=payload,
+                timeout=8,
+            ) as resp:
+                if resp.ok:
+                    data = resp.json()
+                    return _find_channel_id_in_node(data)
+        except Exception:
+            pass
+        return ""
+
+    def get_channel_page(
+        self,
+        channel_id: str,
+        tab: Literal["videos", "streams"] = "videos",
+        continuation: str | None = None,
+        limit: int = 24,
+        params: str | None = None,
+        fallback_name: str = "",
+        fallback_avatar: str = "",
+    ) -> tuple[ChannelInfo, list[MediaItem], str | None]:
+        """Obtiene cabecera y lista de Videos o Directos (sin Shorts) de un canal YouTube."""
+        cid = str(channel_id or "").strip()
+        default_params = (
+            "EgdzdHJlYW1z8gYECgJ6AA==" if tab == "streams" else "EgZ2aWRlb3PyBgQKAjoA"
+        )
+        headers = _build_innertube_headers("https://www.youtube.com")
+        data = self._fetch_browse_page(
+            headers,
+            continuation=continuation,
+            browse_id=cid,
+            params=None if continuation else (params or default_params),
+        )
+        if data is None:
+            raise RuntimeError("No se pudo cargar la información del canal.")
+
+        name = fallback_name.strip()
+        handle = ""
+        subscribers = ""
+        avatar_url = fallback_avatar.strip()
+        videos_params = "EgZ2aWRlb3PyBgQKAjoA"
+        streams_params = "EgdzdHJlYW1z8gYECgJ6AA=="
+
+        if not continuation:
+            hdr = data.get("header") or {}
+            ph = (
+                hdr.get("pageHeaderRenderer", {})
+                .get("content", {})
+                .get("pageHeaderViewModel", {})
+            )
+            if isinstance(ph, dict) and ph:
+                name = _extract_text(ph.get("title")) or name
+                rows = (
+                    ph.get("metadata", {})
+                    .get("contentMetadataViewModel", {})
+                    .get("metadataRows")
+                    or []
+                )
+                for row in rows:
+                    for part in (row.get("metadataParts") or []) if isinstance(row, dict) else ():
+                        txt = _normalize_space(_extract_text((part or {}).get("text")))
+                        if not txt:
+                            continue
+                        if txt.startswith("@") and not handle:
+                            handle = txt
+                        elif "suscriptor" in txt.lower() or "subscriber" in txt.lower():
+                            subscribers = txt
+                av_sources = (
+                    ph.get("image", {})
+                    .get("decoratedAvatarViewModel", {})
+                    .get("avatar", {})
+                    .get("avatarViewModel", {})
+                    .get("image", {})
+                    .get("sources")
+                )
+                found_av = _pick_best_thumb(av_sources)
+                if found_av:
+                    avatar_url = found_av
+
+            meta_renderer = (data.get("metadata") or {}).get("channelMetadataRenderer", {})
+            if isinstance(meta_renderer, dict):
+                if not name:
+                    name = str(meta_renderer.get("title") or "").strip()
+                if not avatar_url:
+                    avatar_url = _pick_best_thumb(
+                        (meta_renderer.get("avatar") or {}).get("thumbnails")
+                    )
+
+            tabs = (
+                data.get("contents", {})
+                .get("twoColumnBrowseResultsRenderer", {})
+                .get("tabs")
+                or []
+            )
+            for t in tabs:
+                tr = (t or {}).get("tabRenderer") if isinstance(t, dict) else None
+                if not isinstance(tr, dict):
+                    continue
+                be = (tr.get("endpoint") or {}).get("browseEndpoint") or {}
+                t_params = str(be.get("params") or "").strip()
+                if not t_params:
+                    continue
+                t_title = str(tr.get("title") or "").strip().lower()
+                if any(k in t_title for k in ("vídeo", "video")):
+                    videos_params = t_params
+                elif any(k in t_title for k in ("directo", "live", "en vivo")):
+                    streams_params = t_params
+
+        items = _extract_innertube_videos(data, limit=limit, block_shorts=True)
+        for it in items:
+            if cid and not it.channel_id:
+                it.channel_id = cid
+            if name and (not it.author or it.author == "YouTube"):
+                it.author = name
+            if avatar_url and not it.channel_avatar_url:
+                it.channel_avatar_url = avatar_url
+
+        next_tok = _extract_feed_continuation_token(data)
+        info = ChannelInfo(
+            channel_id=cid,
+            name=name or cid,
+            handle=handle,
+            subscribers=subscribers,
+            avatar_url=avatar_url,
+            videos_params=videos_params,
+            streams_params=streams_params,
+        )
+        return info, items, next_tok
 
     def _parse_ytm_items(self, raw_items: list[dict], limit: int = 8) -> list[MediaItem]:
         tracks: list[MediaItem] = []

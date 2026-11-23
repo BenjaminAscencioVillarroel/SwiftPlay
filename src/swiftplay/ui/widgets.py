@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import (
     QEasingCurve,
+    QEvent,
     QPoint,
     QPropertyAnimation,
     QRect,
@@ -756,6 +757,49 @@ class ResponsiveGridWidget(QWidget):
             self._in_batch_layout = False
             self.setUpdatesEnabled(True)
 
+    def append_widgets(
+        self, widgets: list[QWidget], hint_width: int = 0
+    ) -> None:
+        if not widgets:
+            return
+        if not self._widgets:
+            self.set_items_widgets(widgets, hint_width=hint_width)
+            return
+        self._in_batch_layout = True
+        self.setUpdatesEnabled(False)
+        try:
+            start_idx = len(self._widgets)
+            cols = self._last_cols if self._last_cols > 0 else 1
+            m = self._grid.contentsMargins()
+            ref_w = max(self.width(), int(hint_width or 0))
+            avail_w = max(ref_w, self._min_col_width + m.left() + m.right())
+            inner_w = max(180, avail_w - m.left() - m.right() - 2)
+            calc_cols = max(
+                1,
+                min(
+                    self._max_cols,
+                    (inner_w + self._spacing) // (self._min_col_width + self._spacing),
+                ),
+            )
+            if calc_cols != cols:
+                self._widgets.extend(widgets)
+                self.relayout(force_regrid=True, hint_width=hint_width)
+            else:
+                col_w = max(160, (inner_w - self._spacing * (cols - 1)) // cols)
+                for offset, w in enumerate(widgets):
+                    set_w = getattr(w, "set_tile_width", None)
+                    if callable(set_w):
+                        set_w(col_w)
+                    self._widgets.append(w)
+                    r, c = divmod(start_idx + offset, cols)
+                    self._grid.addWidget(w, r, c, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            self._grid.activate()
+            self.adjustSize()
+            self.updateGeometry()
+        finally:
+            self._in_batch_layout = False
+            self.setUpdatesEnabled(True)
+
     def relayout(self, force_regrid: bool = False, hint_width: int = 0) -> None:
         if not self._widgets:
             return
@@ -802,6 +846,7 @@ class VideoGridCard(QFrame):
     """Elemento de video en grilla estilo YouTube (sin borde ni fondo de card)."""
 
     play_requested = Signal(object)       # MediaItem
+    channel_clicked = Signal(object)      # MediaItem
     watch_later_toggled = Signal(object)  # MediaItem
     download_requested = Signal(object)   # MediaItem
     remove_requested = Signal(object)     # MediaItem
@@ -832,6 +877,7 @@ class VideoGridCard(QFrame):
         self._thumb_done = False
         self._avatar_done = not bool(self._avatar_url)
         self._thumb_connected = False
+        self._offscreen_unloaded = False
         self._card_hovered = False
         self._has_resume = item.resume_pos >= 3.0
         self.setObjectName("YtVideoTile")
@@ -907,6 +953,15 @@ class VideoGridCard(QFrame):
         self.update_theme(palette)
         self.set_watch_later(in_watch_later)
 
+        if self.item.kind == "video" and (self.item.channel_id or self.item.video_id):
+            self.avatar_label.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.author_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            tip_ch = f"Ver canal: {item.author or 'YouTube'}"
+            self.avatar_label.setToolTip(tip_ch)
+            self.author_lbl.setToolTip(tip_ch)
+            self.avatar_label.installEventFilter(self)
+            self.author_lbl.installEventFilter(self)
+
         cached = thumb_cache.get_or_fetch(self._thumb_url, self.THUMB_FETCH_SIZE)
         if cached is not None:
             self.thumb_widget.set_pixmap(cached)
@@ -939,6 +994,25 @@ class VideoGridCard(QFrame):
         self.thumb_widget.clear()
         self.avatar_label.clear()
 
+    def set_offscreen_unloaded(self, unloaded: bool) -> None:
+        want = bool(unloaded)
+        if want == self._offscreen_unloaded:
+            return
+        self._offscreen_unloaded = want
+        if want:
+            self._disconnect_thumb_cache()
+            self.thumb_widget.clear()
+            self._thumb_done = False
+            return
+        if self._thumb_url:
+            cached = self._thumb_cache.get_or_fetch(self._thumb_url, self.THUMB_FETCH_SIZE)
+            if cached is not None:
+                self.thumb_widget.set_pixmap(cached)
+                self._thumb_done = True
+            elif not self._thumb_connected:
+                self._thumb_cache.ready.connect(self._on_thumb_ready)
+                self._thumb_connected = True
+
     def set_tile_width(self, width: int) -> None:
         w = max(160, int(width))
         h = max(90, int(round(w * 9 / 16)))
@@ -965,6 +1039,9 @@ class VideoGridCard(QFrame):
                 act_fav = menu.addAction(fav_label)
                 act_fav.triggered.connect(lambda: self.watch_later_toggled.emit(self.item))
             else:
+                if self.item.kind == "video" and (self.item.channel_id or self.item.video_id):
+                    act_ch = menu.addAction("Ir al canal")
+                    act_ch.triggered.connect(lambda: self.channel_clicked.emit(self.item))
                 wl_label = (
                     "Quitar de Ver más tarde"
                     if self._in_watch_later
@@ -1041,6 +1118,24 @@ class VideoGridCard(QFrame):
         if self.item.kind != "twitch":
             self.hover_left.emit(self.item)
         super().leaveEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        try:
+            etype = event.type()
+        except RuntimeError:
+            return False
+        if (
+            self.item.kind == "video"
+            and (obj is self.avatar_label or obj is self.author_lbl)
+        ):
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self.channel_clicked.emit(self.item)
+                return True
+            if etype == QEvent.Type.Enter and obj is self.author_lbl:
+                self.author_lbl.setStyleSheet(f"color: {self._palette.text};")
+            elif etype == QEvent.Type.Leave and obj is self.author_lbl:
+                self.author_lbl.setStyleSheet("")
+        return super().eventFilter(obj, event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
