@@ -425,6 +425,48 @@ def get_process_memory_mb() -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def get_pid_memory_mb(pid: int) -> tuple[float, float]:
+    """Devuelve (WorkingSetSize_MB, PrivateUsage_MB) para cualquier PID activo en Windows."""
+    if sys.platform != "win32" or not pid or int(pid) <= 0:
+        return 0.0, 0.0
+    h_proc = None
+    kernel32 = ctypes.windll.kernel32
+    try:
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        h_proc = kernel32.OpenProcess(0x1000, False, wintypes.DWORD(int(pid)))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h_proc:
+            return 0.0, 0.0
+        fn = getattr(kernel32, "K32GetProcessMemoryInfo", None)
+        if fn is None:
+            fn = ctypes.windll.psapi.GetProcessMemoryInfo
+        fn.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_PROCESS_MEMORY_COUNTERS_EX),
+            wintypes.DWORD,
+        ]
+        fn.restype = wintypes.BOOL
+
+        counters = _PROCESS_MEMORY_COUNTERS_EX()
+        counters.cb = ctypes.sizeof(counters)
+        if fn(h_proc, ctypes.byref(counters), counters.cb):
+            return (
+                counters.WorkingSetSize / (1024 * 1024),
+                counters.PrivateUsage / (1024 * 1024),
+            )
+    except Exception:
+        pass
+    finally:
+        if h_proc:
+            try:
+                kernel32.CloseHandle(h_proc)
+            except Exception:
+                pass
+    return 0.0, 0.0
+
+
 def get_process_ram_mb() -> float:
     """Devuelve el WorkingSetSize actual del proceso en MB."""
     return get_process_memory_mb()[0]

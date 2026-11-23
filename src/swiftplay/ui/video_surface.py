@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes
 import sys
 
 from PySide6.QtCore import QEvent, QSize, Qt, Signal
@@ -66,26 +67,40 @@ class VideoSurface(QWidget):
     def force_native_redraw(self) -> None:
         if not self.isVisible() or self.width() <= 4 or self.height() <= 4:
             return
-        w, h = self.width(), self.height()
         if sys.platform == "win32":
             try:
                 user32 = ctypes.windll.user32
                 hwnd = int(self.winId())
-                lparam = ((h & 0xFFFF) << 16) | (w & 0xFFFF)
-                # SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
-                user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0037)
-                user32.PostMessageW(hwnd, 0x0005, 0, lparam)  # WM_SIZE
+                rect = ctypes.wintypes.RECT()
+                if user32.GetClientRect(hwnd, ctypes.byref(rect)):
+                    phys_w = int(rect.right - rect.left)
+                    phys_h = int(rect.bottom - rect.top)
+                else:
+                    phys_w = 0
+                    phys_h = 0
+                if phys_w <= 4 or phys_h <= 4:
+                    dpr = max(1.0, float(self.devicePixelRatioF()))
+                    phys_w = round(self.width() * dpr)
+                    phys_h = round(self.height() * dpr)
+                lparam = ((phys_h & 0xFFFF) << 16) | (phys_w & 0xFFFF)
                 child = user32.FindWindowExW(hwnd, 0, None, None)
                 if child:
-                    user32.SetWindowPos(child, 0, 0, 0, w, h, 0x0014)
-                    user32.PostMessageW(child, 0x0005, 0, lparam)
+                    if not user32.IsWindowVisible(child):
+                        user32.ShowWindow(child, 8)  # SW_SHOWNA
+                    crect = ctypes.wintypes.RECT()
+                    cur_cw = -1
+                    cur_ch = -1
+                    if user32.GetClientRect(child, ctypes.byref(crect)):
+                        cur_cw = int(crect.right - crect.left)
+                        cur_ch = int(crect.bottom - crect.top)
+                    if cur_cw != phys_w or cur_ch != phys_h:
+                        # SWP_NOZORDER | SWP_NOACTIVATE
+                        user32.SetWindowPos(child, 0, 0, 0, phys_w, phys_h, 0x0014)
+                        user32.PostMessageW(child, 0x0005, 0, lparam)  # WM_SIZE
                 # RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN
                 user32.RedrawWindow(hwnd, None, None, 0x0181)
             except Exception:
                 pass
-        self.resize(max(2, w - 1), h)
-        self.resize(w, h)
-        self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:

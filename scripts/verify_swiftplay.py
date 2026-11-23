@@ -221,10 +221,14 @@ def test_storage_config_themes() -> None:
                 "timestamp": "21:10",
                 "date_label": "Hoy",
             },
-            peer_name="Carlos",
+            peer_name="",
         )
+        # Simular upsert con fallback numérico o edición del propio bot: jamás debe pisar 'Carlos'
+        db.upsert_discord_dm_thread("u99", "u99", "", "editado", touch_timestamp=False)
         threads = db.list_discord_dm_threads()
-        assert len(threads) == 1 and threads[0]["user_name"] == "Carlos"
+        assert len(threads) == 1 and threads[0]["user_name"] == "Carlos", (
+            f"Un ID fallback nunca debe sobrescribir el nombre real guardado: {threads}"
+        )
         saved_dms = db.list_discord_dm_messages("u99")
         assert len(saved_dms) == 1 and saved_dms[0]["content"] == "Que tal?"
         db.remove_discord_dm_thread("u99")
@@ -702,6 +706,27 @@ def test_gui_and_libmpv_smoke(
             app.processEvents()
             time.sleep(0.03)
         assert win.video_player.get_property("pause") is True, "Clic simple debe pausar el video"
+
+        # Verificar recuperación real de VO D3D11 en libmpv + rotación Tab sin efecto fade huérfano
+        assert hasattr(win.video_player, "vo_error_detected")
+        win.video_player._vo_needs_reinit = True
+        win.video_player._started_hidden = True
+        win.video_player._last_vo_reinit_ts = 0.0
+        reinit_ok = win.video_player.refresh_video_output()
+        assert reinit_ok is True and not win.video_player._vo_needs_reinit and not win.video_player._started_hidden, (
+            "refresh_video_output() debe reconstruir el VO tras _vo_needs_reinit/_started_hidden"
+        )
+        app.processEvents()
+        vs_before = win.video_panel.video_surface.size()
+        win.video_panel.video_surface.force_native_redraw()
+        assert win.video_panel.video_surface.size() == vs_before, (
+            "force_native_redraw no debe mutar el tamaño lógico Qt del VideoSurface"
+        )
+        win._switch_page(MainWindow.PAGE_DISCORD)
+        app.processEvents()
+        win._switch_page(MainWindow.PAGE_VIDEO_PLAYER)
+        app.processEvents()
+        assert win._page_fade_target is None, "Entrar a PAGE_VIDEO_PLAYER debe cancelar cualquier fade previo"
 
         # Verificar unload de libmpv en reposo y reciclaje automático de instancia
         win.player._streams_played = win.player._recycle_after
@@ -1332,6 +1357,119 @@ def test_gui_and_libmpv_smoke(
                 app.processEvents()
                 assert not dp.voice_pane.isHidden() and dp.chat_pane.isHidden(), (
                     "Al pulsar el canal de voz conectado desde Chat debe cambiar al panel de Voz"
+                )
+
+                # Verificar UI de compartida de pantalla (sin inicializar libmpv hasta abrir visor)
+                assert dp._screen_player is None, "El reproductor de pantalla debe ser lazy"
+                assert dp.remote_share_banner.isHidden() and dp.screen_viewer_card.isHidden()
+                dp._on_remote_screen_share_detected(
+                    {
+                        "guild_id": "10",
+                        "channel_id": "201",
+                        "channel_name": "bots",
+                        "message_id": "999",
+                        "author_name": "Socio",
+                        "watch_url": "https://demo-stream.trycloudflare.com/watch?t=abc_123",
+                        "stream_url": "https://demo-stream.trycloudflare.com/stream.mp4?t=abc_123",
+                        "is_self": False,
+                    }
+                )
+                app.processEvents()
+                assert not dp.remote_share_banner.isHidden(), "Banner remoto debe mostrarse al detectar link"
+                dp._on_remote_screen_share_ended({"message_id": "999"})
+                app.processEvents()
+                assert dp.remote_share_banner.isHidden(), "Banner remoto debe ocultarse al finalizar"
+
+                # Autocuración de hilo DM cuyo user_name había quedado con el ID numérico
+                dm_num_id = "999999999999999099"
+                try:
+                    dp._upsert_dm_thread_local(dm_num_id, dm_num_id, "", "hola")
+                    dp._on_guild_members_updated(
+                        {
+                            "guild_id": "10",
+                            "online_count": 1,
+                            "members": [
+                                {
+                                    "id": dm_num_id,
+                                    "name": "AmigoReal",
+                                    "status": "online",
+                                    "is_bot": False,
+                                    "avatar_url": "",
+                                }
+                            ],
+                        }
+                    )
+                    app.processEvents()
+                    healed_threads = dp._load_dm_threads()
+                    healed_row = next((t for t in healed_threads if t["user_id"] == dm_num_id), None)
+                    assert healed_row is not None and healed_row["user_name"] == "AmigoReal", (
+                        f"El hilo DM con ID numérico debe autocurarse al recibir miembros: {healed_row}"
+                    )
+                    assert dm_num_id in dp._dm_buttons and dp._dm_buttons[dm_num_id].text().strip() == "@ AmigoReal", (
+                        f"Botón lateral DM debe mostrar '@ AmigoReal': {dp._dm_buttons.get(dm_num_id)}"
+                    )
+                finally:
+                    dp._remove_dm_thread_local(dm_num_id)
+
+                # Verificar diálogo de compartida: Discord desactivado por defecto + canales y DMs
+                from swiftplay.ui.discord_panel import _ScreenShareSetupDialog
+                ss_dlg = _ScreenShareSetupDialog(
+                    dp.screen_share_svc,
+                    dp.palette,
+                    [("201", "bots")],
+                    dm_targets=[("777", "Compa")],
+                    default_target=("dm", "777"),
+                    parent=win,
+                )
+                try:
+                    assert ss_dlg.announce_check.isChecked() is False, (
+                        "Envío por Discord debe iniciar desactivado por defecto"
+                    )
+                    assert ss_dlg.targets_list.count() == 2
+                    for idx in range(ss_dlg.targets_list.count()):
+                        assert ss_dlg.targets_list.item(idx).checkState() == Qt.CheckState.Unchecked, (
+                            "Todos los canales y DMs deben iniciar desmarcados por defecto"
+                        )
+                    assert ss_dlg.selected_options()["targets"] == []
+                    ss_dlg.announce_check.setChecked(True)
+                    ss_dlg.targets_list.item(0).setCheckState(Qt.CheckState.Checked)
+                    ss_dlg.targets_list.item(1).setCheckState(Qt.CheckState.Checked)
+                    sel_targets = ss_dlg.selected_options()["targets"]
+                    assert ("channel", "201") in sel_targets and ("dm", "777") in sel_targets, (
+                        f"Debe permitir canales y DMs juntos: {sel_targets}"
+                    )
+                finally:
+                    ss_dlg.deleteLater()
+
+                # Verificar diálogo en vivo (preselecciona calidad/FPS/audio sin marcar destinos Discord)
+                ss_live_dlg = _ScreenShareSetupDialog(
+                    dp.screen_share_svc,
+                    dp.palette,
+                    [("201", "bots")],
+                    dm_targets=[("777", "Compa")],
+                    is_live_edit=True,
+                    current_quality="1080p",
+                    current_fps=60,
+                    current_include_audio=False,
+                    parent=win,
+                )
+                try:
+                    assert ss_live_dlg.quality_combo.currentData() == "1080p"
+                    assert ss_live_dlg.fps_combo.currentData() == 60
+                    assert ss_live_dlg.audio_check.isChecked() is False
+                    assert ss_live_dlg.announce_check.isChecked() is False
+                    for idx in range(ss_live_dlg.targets_list.count()):
+                        assert ss_live_dlg.targets_list.item(idx).checkState() == Qt.CheckState.Unchecked
+                finally:
+                    ss_live_dlg.deleteLater()
+
+                # Verificar cierre automático de vista previa local al detener compartida
+                dp._screen_viewer_active = True
+                dp._screen_viewer_is_local_preview = True
+                dp.screen_viewer_card.setVisible(True)
+                dp._on_screen_share_state_changed("idle", {})
+                assert dp._screen_viewer_active is False and dp.screen_viewer_card.isHidden(), (
+                    "La vista previa local debe cerrarse al dejar de compartir"
                 )
             finally:
                 app.removeEventFilter(d_watcher)
@@ -2990,7 +3128,18 @@ try:
     eng_test._out_opened_at = 20.0
     eng_test._input_callback(bytes(96), 24, None, None)
     eng_test._output_callback(bytearray(1920), 480, None, None)
-    assert eng_test.check_and_recover_streams(now=22.0) == (False, False)
+    assert eng_test.check_and_recover_streams() == (False, False)
+
+    # Si un stream ya venía funcionando (cb_count > 0) y se congela a mitad de llamada, debe recuperarse sin saltar candidato
+    eng_test._last_out_cb_ts = 1.0
+    _prev_skip_out = eng_test._out_candidate_skip
+    rec_in_mid, rec_out_mid = eng_test.check_and_recover_streams(now=3.0)
+    assert rec_in_mid is False and rec_out_mid is True, (
+        f"Debe recuperar salida bloqueada a mitad de llamada: {(rec_in_mid, rec_out_mid)}"
+    )
+    assert eng_test._out_candidate_skip == _prev_skip_out, (
+        "Recuperación a mitad de llamada no debe rotar de dispositivo funcional"
+    )
     eng_test.close()
 finally:
     if _prev_sd is None:
@@ -3098,11 +3247,192 @@ print("RTP_DAVE_OK")
         "deepfilternet_slim",
         "pysilero_vad",
         "yt_dlp",
+        "aiohttp",
     ):
         assert mod_name not in sys.modules, (
             f"{mod_name} nunca debe importarse en el proceso GUI principal"
         )
-    print("   OK: DPAPI Bot, mezclador PCM, descifrado AEAD+DAVE y worker aislado 0 MB verificados.")
+
+    # 5. Worker aislado de compartida de pantalla (fMP4 + relay HTTP/WebSocket + auth + 0 MB idle)
+    from swiftplay.screen_share_service import (
+        SCREEN_SHARE_ENDED_MARKER,
+        ScreenShareService,
+        format_screen_share_announcement,
+        is_screen_share_ended_message,
+        parse_screen_share_message,
+    )
+
+    ann_msg = format_screen_share_announcement(
+        "https://demo-abc.trycloudflare.com/watch?t=TokEn_123",
+        "720p",
+        30,
+        True,
+        "Monitor 1",
+    )
+    parsed_ss = parse_screen_share_message(ann_msg)
+    assert parsed_ss is not None
+    assert parsed_ss["watch_url"] == "https://demo-abc.trycloudflare.com/watch?t=TokEn_123"
+    assert parsed_ss["stream_url"] == "https://demo-abc.trycloudflare.com/stream.mp4?t=TokEn_123"
+    assert is_screen_share_ended_message(f"⏹️ {SCREEN_SHARE_ENDED_MARKER}.")
+    assert parse_screen_share_message(f"⏹️ {SCREEN_SHARE_ENDED_MARKER}.") is None
+
+    ss_svc = ScreenShareService()
+    try:
+        assert ss_svc.ping(timeout=10.0) == "pong"
+        sources = ss_svc.list_sources_sync(timeout=8.0)
+        assert sources and sources[0]["id"].startswith("monitor:"), (
+            f"Debe detectar al menos un monitor: {sources}"
+        )
+        share_info = ss_svc.start_share(
+            source_id="synthetic",
+            quality="480p",
+            fps=30,
+            include_audio=True,
+            title="Test Sintético",
+            use_tunnel=False,
+            await_result=True,
+            timeout=15.0,
+        )
+        assert isinstance(share_info, dict) and share_info.get("state") == "sharing"
+        assert "127.0.0.1" in str(share_info.get("local_watch_url") or "")
+
+        probe_script = """
+import ctypes, json, subprocess, urllib.request, urllib.error, asyncio, websockets
+from pathlib import Path
+from swiftplay.screen_share_worker import (
+    WasapiLoopbackCapture,
+    _WAVEFORMATEX,
+    _WAVEFORMATEXTENSIBLE,
+    build_ffmpeg_command,
+    probe_best_encoder,
+)
+import os as _os
+
+assert ctypes.sizeof(_WAVEFORMATEX) == 18 and ctypes.sizeof(_WAVEFORMATEXTENSIBLE) == 40
+cap_excl = WasapiLoopbackCapture(exclude_pid=_os.getpid())
+cap_excl.open()
+assert cap_excl.process_excluded is True and cap_excl.ffmpeg_fmt == "f32le", (
+    f"Process_Loopback debe excluir PID de Discord en f32le: {(cap_excl.process_excluded, cap_excl.ffmpeg_fmt)}"
+)
+cap_excl.close()
+ff_p = Path("bin/ffmpeg.exe")
+enc_p = probe_best_encoder(ff_p)
+cmd_audio = build_ffmpeg_command(
+    ff_p,
+    source={"id": "synthetic", "kind": "synthetic"},
+    quality="480p",
+    fps=30,
+    encoder=enc_p,
+    capture_backend="synthetic",
+    audio_info=("f32le", 48000, 2),
+)
+assert "-thread_queue_size" not in cmd_audio, "FFmpeg pipe:0 no debe incluir -thread_queue_size"
+# Probar pipe:0 real de audio f32le + testsrc con -frames:v 8 antes de '-f mp4'
+cmd_short = cmd_audio[:-7] + ["-frames:v", "8", "-shortest"] + cmd_audio[-7:]
+res_a = subprocess.run(cmd_short, input=b"\\x00" * (48000 * 8), capture_output=True, timeout=10)
+assert res_a.returncode == 0 and b"moov" in res_a.stdout and b"mp4a" in res_a.stdout and b"moof" in res_a.stdout, (
+    f"FFmpeg pipe:0 f32le falló: rc={res_a.returncode} {res_a.stderr.decode('utf-8', 'replace')}"
+)
+
+info = json.loads(%s)
+try:
+    urllib.request.urlopen(info["local_watch_url"].split("?")[0] + "?t=bad", timeout=3)
+    raise AssertionError("Token inválido debe devolver 403")
+except urllib.error.HTTPError as e:
+    assert e.code == 403, f"Código inesperado: {e.code}"
+
+with urllib.request.urlopen(info["local_watch_url"], timeout=5) as r:
+    assert r.status == 200
+    body = r.read().decode("utf-8")
+    assert "MediaSource" in body and "WebSocket" in body
+
+with urllib.request.urlopen(info["local_stream_url"], timeout=6) as r:
+    assert r.status == 200
+    chunk = r.read(65536)
+    assert b"ftyp" in chunk and b"moov" in chunk and b"moof" in chunk, "Stream HTTP debe contener ftyp+moov+moof"
+
+async def check_ws():
+    async with websockets.connect(info["ws_url"], open_timeout=5) as ws:
+        meta_raw = await asyncio.wait_for(ws.recv(), timeout=5)
+        meta = json.loads(meta_raw)
+        assert meta["type"] == "meta" and "avc1." in meta["mime"], f"Meta inválido: {meta}"
+        init_seg = await asyncio.wait_for(ws.recv(), timeout=5)
+        assert isinstance(init_seg, (bytes, bytearray)) and b"moov" in init_seg
+        frag = await asyncio.wait_for(ws.recv(), timeout=5)
+        assert isinstance(frag, (bytes, bytearray)) and b"moof" in frag
+        print("READY_RECONFIG", flush=True)
+        got_reset = False
+        got_new_meta = False
+        got_new_init = False
+        got_new_frag = False
+        for _ in range(40):
+            frame = await asyncio.wait_for(ws.recv(), timeout=8)
+            if isinstance(frame, str):
+                msg = json.loads(frame)
+                if msg.get("type") == "reset":
+                    got_reset = True
+                elif got_reset and msg.get("type") == "meta":
+                    assert int(msg.get("fps") or 0) == 60, f"Meta tras reconfigure debe ser 60fps: {msg}"
+                    got_new_meta = True
+            elif got_new_meta and not got_new_init:
+                assert b"moov" in frame
+                got_new_init = True
+            elif got_new_init:
+                assert b"moof" in frame
+                got_new_frag = True
+                break
+        assert got_reset and got_new_meta and got_new_init and got_new_frag, (
+            f"Faltaron frames en hot-reconfigure WS: {(got_reset, got_new_meta, got_new_init, got_new_frag)}"
+        )
+
+asyncio.run(check_ws())
+print("SCREEN_SHARE_RELAY_OK")
+""" % repr(json.dumps(share_info))
+
+        ss_proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", probe_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        ready_seen = False
+        assert ss_proc.stdout is not None
+        for line in ss_proc.stdout:
+            if line.strip() == "READY_RECONFIG":
+                ready_seen = True
+                break
+        assert ready_seen, (
+            f"Probe WS no llegó a READY_RECONFIG: {ss_proc.stderr.read() if ss_proc.stderr else ''}"
+        )
+        reconf = ss_svc.reconfigure_share(
+            source_id="synthetic",
+            quality="720p",
+            fps=60,
+            include_audio=True,
+            title="Reconfigurado",
+            await_result=True,
+            timeout=15.0,
+        )
+        assert isinstance(reconf, dict) and reconf.get("fps") == 60 and reconf.get("reconfigured") is True
+        assert reconf.get("token") == share_info.get("token") and reconf.get("port") == share_info.get("port"), (
+            "Reconfigure en vivo no debe cambiar ni el token ni la URL del stream"
+        )
+        ss_out, ss_err = ss_proc.communicate(timeout=20)
+        assert ss_proc.returncode == 0 and "SCREEN_SHARE_RELAY_OK" in ss_out, (
+            f"Falló prueba de relay/reconfigure de compartida de pantalla: {ss_out}\n{ss_err}"
+        )
+        from swiftplay.windows_os import get_pid_memory_mb
+        self_ws, self_priv = get_pid_memory_mb(os.getpid())
+        assert self_ws > 0.0 and self_priv > 0.0
+        print(
+            f"   Compartida de pantalla OK: encoder={share_info.get('encoder')} "
+            f"audio={share_info.get('has_audio')} port={share_info.get('port')} (hot-reconfigure 60fps WS OK)."
+        )
+    finally:
+        ss_svc.close()
+    assert not ss_svc.is_worker_running, "El worker de pantalla debe terminar por completo tras close()"
+    print("   OK: DPAPI Bot, mezclador PCM, descifrado AEAD+DAVE, ScreenShare y workers 0 MB verificados.")
 
 
 def main() -> int:

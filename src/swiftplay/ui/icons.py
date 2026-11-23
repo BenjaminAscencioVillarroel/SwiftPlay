@@ -417,5 +417,17 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
         p.drawLine(QPointF(s * 0.34, s * 0.50), QPointF(s * 0.66, s * 0.50))
         p.drawLine(QPointF(s * 0.34, s * 0.66), QPointF(s * 0.58, s * 0.66))
 
+    elif name in ("screen_share", "screen_share_off"):
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(s * 0.14, s * 0.20, s * 0.72, s * 0.50), 4, 4)
+        p.drawLine(QPointF(s * 0.36, s * 0.80), QPointF(s * 0.64, s * 0.80))
+        p.drawLine(QPointF(s * 0.50, s * 0.70), QPointF(s * 0.50, s * 0.80))
+        if name == "screen_share":
+            p.drawLine(QPointF(s * 0.50, s * 0.56), QPointF(s * 0.50, s * 0.33))
+            p.drawLine(QPointF(s * 0.39, s * 0.43), QPointF(s * 0.50, s * 0.32))
+            p.drawLine(QPointF(s * 0.61, s * 0.43), QPointF(s * 0.50, s * 0.32))
+        else:
+            p.drawLine(QPointF(s * 0.20, s * 0.22), QPointF(s * 0.80, s * 0.70))
+
     p.end()
     return QIcon(pm)

@@ -51,6 +51,18 @@ def _is_shift_pressed() -> bool:
         return False
 
 
+def _is_hwnd_visible(wid: int | None) -> bool:
+    if sys.platform != "win32" or wid is None:
+        return True
+    try:
+        hwnd = int(wid)
+        if hwnd <= 0:
+            return True
+        return bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+    except Exception:
+        return True
+
+
 class MediaPlayer(QObject):
     """Controla libmpv embebido en HWND (Video) o en modo headless solo-audio (Música)."""
 
@@ -60,6 +72,7 @@ class MediaPlayer(QObject):
     track_ended = Signal()
     buffering_changed = Signal(bool)
     error_occurred = Signal(str)
+    vo_error_detected = Signal(str)
     wheel_scrolled = Signal(int)
     mouse_moved = Signal()
     clicked = Signal()
@@ -97,6 +110,12 @@ class MediaPlayer(QObject):
         self._last_pos_emit_ts = 0.0
         self._last_pos_emit_val = -10.0
         self._applied_af: str | None = None
+        self._active_vo = "gpu"
+        self._vo_error_count = 0
+        self._vo_needs_reinit = False
+        self._started_hidden = False
+        self._last_vo_reinit_ts = 0.0
+        self._last_vo_error = ""
         self._mpv: Any = None
 
         if not lazy:
@@ -121,6 +140,16 @@ class MediaPlayer(QObject):
                 return bool(self._mpv.pause)
             except Exception:
                 return True
+
+    def _on_mpv_log(self, level: str, prefix: str, text: str) -> None:
+        if self._shutdown or self._unloading:
+            return
+        if str(level or "").lower() in ("error", "fatal") and "vo" in str(prefix or "").lower():
+            msg = f"{prefix}: {text}".strip()[:240]
+            self._last_vo_error = msg
+            self._vo_needs_reinit = True
+            self._vo_error_count += 1
+            self.vo_error_detected.emit(msg)
 
     def _ensure_mpv(self) -> Any:
         with self._lock:
@@ -164,7 +193,7 @@ class MediaPlayer(QObject):
             )
             if self._wid is not None:
                 kwargs["wid"] = str(int(self._wid))
-                kwargs["vo"] = "gpu"
+                kwargs["vo"] = self._active_vo
                 kwargs["gpu_api"] = "d3d11"
                 kwargs["d3d11_flip"] = "no"
                 kwargs["hwdec"] = "d3d11va-copy"
@@ -174,6 +203,8 @@ class MediaPlayer(QObject):
                 kwargs["demuxer_max_bytes"] = "4MiB"
                 kwargs["demuxer_max_back_bytes"] = "512KiB"
                 kwargs["cursor_autohide"] = "no"
+                kwargs["msg_level"] = "all=no,vo=error"
+                kwargs["log_handler"] = self._on_mpv_log
             else:
                 kwargs["vo"] = "null"
                 kwargs["vid"] = "no"
@@ -337,10 +368,11 @@ class MediaPlayer(QObject):
         start_pos: float = 0.0,
         is_live: bool = False,
         allow_seek: bool = False,
+        low_latency: bool = False,
     ) -> None:
         with self._lock:
             live_flag = bool(is_live)
-            live_seekable = bool(live_flag and allow_seek)
+            live_seekable = bool(live_flag and allow_seek and not low_latency)
             if self._mpv is not None and (
                 self._streams_played >= self._recycle_after
                 or (self._last_was_live is not None and self._last_was_live != live_flag)
@@ -362,22 +394,46 @@ class MediaPlayer(QObject):
             if self._is_audio_only_instance:
                 player.vid = "no"
             else:
+                self._started_hidden = bool(video_enabled and not _is_hwnd_visible(self._wid))
+                self._vo_needs_reinit = False
                 player.vid = "auto" if video_enabled else "no"
 
-            if live_flag and not live_seekable:
+            if low_latency:
+                player["cache"] = "no"
+                player["cache-secs"] = 0.4
+                player["demuxer-lavf-probesize"] = 32768
+                player["demuxer-lavf-analyzeduration"] = 0.25
+                player["audio-buffer"] = 0.05
+                player["demuxer-max-bytes"] = "1MiB"
+                player["demuxer-max-back-bytes"] = "64KiB"
+                player.start = "none"
+                player.speed = 1.0
+            elif live_flag and not live_seekable:
+                player["cache"] = "yes"
                 player["cache-secs"] = 2
+                player["demuxer-lavf-probesize"] = 1048576
+                player["demuxer-lavf-analyzeduration"] = 0.5
+                player["audio-buffer"] = 0.1
                 player["demuxer-max-bytes"] = "2MiB"
                 player["demuxer-max-back-bytes"] = "128KiB"
                 player.start = "none"
                 player.speed = 1.0
             elif live_flag and live_seekable:
+                player["cache"] = "yes"
                 player["cache-secs"] = 3
+                player["demuxer-lavf-probesize"] = 1048576
+                player["demuxer-lavf-analyzeduration"] = 0.5
+                player["audio-buffer"] = 0.1
                 player["demuxer-max-bytes"] = "4MiB"
                 player["demuxer-max-back-bytes"] = "512KiB"
                 player.start = "none"
                 player.speed = self._speed
             else:
+                player["cache"] = "yes"
                 player["cache-secs"] = 3
+                player["demuxer-lavf-probesize"] = 1048576
+                player["demuxer-lavf-analyzeduration"] = 0.5
+                player["audio-buffer"] = 0.1
                 player["demuxer-max-bytes"] = (
                     "2MiB" if self._is_audio_only_instance else "4MiB"
                 )
@@ -447,6 +503,11 @@ class MediaPlayer(QObject):
             self._streams_played = 0
             self._applied_af = None
             self._last_mouse_xy = None
+            self._vo_needs_reinit = False
+            self._started_hidden = False
+            self._vo_error_count = 0
+            self._active_vo = "gpu"
+            self._last_vo_error = ""
             if self._mpv is not None:
                 self._unloading = True
                 try:
@@ -501,21 +562,49 @@ class MediaPlayer(QObject):
             ):
                 self._mpv.vid = "auto" if enabled else "no"
 
-    def refresh_video_output(self) -> None:
-        """Fuerza re-presentación del frame actual cuando el HWND vuelve de estar oculto."""
+    def refresh_video_output(self, *, force_reinit: bool = False) -> bool:
+        """Fuerza re-presentación del frame actual cuando el HWND vuelve de estar oculto o tras error D3D11."""
         with self._lock:
             if (
-                not self._shutdown
-                and not self._unloading
-                and not self._is_audio_only_instance
-                and self._mpv is not None
-                and self._has_media
+                self._shutdown
+                or self._unloading
+                or self._is_audio_only_instance
+                or self._mpv is None
+                or not self._has_media
             ):
+                return False
+            if not _is_hwnd_visible(self._wid):
+                return False
+            vo_cfg = True
+            try:
+                vo_cfg = bool(self._mpv.vo_configured)
+            except Exception:
+                vo_cfg = True
+            need_reinit = bool(
+                force_reinit or self._vo_needs_reinit or self._started_hidden or not vo_cfg
+            )
+            if need_reinit:
+                now = time.monotonic()
+                if (now - self._last_vo_reinit_ts) < 0.8:
+                    self._started_hidden = False
+                    return False
                 try:
-                    self._mpv.video_pan_x = 0.0001
-                    self._mpv.video_pan_x = 0.0
+                    if self._vo_error_count >= 2 and self._active_vo == "gpu":
+                        self._active_vo = "gpu-next"
+                    self._mpv["vo"] = "null"
+                    self._mpv["vo"] = self._active_vo
+                    self._last_vo_reinit_ts = now
+                    self._vo_needs_reinit = False
+                    self._started_hidden = False
+                    return True
                 except Exception:
-                    pass
+                    return False
+            try:
+                self._mpv.video_pan_x = 0.0001
+                self._mpv.video_pan_x = 0.0
+            except Exception:
+                pass
+            return False
 
     def set_cursor_autohide(self, value: int | str) -> None:
         with self._lock:
@@ -538,6 +627,11 @@ class MediaPlayer(QObject):
             self._last_was_live = None
             self._streams_played = 0
             self._applied_af = None
+            self._vo_needs_reinit = False
+            self._started_hidden = False
+            self._vo_error_count = 0
+            self._active_vo = "gpu"
+            self._last_vo_error = ""
             if self._mpv is not None:
                 self._unloading = True
                 try:

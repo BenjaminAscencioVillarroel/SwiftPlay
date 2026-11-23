@@ -909,6 +909,24 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
         background-color: #16221B;
         border: 1px solid #2F6F52;
     }}
+
+    QFrame#ScreenShareLiveStrip {{
+        background-color: #1A161A;
+        border: 1px solid #5B2E35;
+        border-radius: 10px;
+    }}
+
+    QFrame#ScreenShareBanner {{
+        background-color: {p.surface2};
+        border: 1px solid {p.border_bright};
+        border-radius: 10px;
+    }}
+
+    QFrame#ScreenShareViewerCard {{
+        background-color: {p.surface1};
+        border: 1px solid {p.border_bright};
+        border-radius: 12px;
+    }}
     """
 
 

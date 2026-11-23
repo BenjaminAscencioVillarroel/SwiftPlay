@@ -212,6 +212,8 @@ class MainWindow(QMainWindow):
         self._ram_logger = RamLogger(ram_log_path if ram_log_path is not None else RAM_LOG_PATH)
         self._discord_ws_mb: float = 0.0
         self._discord_priv_mb: float = 0.0
+        self._screen_share_ws_mb: float = 0.0
+        self._screen_share_priv_mb: float = 0.0
         self._last_gui_ws_mb: float = 0.0
         self._ram_log_tick_count: int = 0
         self.sound_fx = SoundEffectPlayer()
@@ -487,6 +489,16 @@ class MainWindow(QMainWindow):
         self._resource_timer.timeout.connect(self._refresh_resource_monitor)
         self._resource_timer.start()
         self._refresh_resource_monitor()
+
+        self._video_refresh_timer = QTimer(self)
+        self._video_refresh_timer.setSingleShot(True)
+        self._video_refresh_timer.setInterval(55)
+        self._video_refresh_timer.timeout.connect(self._refresh_video_surface_output)
+
+        self._video_post_reinit_timer = QTimer(self)
+        self._video_post_reinit_timer.setSingleShot(True)
+        self._video_post_reinit_timer.setInterval(150)
+        self._video_post_reinit_timer.timeout.connect(self._post_reinit_video_redraw)
 
         QTimer.singleShot(150, self._load_video_feed)
         QTimer.singleShot(250, self._refresh_account_async_if_needed)
@@ -1055,6 +1067,7 @@ class MainWindow(QMainWindow):
         self.discord_panel.unread_count_changed.connect(self._on_discord_unread_count_changed)
         self.discord_panel.sound_event_requested.connect(self.play_discord_sound)
         self.discord_panel.toast_requested.connect(self.show_toast)
+        self.discord_panel.screen_share_ram_updated.connect(self._on_screen_share_ram_updated)
         self.stack.addWidget(self.discord_panel)
 
         # Pág 10: Canal de YouTube (Videos y Directos sin Shorts)
@@ -1437,6 +1450,7 @@ class MainWindow(QMainWindow):
         vp.buffering_changed.connect(self._on_video_buffering_changed)
         vp.track_ended.connect(self._on_video_ended)
         vp.error_occurred.connect(lambda m: self.show_toast(m))
+        vp.vo_error_detected.connect(self._on_video_vo_error)
         vp.wheel_scrolled.connect(self._on_video_wheel_volume)
         vp.mouse_moved.connect(self._on_video_mouse_moved)
         vp.clicked.connect(self._on_video_surface_clicked)
@@ -1470,7 +1484,7 @@ class MainWindow(QMainWindow):
         p.wheel_scrolled.connect(self._on_video_wheel_volume)
         p.video_surface.mouse_moved.connect(self._on_video_mouse_moved)
         p.video_surface.surface_shown.connect(
-            lambda: QTimer.singleShot(25, self._refresh_video_surface_output)
+            lambda: self._schedule_video_surface_refresh(55)
         )
 
     def _connect_fs_overlay_signals(self) -> None:
@@ -2013,7 +2027,17 @@ class MainWindow(QMainWindow):
         self._discord_ws_mb = max(0.0, float(ws_mb))
         self._discord_priv_mb = max(0.0, float(priv_mb))
         if hasattr(self, "res_ram_total_lbl") and self._last_gui_ws_mb > 0.0:
-            self.res_ram_total_lbl.setText(f"{(self._last_gui_ws_mb + self._discord_ws_mb):.0f} MB")
+            self.res_ram_total_lbl.setText(
+                f"{(self._last_gui_ws_mb + self._discord_ws_mb + self._screen_share_ws_mb):.0f} MB"
+            )
+
+    def _on_screen_share_ram_updated(self, ws_mb: float, priv_mb: float) -> None:
+        self._screen_share_ws_mb = max(0.0, float(ws_mb))
+        self._screen_share_priv_mb = max(0.0, float(priv_mb))
+        if hasattr(self, "res_ram_total_lbl") and self._last_gui_ws_mb > 0.0:
+            self.res_ram_total_lbl.setText(
+                f"{(self._last_gui_ws_mb + self._discord_ws_mb + self._screen_share_ws_mb):.0f} MB"
+            )
 
     def _on_discord_state_changed_for_log(self, state: str, data: dict) -> None:
         if state == "connected":
@@ -2031,7 +2055,9 @@ class MainWindow(QMainWindow):
             self._discord_ws_mb = 0.0
             self._discord_priv_mb = 0.0
             if hasattr(self, "res_ram_total_lbl") and self._last_gui_ws_mb > 0.0:
-                self.res_ram_total_lbl.setText(f"{self._last_gui_ws_mb:.0f} MB")
+                self.res_ram_total_lbl.setText(
+                    f"{(self._last_gui_ws_mb + self._screen_share_ws_mb):.0f} MB"
+                )
             self._discord_bot_name = ""
             self._discord_bot_avatar_url = ""
             self._discord_voice_active = False
@@ -2507,6 +2533,24 @@ class MainWindow(QMainWindow):
             self._channel_cards.clear()
             self._channel_page_dirty = True
 
+    def _schedule_video_surface_refresh(self, delay_ms: int = 55) -> None:
+        if self._cleaned_up:
+            return
+        self._video_refresh_timer.start(max(10, int(delay_ms)))
+
+    def _on_video_vo_error(self, _detail: str) -> None:
+        if (
+            not self._cleaned_up
+            and self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER
+            and not self.cfg.video_audio_only
+        ):
+            self._schedule_video_surface_refresh(30)
+
+    def _post_reinit_video_redraw(self) -> None:
+        if self._cleaned_up or self.stack.currentIndex() != self.PAGE_VIDEO_PLAYER:
+            return
+        self.video_panel.video_surface.force_native_redraw()
+
     def _refresh_video_surface_output(self) -> None:
         if self._cleaned_up or self.stack.currentIndex() != self.PAGE_VIDEO_PLAYER:
             return
@@ -2520,7 +2564,8 @@ class MainWindow(QMainWindow):
             self.video_panel.media_stack.setCurrentIndex(0)
         self.video_panel.video_surface.force_native_redraw()
         if not self.cfg.video_audio_only and self.video_player.has_active_stream:
-            self.video_player.refresh_video_output()
+            if self.video_player.refresh_video_output():
+                self._video_post_reinit_timer.start(150)
 
     def _on_page_fade_step(self, val: object) -> None:
         w = self._page_fade_target
@@ -2539,9 +2584,7 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
 
-    def _animate_page_fade(self, widget: QWidget | None) -> None:
-        if widget is None or not self.isVisible() or self._cleaned_up:
-            return
+    def _stop_page_fade(self) -> None:
         try:
             self._page_fade_anim.stop()
         except RuntimeError:
@@ -2552,6 +2595,11 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
             self._page_fade_target = None
+
+    def _animate_page_fade(self, widget: QWidget | None) -> None:
+        if widget is None or not self.isVisible() or self._cleaned_up:
+            return
+        self._stop_page_fade()
         eff = QGraphicsOpacityEffect(widget)
         eff.setOpacity(0.86)
         widget.setGraphicsEffect(eff)
@@ -2562,6 +2610,7 @@ class MainWindow(QMainWindow):
         if self._is_fullscreen and page_idx != self.PAGE_VIDEO_PLAYER:
             self.toggle_fullscreen()
 
+        self._stop_page_fade()
         prev_idx = self.stack.currentIndex()
         hint_w = max(480, self.stack.width() - 52)
         trigger_music_home = False
@@ -2734,7 +2783,7 @@ class MainWindow(QMainWindow):
         if page_idx == self.PAGE_MUSIC_PLAYER and prev_idx != self.PAGE_MUSIC_PLAYER:
             self.music_panel.play_entrance_animation()
         elif page_idx == self.PAGE_VIDEO_PLAYER and self._video_item is not None:
-            QTimer.singleShot(25, self._refresh_video_surface_output)
+            self._schedule_video_surface_refresh(55)
         elif page_idx != self.PAGE_VIDEO_PLAYER and page_idx != prev_idx:
             self._animate_page_fade(self.stack.currentWidget())
         if page_idx == self.PAGE_VIDEO_SEARCH:
@@ -5141,7 +5190,7 @@ class MainWindow(QMainWindow):
             self._active_deck = "video"
             self._switch_page(self.PAGE_VIDEO_PLAYER)
             if self.video_player.has_active_stream:
-                QTimer.singleShot(25, self._refresh_video_surface_output)
+                self._schedule_video_surface_refresh(55)
             else:
                 if self._video_item.kind == "twitch":
                     fav = self.db.is_twitch_favorite(self._video_item.video_id)
@@ -5854,15 +5903,23 @@ class MainWindow(QMainWindow):
         self._last_gui_ws_mb = gui_ws
         ds_ws = max(0.0, float(self._discord_ws_mb))
         ds_priv = max(0.0, float(self._discord_priv_mb))
-        total_ws = gui_ws + ds_ws
+        ss_ws = max(0.0, float(self._screen_share_ws_mb))
+        ss_priv = max(0.0, float(self._screen_share_priv_mb))
+        total_ws = gui_ws + ds_ws + ss_ws
         self.res_ram_lbl.setText(f"{gui_ws:.0f} MB")
         self.res_ram_total_lbl.setText(f"{total_ws:.0f} MB")
         self.res_cpu_lbl.setText(f"{snap.app_cpu_pct:.1f}%")
         self.res_gpu_lbl.setText(f"{snap.app_gpu_pct:.1f}%")
+        ss_line = (
+            f"RAM física Pantalla (WS): {ss_ws:.1f} MB  ·  Confirmada (Priv): {ss_priv:.1f} MB\n"
+            if ss_ws > 0.0
+            else ""
+        )
         self.resource_card.setToolTip(
             f"RAM física App (WS): {gui_ws:.1f} MB  ·  Confirmada (Priv): {snap.priv_mb:.1f} MB\n"
             f"RAM física Discord (WS): {ds_ws:.1f} MB  ·  Confirmada (Priv): {ds_priv:.1f} MB\n"
-            f"Total físico (App + Discord): {total_ws:.1f} MB\n"
+            f"{ss_line}"
+            f"Total físico (App + Workers): {total_ws:.1f} MB\n"
             f"CPU app: {snap.app_cpu_pct:.1f}%  ·  CPU sistema: {snap.sys_cpu_pct:.1f}%\n"
             f"GPU app: {snap.app_gpu_pct:.1f}%  ·  GPU sistema: {snap.sys_gpu_pct:.1f}%"
         )
@@ -5885,6 +5942,7 @@ class MainWindow(QMainWindow):
                 self.discord_panel.close_audio_popover()
                 self.discord_panel.close_image_lightbox()
                 self.discord_panel._clear_pending_attachments(delete_temp=True)
+                self.discord_panel.shutdown_screen_share()
             self.discord_overlay.set_edit_mode(False)
         except Exception:
             pass
@@ -5904,6 +5962,11 @@ class MainWindow(QMainWindow):
             pass
         try:
             self._ram_log_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._video_refresh_timer.stop()
+            self._video_post_reinit_timer.stop()
         except Exception:
             pass
         try:

@@ -30,6 +30,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QCursor,
+    QDesktopServices,
     QFont,
     QIcon,
     QImage,
@@ -47,6 +48,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
@@ -70,11 +72,22 @@ from PySide6.QtWidgets import (
 from swiftplay.config import AppConfig, save_config
 from swiftplay.discord_service import DiscordService
 from swiftplay.paths import USER_DATA_DIR
+from swiftplay.player import MediaPlayer
+from swiftplay.screen_share_service import (
+    SCREEN_SHARE_ENDED_MARKER,
+    ScreenShareService,
+    download_cloudflared,
+    find_cloudflared,
+    find_ffmpeg,
+    format_screen_share_announcement,
+    parse_screen_share_message,
+)
 from swiftplay.security import has_discord_token
 from swiftplay.storage import LocalLibrary
-from swiftplay.themes import ThemePalette
+from swiftplay.themes import ThemePalette, apply_windows_dark_titlebar
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
+from swiftplay.ui.video_surface import VideoSurface
 
 _IMAGE_EXTS: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 _MAX_CHAT_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -559,6 +572,7 @@ class _ChatMessageRow(QFrame):
     context_requested = Signal(object, QPoint, str, object)  # row, global_pos, sel_text, att_ref
     image_clicked = Signal(dict)
     save_attachment_requested = Signal(dict)
+    screen_share_watch_requested = Signal(dict)
 
     _AVATAR_SIZE = QSize(36, 36)
     _THUMB_SIZE = QSize(280, 200)
@@ -738,6 +752,30 @@ class _ChatMessageRow(QFrame):
             self.body_lbl = body
             content_col.addWidget(body)
 
+        ss_info = parse_screen_share_message(raw_content)
+        if ss_info is not None:
+            ss_btn_row = QHBoxLayout()
+            ss_btn_row.setContentsMargins(0, 3, 0, 3)
+            ss_btn_row.setSpacing(6)
+            ss_payload = {
+                "title": f"{raw_author} · Pantalla compartida",
+                "author_name": raw_author,
+                "watch_url": ss_info["watch_url"],
+                "stream_url": ss_info["stream_url"],
+                "message_id": str(msg.get("id") or ""),
+            }
+            watch_btn = QPushButton(" Ver pantalla en SwiftPlay")
+            watch_btn.setObjectName("PillBtn")
+            watch_btn.setIcon(render_icon("screen_share", palette.text, 13))
+            watch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            watch_btn.setToolTip("Abrir la transmisión de pantalla directamente dentro de SwiftPlay")
+            watch_btn.clicked.connect(
+                lambda _c=False, p=ss_payload: self.screen_share_watch_requested.emit(p)
+            )
+            ss_btn_row.addWidget(watch_btn)
+            ss_btn_row.addStretch(1)
+            content_col.addLayout(ss_btn_row)
+
         for att in atts:
             att_copy = dict(att)
             aname = str(att.get("name") or "archivo")
@@ -884,6 +922,7 @@ class _ChatMessagesView(QScrollArea):
     image_clicked = Signal(dict)
     save_attachment_requested = Signal(dict)
     row_context_menu_requested = Signal(object, QPoint, str, object)
+    screen_share_watch_requested = Signal(dict)
 
     def __init__(self, palette: ThemePalette, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1057,6 +1096,7 @@ class _ChatMessagesView(QScrollArea):
         row.context_requested.connect(self.row_context_menu_requested.emit)
         row.image_clicked.connect(self.image_clicked.emit)
         row.save_attachment_requested.connect(self.save_attachment_requested.emit)
+        row.screen_share_watch_requested.connect(self.screen_share_watch_requested.emit)
         self._rows.append(row)
         self._lay.insertWidget(self._lay.count() - 1, row)
         return row
@@ -1800,6 +1840,327 @@ class _ParticipantCard(QFrame):
             )
 
 
+class _DownloadBridge(QObject):
+    progress = Signal(int, int)
+    finished = Signal(str)
+    failed = Signal(str)
+
+
+class _ScreenShareSetupDialog(QDialog):
+    """Diálogo compacto para elegir fuente, calidad, FPS, audio y destinos Discord."""
+
+    def __init__(
+        self,
+        service: ScreenShareService,
+        palette: ThemePalette,
+        text_channels: list[tuple[str, str]],
+        dm_targets: list[tuple[str, str]] | None = None,
+        default_target: tuple[str, str] | None = None,
+        *,
+        is_live_edit: bool = False,
+        current_source_id: str = "",
+        current_quality: str = "720p",
+        current_fps: int = 30,
+        current_include_audio: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._service = service
+        self._palette = palette
+        self._is_live_edit = bool(is_live_edit)
+        self._downloading = False
+        self._dl_bridge = _DownloadBridge(self)
+        self._dl_bridge.progress.connect(self._on_dl_progress)
+        self._dl_bridge.finished.connect(self._on_dl_finished)
+        self._dl_bridge.failed.connect(self._on_dl_failed)
+
+        self.setWindowTitle(
+            "Cambiar transmisión en vivo" if self._is_live_edit else "Compartir pantalla"
+        )
+        self.setMinimumWidth(470)
+        self.setModal(True)
+        try:
+            apply_windows_dark_titlebar(int(self.winId()), palette.base)
+        except Exception:
+            pass
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        hdr_lbl = QLabel(
+            "Ajustes en vivo · Pantalla compartida"
+            if self._is_live_edit
+            else "Configurar transmisión de pantalla"
+        )
+        hdr_lbl.setStyleSheet("font-size: 14px; font-weight: 700;")
+        root.addWidget(hdr_lbl)
+
+        sub_lbl = QLabel(
+            "Cambia la ventana/monitor, calidad, FPS o audio sin cortar el enlace actual ni sacar a nadie."
+            if self._is_live_edit
+            else "Tu compa en SwiftPlay la ve directo en el panel de voz y los de Discord oficial entran con 1 clic en el navegador (0 cuentas)."
+        )
+        sub_lbl.setObjectName("MutedLabel")
+        sub_lbl.setWordWrap(True)
+        root.addWidget(sub_lbl)
+
+        # Fuente (Monitores / Ventanas)
+        src_row = QHBoxLayout()
+        src_row.setSpacing(6)
+        src_lbl = QLabel("Fuente:")
+        src_lbl.setFixedWidth(74)
+        src_row.addWidget(src_lbl)
+        self.source_combo = QComboBox()
+        src_row.addWidget(self.source_combo, 1)
+        self.refresh_btn = QPushButton()
+        self.refresh_btn.setObjectName("IconBtn")
+        self.refresh_btn.setFixedSize(28, 28)
+        self.refresh_btn.setIcon(render_icon("refresh", palette.text, 14))
+        self.refresh_btn.setToolTip("Actualizar monitores y ventanas abiertas")
+        self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_btn.clicked.connect(self._reload_sources)
+        src_row.addWidget(self.refresh_btn)
+        root.addLayout(src_row)
+
+        # Calidad y FPS
+        qf_row = QHBoxLayout()
+        qf_row.setSpacing(8)
+        q_lbl = QLabel("Calidad:")
+        q_lbl.setFixedWidth(74)
+        qf_row.addWidget(q_lbl)
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItem("720p (Equilibrado)", "720p")
+        self.quality_combo.addItem("1080p (Alta definición)", "1080p")
+        self.quality_combo.addItem("480p (Menor consumo)", "480p")
+        qf_row.addWidget(self.quality_combo, 1)
+
+        f_lbl = QLabel("FPS:")
+        qf_row.addWidget(f_lbl)
+        self.fps_combo = QComboBox()
+        self.fps_combo.addItem("30 fps", 30)
+        self.fps_combo.addItem("60 fps", 60)
+        qf_row.addWidget(self.fps_combo)
+        root.addLayout(qf_row)
+
+        # Audio del sistema
+        self.audio_check = QCheckBox("Incluir audio del sistema (WASAPI)")
+        self.audio_check.setChecked(True)
+        root.addWidget(self.audio_check)
+
+        # Envío opcional por Discord (desactivado por defecto; canales y/o DMs)
+        has_targets = bool(text_channels or dm_targets)
+        self.announce_check = QCheckBox("Enviar enlace por Discord (canales o DMs)")
+        self.announce_check.setChecked(False)
+        self.announce_check.setEnabled(has_targets)
+        root.addWidget(self.announce_check)
+
+        self.targets_box = QFrame()
+        self.targets_box.setObjectName("ScreenShareBanner")
+        tb_lay = QVBoxLayout(self.targets_box)
+        tb_lay.setContentsMargins(10, 8, 10, 8)
+        tb_lay.setSpacing(6)
+
+        self.target_filter_edit = QLineEdit()
+        self.target_filter_edit.setPlaceholderText("Filtrar canal #texto o @persona...")
+        self.target_filter_edit.textChanged.connect(self._filter_targets)
+        tb_lay.addWidget(self.target_filter_edit)
+
+        self.targets_list = QListWidget()
+        self.targets_list.setMaximumHeight(175)
+        self.targets_list.setStyleSheet(
+            "QListWidget { background: transparent; border: none; outline: none; }"
+            "QListWidget::item { padding: 4px 6px; border-radius: 6px; }"
+            "QListWidget::item:hover { background-color: #24272F; }"
+        )
+        for cid, cname in text_channels:
+            it = QListWidgetItem(f"# {cname.lstrip('# ')}  ·  Canal")
+            it.setData(Qt.ItemDataRole.UserRole, ("channel", str(cid)))
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Unchecked)
+            self.targets_list.addItem(it)
+
+        for uid, ulabel in (dm_targets or []):
+            it = QListWidgetItem(f"@ {ulabel.lstrip('@ ')}  ·  DM")
+            it.setData(Qt.ItemDataRole.UserRole, ("dm", str(uid)))
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Unchecked)
+            self.targets_list.addItem(it)
+        tb_lay.addWidget(self.targets_list)
+
+        target_hint = QLabel(
+            "Los DMs llegan a usuarios reales de Discord; si tu compa usa Bot en SwiftPlay, marca también un #canal."
+        )
+        target_hint.setObjectName("MutedLabel")
+        target_hint.setWordWrap(True)
+        target_hint.setStyleSheet("font-size: 11px; background: transparent;")
+        tb_lay.addWidget(target_hint)
+
+        self.targets_box.setVisible(False)
+        self.announce_check.toggled.connect(self._on_announce_toggled)
+        root.addWidget(self.targets_box)
+
+        # Estado de binarios (ffmpeg / cloudflared)
+        self.deps_frame = QFrame()
+        self.deps_frame.setObjectName("ScreenShareBanner")
+        deps_lay = QHBoxLayout(self.deps_frame)
+        deps_lay.setContentsMargins(10, 8, 10, 8)
+        deps_lay.setSpacing(8)
+        self.deps_lbl = QLabel("")
+        self.deps_lbl.setWordWrap(True)
+        self.deps_lbl.setStyleSheet("color: #FBBF24; font-size: 11.5px; background: transparent;")
+        deps_lay.addWidget(self.deps_lbl, 1)
+        self.dl_cloudflared_btn = QPushButton("Descargar cloudflared (~35 MB)")
+        self.dl_cloudflared_btn.setObjectName("PillBtn")
+        self.dl_cloudflared_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dl_cloudflared_btn.clicked.connect(self._start_download_cloudflared)
+        deps_lay.addWidget(self.dl_cloudflared_btn)
+        root.addWidget(self.deps_frame)
+
+        # Botones finales
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        btns.addStretch(1)
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.setObjectName("PillBtn")
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+
+        self.start_btn = QPushButton(
+            "Aplicar cambios" if self._is_live_edit else "Iniciar transmisión"
+        )
+        self.start_btn.setObjectName("AccentBtn")
+        self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.start_btn.clicked.connect(self.accept)
+        btns.addWidget(self.start_btn)
+        root.addLayout(btns)
+
+        self._reload_sources()
+        if current_source_id:
+            s_idx = self.source_combo.findData(str(current_source_id))
+            if s_idx >= 0:
+                self.source_combo.setCurrentIndex(s_idx)
+        q_idx = self.quality_combo.findData(str(current_quality))
+        if q_idx >= 0:
+            self.quality_combo.setCurrentIndex(q_idx)
+        f_idx = self.fps_combo.findData(60 if int(current_fps or 30) >= 60 else 30)
+        if f_idx >= 0:
+            self.fps_combo.setCurrentIndex(f_idx)
+        self.audio_check.setChecked(bool(current_include_audio))
+        if self._is_live_edit:
+            self.announce_check.setText("Enviar enlace a más canales o DMs")
+        self._refresh_deps_state()
+
+    def _on_announce_toggled(self, checked: bool) -> None:
+        self.targets_box.setVisible(bool(checked))
+        self.adjustSize()
+
+    def _filter_targets(self, query: str) -> None:
+        q = str(query or "").strip().lower()
+        for idx in range(self.targets_list.count()):
+            it = self.targets_list.item(idx)
+            if it is None:
+                continue
+            it.setHidden(bool(q) and q not in it.text().lower())
+
+    def _reload_sources(self) -> None:
+        self.source_combo.clear()
+        try:
+            sources = self._service.list_sources_sync(timeout=8.0)
+        except Exception:
+            sources = []
+        if not sources:
+            sources = [{"id": "monitor:0", "label": "Monitor 1 (Principal)"}]
+        for src in sources:
+            self.source_combo.addItem(
+                str(src.get("label") or src.get("id") or "Monitor"),
+                str(src.get("id") or "monitor:0"),
+            )
+
+    def _refresh_deps_state(self) -> None:
+        ff_ok = find_ffmpeg() is not None
+        cf_ok = find_cloudflared() is not None
+        if not ff_ok:
+            self.deps_frame.setVisible(True)
+            self.deps_lbl.setText(
+                "No se encontró bin/ffmpeg.exe. Es necesario para capturar pantalla."
+            )
+            self.dl_cloudflared_btn.setVisible(False)
+            self.start_btn.setEnabled(False)
+            return
+        if not cf_ok:
+            self.deps_frame.setVisible(True)
+            self.deps_lbl.setText(
+                "Falta cloudflared para crear el enlace seguro sin abrir puertos."
+            )
+            self.dl_cloudflared_btn.setVisible(True)
+            self.dl_cloudflared_btn.setEnabled(not self._downloading)
+            self.start_btn.setEnabled(False)
+            return
+        self.deps_frame.setVisible(False)
+        self.start_btn.setEnabled(True)
+
+    def _start_download_cloudflared(self) -> None:
+        if self._downloading:
+            return
+        self._downloading = True
+        self.dl_cloudflared_btn.setEnabled(False)
+        self.dl_cloudflared_btn.setText("Descargando...")
+
+        def _worker() -> None:
+            try:
+                path = download_cloudflared(
+                    progress_cb=lambda d, t: self._dl_bridge.progress.emit(d, t)
+                )
+                self._dl_bridge.finished.emit(str(path))
+            except Exception as exc:
+                self._dl_bridge.failed.emit(str(exc))
+
+        import threading
+
+        threading.Thread(target=_worker, daemon=True, name="dl-cloudflared").start()
+
+    def _on_dl_progress(self, done: int, total: int) -> None:
+        if total > 0:
+            pct = min(100, int((done * 100) / total))
+            self.dl_cloudflared_btn.setText(f"Descargando {pct}%...")
+        else:
+            mb = done / (1024 * 1024)
+            self.dl_cloudflared_btn.setText(f"{mb:.1f} MB...")
+
+    def _on_dl_finished(self, _path: str) -> None:
+        self._downloading = False
+        self.dl_cloudflared_btn.setText("Listo")
+        self._refresh_deps_state()
+
+    def _on_dl_failed(self, err: str) -> None:
+        self._downloading = False
+        self.dl_cloudflared_btn.setText("Reintentar descarga")
+        self.dl_cloudflared_btn.setEnabled(True)
+        self.deps_lbl.setText(f"Error descargando cloudflared: {err}")
+
+    def selected_options(self) -> dict[str, Any]:
+        targets: list[tuple[str, str]] = []
+        if self.announce_check.isChecked():
+            for idx in range(self.targets_list.count()):
+                it = self.targets_list.item(idx)
+                if it is None or it.checkState() != Qt.CheckState.Checked:
+                    continue
+                meta = it.data(Qt.ItemDataRole.UserRole)
+                if isinstance(meta, tuple) and len(meta) == 2:
+                    targets.append((str(meta[0]), str(meta[1])))
+        return {
+            "source_id": str(self.source_combo.currentData() or "monitor:0"),
+            "title": str(self.source_combo.currentText() or "Pantalla compartida"),
+            "quality": str(self.quality_combo.currentData() or "720p"),
+            "fps": int(self.fps_combo.currentData() or 30),
+            "include_audio": bool(self.audio_check.isChecked()),
+            "announce": bool(self.announce_check.isChecked() and targets),
+            "targets": targets,
+        }
+
+
 class DiscordVoicePanel(QWidget):
     """Vista minimalista de Discord Voz + Estados + Chat (Bot puente aislado, 0 MB en reposo)."""
 
@@ -1811,6 +2172,8 @@ class DiscordVoicePanel(QWidget):
     unread_count_changed = Signal(int)
     sound_event_requested = Signal(str)
     toast_requested = Signal(str)
+    screen_share_announced = Signal(str, str, str)  # kind, target_id, message_id
+    screen_share_ram_updated = Signal(float, float)  # ws_mb, priv_mb
 
     _LIST_AVATAR_SIZE = QSize(28, 28)
 
@@ -1900,6 +2263,25 @@ class DiscordVoicePanel(QWidget):
         self._last_participants_sig: Any = None
         self._worker_ws_mb = 0.0
         self._worker_priv_mb = 0.0
+
+        # Compartida de pantalla aislada + visor nativo libmpv lazy
+        self.screen_share_svc = ScreenShareService(self)
+        self._screen_share_state = "idle"
+        self._screen_share_info: dict[str, Any] = {}
+        self._screen_share_stats: dict[str, Any] = {}
+        self._screen_share_ws_mb = 0.0
+        self._screen_share_priv_mb = 0.0
+        self._screen_share_pending_opts: dict[str, Any] | None = None
+        self._screen_share_announces: list[tuple[str, str, str]] = []  # [(kind, target_id, message_id)]
+        self._remote_screen_share: dict[str, Any] | None = None
+        self._screen_viewer_active = False
+        self._screen_viewer_is_local_preview = False
+        self._screen_viewer_expanded = False
+        self._screen_viewer_muted = False
+        self._screen_viewer_volume = 80
+        self._screen_viewer_stream_url = ""
+        self._screen_viewer_watch_url = ""
+        self._screen_player: MediaPlayer | None = None
 
         # Estado de acordeones y vista exclusiva central (Voz o Chat)
         self._channels_visible = True
@@ -2178,6 +2560,17 @@ class DiscordVoicePanel(QWidget):
         )
         vh_lay.addWidget(v_title)
         vh_lay.addStretch()
+
+        self.screen_share_btn = QPushButton(" Compartir pantalla")
+        self.screen_share_btn.setObjectName("PillBtn")
+        self.screen_share_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.screen_share_btn.setToolTip(
+            "Comparte pantalla + audio del sistema (nativo en SwiftPlay y 1 clic web para Discord)"
+        )
+        self.screen_share_btn.clicked.connect(self._on_screen_share_btn_clicked)
+        self.screen_share_btn.setVisible(False)
+        vh_lay.addWidget(self.screen_share_btn)
+
         self.close_voice_btn = QPushButton()
         self.close_voice_btn.setObjectName("IconBtn")
         self.close_voice_btn.setFixedSize(24, 24)
@@ -2187,6 +2580,139 @@ class DiscordVoicePanel(QWidget):
         self.close_voice_btn.setVisible(False)
         vh_lay.addWidget(self.close_voice_btn)
         vp_lay.addWidget(voice_hdr_frame)
+
+        # Franja activa cuando el usuario local está compartiendo pantalla
+        self.share_live_strip = QFrame()
+        self.share_live_strip.setObjectName("ScreenShareLiveStrip")
+        sls_lay = QHBoxLayout(self.share_live_strip)
+        sls_lay.setContentsMargins(10, 6, 10, 6)
+        sls_lay.setSpacing(6)
+        self.share_live_lbl = QLabel("🔴 Compartiendo pantalla...")
+        self.share_live_lbl.setStyleSheet(
+            "color: #F87171; font-size: 12px; font-weight: 700; background: transparent;"
+        )
+        sls_lay.addWidget(self.share_live_lbl, 1)
+
+        self.share_copy_url_btn = QPushButton("Copiar link")
+        self.share_copy_url_btn.setObjectName("PillBtn")
+        self.share_copy_url_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.share_copy_url_btn.clicked.connect(self._copy_active_share_url)
+        sls_lay.addWidget(self.share_copy_url_btn)
+
+        self.share_settings_btn = QPushButton("Cambiar")
+        self.share_settings_btn.setObjectName("PillBtn")
+        self.share_settings_btn.setToolTip(
+            "Cambiar ventana/monitor, calidad, FPS o audio sin cortar el enlace actual"
+        )
+        self.share_settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.share_settings_btn.clicked.connect(self._on_screen_share_reconfigure_clicked)
+        sls_lay.addWidget(self.share_settings_btn)
+
+        self.share_preview_btn = QPushButton("Vista previa")
+        self.share_preview_btn.setObjectName("PillBtn")
+        self.share_preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.share_preview_btn.clicked.connect(self._open_local_share_preview)
+        sls_lay.addWidget(self.share_preview_btn)
+
+        self.share_stop_btn = QPushButton("Detener")
+        self.share_stop_btn.setObjectName("DangerBtn")
+        self.share_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.share_stop_btn.clicked.connect(self._stop_screen_share)
+        sls_lay.addWidget(self.share_stop_btn)
+        self.share_live_strip.setVisible(False)
+        vp_lay.addWidget(self.share_live_strip)
+
+        # Banner de transmisión remota detectada en Discord
+        self.remote_share_banner = QFrame()
+        self.remote_share_banner.setObjectName("ScreenShareBanner")
+        rsb_lay = QHBoxLayout(self.remote_share_banner)
+        rsb_lay.setContentsMargins(10, 6, 8, 6)
+        rsb_lay.setSpacing(6)
+        self.remote_share_lbl = QLabel("🖥️ Pantalla compartida disponible")
+        self.remote_share_lbl.setStyleSheet(
+            "font-size: 12px; font-weight: 600; background: transparent;"
+        )
+        rsb_lay.addWidget(self.remote_share_lbl, 1)
+
+        self.remote_watch_btn = QPushButton("Ver aquí")
+        self.remote_watch_btn.setObjectName("AccentBtn")
+        self.remote_watch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.remote_watch_btn.clicked.connect(self._watch_detected_remote_share)
+        rsb_lay.addWidget(self.remote_watch_btn)
+
+        self.remote_browser_btn = QPushButton("Navegador")
+        self.remote_browser_btn.setObjectName("PillBtn")
+        self.remote_browser_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.remote_browser_btn.clicked.connect(self._open_detected_remote_in_browser)
+        rsb_lay.addWidget(self.remote_browser_btn)
+
+        self.remote_dismiss_btn = QPushButton()
+        self.remote_dismiss_btn.setObjectName("IconBtn")
+        self.remote_dismiss_btn.setFixedSize(24, 24)
+        self.remote_dismiss_btn.setToolTip("Ocultar aviso")
+        self.remote_dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.remote_dismiss_btn.clicked.connect(self._dismiss_remote_share_banner)
+        rsb_lay.addWidget(self.remote_dismiss_btn)
+        self.remote_share_banner.setVisible(False)
+        vp_lay.addWidget(self.remote_share_banner)
+
+        # Visor nativo embebido libmpv para ver pantalla compartida sin navegador
+        self.screen_viewer_card = QFrame()
+        self.screen_viewer_card.setObjectName("ScreenShareViewerCard")
+        svc_lay = QVBoxLayout(self.screen_viewer_card)
+        svc_lay.setContentsMargins(8, 6, 8, 8)
+        svc_lay.setSpacing(6)
+
+        sv_hdr = QHBoxLayout()
+        sv_hdr.setSpacing(6)
+        self.screen_viewer_title_lbl = QLabel("Pantalla compartida")
+        self.screen_viewer_title_lbl.setStyleSheet(
+            "font-size: 12px; font-weight: 700; background: transparent;"
+        )
+        sv_hdr.addWidget(self.screen_viewer_title_lbl, 1)
+
+        self.screen_viewer_mute_btn = QPushButton()
+        self.screen_viewer_mute_btn.setObjectName("IconBtn")
+        self.screen_viewer_mute_btn.setFixedSize(26, 26)
+        self.screen_viewer_mute_btn.setToolTip("Silenciar o activar audio del stream")
+        self.screen_viewer_mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.screen_viewer_mute_btn.clicked.connect(self._toggle_screen_viewer_mute)
+        sv_hdr.addWidget(self.screen_viewer_mute_btn)
+
+        self.screen_viewer_vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.screen_viewer_vol_slider.setRange(0, 100)
+        self.screen_viewer_vol_slider.setValue(80)
+        self.screen_viewer_vol_slider.setFixedWidth(90)
+        self.screen_viewer_vol_slider.setToolTip("Volumen del stream compartido")
+        self.screen_viewer_vol_slider.valueChanged.connect(self._on_screen_viewer_vol_changed)
+        sv_hdr.addWidget(self.screen_viewer_vol_slider)
+
+        self.screen_viewer_expand_btn = QPushButton("Expandir")
+        self.screen_viewer_expand_btn.setObjectName("PillBtn")
+        self.screen_viewer_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.screen_viewer_expand_btn.clicked.connect(self._toggle_screen_viewer_expanded)
+        sv_hdr.addWidget(self.screen_viewer_expand_btn)
+
+        self.screen_viewer_browser_btn = QPushButton("Navegador")
+        self.screen_viewer_browser_btn.setObjectName("PillBtn")
+        self.screen_viewer_browser_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.screen_viewer_browser_btn.clicked.connect(self._open_current_viewer_in_browser)
+        sv_hdr.addWidget(self.screen_viewer_browser_btn)
+
+        self.screen_viewer_close_btn = QPushButton("Cerrar")
+        self.screen_viewer_close_btn.setObjectName("DangerBtn")
+        self.screen_viewer_close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.screen_viewer_close_btn.clicked.connect(self._close_screen_share_viewer)
+        sv_hdr.addWidget(self.screen_viewer_close_btn)
+        svc_lay.addLayout(sv_hdr)
+
+        self.screen_video_surface = VideoSurface(self.screen_viewer_card)
+        self.screen_video_surface.setMinimumHeight(240)
+        self.screen_video_surface.double_clicked.connect(self._toggle_screen_viewer_expanded)
+        svc_lay.addWidget(self.screen_video_surface, 1)
+
+        self.screen_viewer_card.setVisible(False)
+        vp_lay.addWidget(self.screen_viewer_card, 3)
 
         self.participants_scroll = QScrollArea()
         self.participants_scroll.setObjectName("TransparentScroll")
@@ -2221,7 +2747,7 @@ class DiscordVoicePanel(QWidget):
         part_outer.addStretch(1)
 
         self.participants_scroll.setWidget(part_container)
-        vp_lay.addWidget(self.participants_scroll, 1)
+        vp_lay.addWidget(self.participants_scroll, 2)
         self.center_stack.addWidget(self.voice_pane)
 
         # Panel inferior: Chat con cabecera propia y estado de usuario en DM
@@ -2285,6 +2811,7 @@ class DiscordVoicePanel(QWidget):
         self.chat_browser.image_clicked.connect(self._open_image_lightbox)
         self.chat_browser.save_attachment_requested.connect(self._save_attachment_to_disk)
         self.chat_browser.row_context_menu_requested.connect(self._show_chat_row_context_menu)
+        self.chat_browser.screen_share_watch_requested.connect(self._open_screen_share_viewer)
         self.chat_browser.show_placeholder(
             "Selecciona un canal de texto a la izquierda para ver y enviar mensajes aquí."
         )
@@ -2664,6 +3191,14 @@ class DiscordVoicePanel(QWidget):
         self.svc.worker_ram_updated.connect(self._on_worker_ram_updated)
         self.svc.error_occurred.connect(self._on_service_error)
         self.svc.warning_occurred.connect(lambda msg: self.toast_requested.emit(msg))
+        self.svc.screen_share_detected.connect(self._on_remote_screen_share_detected)
+        self.svc.screen_share_ended.connect(self._on_remote_screen_share_ended)
+        self.screen_share_svc.state_changed.connect(self._on_screen_share_state_changed)
+        self.screen_share_svc.stats_updated.connect(self._on_screen_share_stats_updated)
+        self.screen_share_svc.worker_ram_updated.connect(self._on_screen_share_worker_ram)
+        self.screen_share_svc.error_occurred.connect(self._on_screen_share_error)
+        self.screen_share_svc.warning_occurred.connect(lambda msg: self.toast_requested.emit(msg))
+        self.screen_share_announced.connect(self._on_screen_share_announced)
         if self._thumb_cache is not None:
             self._thumb_cache.ready.connect(self._on_member_avatar_ready)
             self._thumb_cache.ready.connect(self._on_chat_image_ready)
@@ -3132,8 +3667,10 @@ class DiscordVoicePanel(QWidget):
             self.close_voice_btn,
             self.close_chat_btn,
             self.close_members_btn,
+            self.remote_dismiss_btn,
         ):
             btn.setIcon(close_ico)
+        self._sync_screen_share_icons()
         self._update_info_pill()
         self._refresh_mute_deaf_buttons()
         for card in self._participant_cards_order:
@@ -3173,6 +3710,7 @@ class DiscordVoicePanel(QWidget):
                 self._sync_dm_header_status()
             self._update_info_pill()
             self.sync_notify_channels()
+            self.screen_share_btn.setVisible(True)
         elif state == "error":
             self._joining_channel_id = ""
             self._mic_test_active = False
@@ -3187,7 +3725,10 @@ class DiscordVoicePanel(QWidget):
             )
             self.intents_banner.setVisible(False)
             self.info_pill.setVisible(False)
+            self.screen_share_btn.setVisible(self.svc.is_connected)
         else:
+            self.stop_screen_share_session()
+            self.screen_share_btn.setVisible(False)
             self._joining_channel_id = ""
             self._mic_test_active = False
             self._mic_test_prev_flags = None
@@ -3294,9 +3835,12 @@ class DiscordVoicePanel(QWidget):
     def _on_guilds_updated(self, guilds: list[dict[str, Any]]) -> None:
         self._guilds = guilds
         status_changed = False
+        voice_people: list[dict[str, Any]] = []
         for g in guilds:
             for vc in g.get("voice_channels") or ():
                 for vm in vc.get("members") or ():
+                    if isinstance(vm, dict):
+                        voice_people.append(vm)
                     uid = str(vm.get("id") or "")
                     st_raw = vm.get("status")
                     if uid and st_raw:
@@ -3304,6 +3848,7 @@ class DiscordVoicePanel(QWidget):
                         if self._user_statuses.get(uid) != norm_st:
                             self._user_statuses[uid] = norm_st
                             status_changed = True
+        healed = self._heal_dm_thread_names(voice_people)
         prev_gid = self.guild_combo.currentData()
         self.guild_combo.blockSignals(True)
         self.guild_combo.clear()
@@ -3315,7 +3860,7 @@ class DiscordVoicePanel(QWidget):
                 self.guild_combo.setCurrentIndex(idx)
         self.guild_combo.blockSignals(False)
         self._render_channels()
-        if status_changed:
+        if status_changed or healed:
             self._render_dm_threads()
             self._sync_dm_header_status()
         gid = str(self.guild_combo.currentData() or "")
@@ -3793,10 +4338,12 @@ class DiscordVoicePanel(QWidget):
 
     def _on_guild_members_updated(self, data: dict[str, Any]) -> None:
         cur_gid = str(self.guild_combo.currentData() or "")
-        for m in data.get("members") or ():
+        members_list = list(data.get("members") or [])
+        for m in members_list:
             uid = str(m.get("id") or "")
             if uid and m.get("status") is not None:
                 self._user_statuses[uid] = _normalize_presence(m.get("status"))
+        self._heal_dm_thread_names(members_list)
         self._render_dm_threads()
         self._sync_dm_header_status()
         for uid, card in self._participant_cards.items():
@@ -3961,6 +4508,80 @@ class DiscordVoicePanel(QWidget):
             return self._db.list_discord_dm_threads(limit=25)
         return list(self._dm_threads_mem)
 
+    def _resolve_known_dm_peer(self, uid: str) -> tuple[str, str]:
+        clean_id = str(uid or "").strip()
+        if not clean_id:
+            return "", ""
+        best_av = ""
+        for bucket in (self._members, self._channel_members):
+            for m in bucket or ():
+                if str(m.get("id") or "").strip() != clean_id:
+                    continue
+                cand = str(m.get("name") or "").strip()
+                av = str(m.get("avatar_url") or "").strip()
+                if av and not best_av:
+                    best_av = av
+                if cand and cand != clean_id:
+                    return cand, best_av or av
+        for g in self._guilds or ():
+            for vc in g.get("voice_channels") or ():
+                for vm in vc.get("members") or ():
+                    if str(vm.get("id") or "").strip() != clean_id:
+                        continue
+                    cand = str(vm.get("name") or "").strip()
+                    av = str(vm.get("avatar_url") or "").strip()
+                    if av and not best_av:
+                        best_av = av
+                    if cand and cand != clean_id:
+                        return cand, best_av or av
+        for th in self._load_dm_threads():
+            if str(th.get("user_id") or "").strip() != clean_id:
+                continue
+            cand = str(th.get("user_name") or "").strip()
+            av = str(th.get("avatar_url") or "").strip()
+            if av and not best_av:
+                best_av = av
+            if cand and cand != clean_id:
+                return cand, best_av or av
+        return "", best_av
+
+    def _heal_dm_thread_names(self, people: list[dict[str, Any]]) -> bool:
+        if not people:
+            return False
+        lookup: dict[str, tuple[str, str]] = {}
+        for p in people:
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get("id") or "").strip()
+            pname = str(p.get("name") or "").strip()
+            pav = str(p.get("avatar_url") or "").strip()
+            if pid and pname and pname != pid:
+                lookup[pid] = (pname, pav)
+        if not lookup:
+            return False
+        healed = False
+        for th in self._load_dm_threads():
+            uid = str(th.get("user_id") or "").strip()
+            cur_name = str(th.get("user_name") or "").strip()
+            if not uid or (cur_name and cur_name != uid):
+                continue
+            resolved = lookup.get(uid)
+            if resolved is None:
+                continue
+            real_name, av_url = resolved
+            self._upsert_dm_thread_local(uid, real_name, av_url, touch_timestamp=False)
+            healed = True
+            if (
+                self._active_chat_kind == "dm"
+                and self._active_chat_id == uid
+                and self._active_dm_peer_name in ("", uid)
+            ):
+                self._active_dm_peer_name = real_name
+                if av_url and not self._active_dm_peer_avatar:
+                    self._active_dm_peer_avatar = av_url
+                self.chat_title_lbl.setText(f"DM · {real_name}")
+        return healed
+
     def _upsert_dm_thread_local(
         self,
         uid: str,
@@ -3973,13 +4594,13 @@ class DiscordVoicePanel(QWidget):
         clean_id = str(uid or "").strip()
         if not clean_id:
             return
-        clean_name = str(name or clean_id).strip() or clean_id
+        raw_name = str(name or "").strip()
         clean_av = str(avatar_url or "").strip()
         clean_prev = str(preview or "").strip()[:120]
         if self._db is not None:
             self._db.upsert_discord_dm_thread(
                 clean_id,
-                clean_name,
+                raw_name,
                 avatar_url=clean_av,
                 last_preview=clean_prev,
                 touch_timestamp=touch_timestamp,
@@ -3990,9 +4611,16 @@ class DiscordVoicePanel(QWidget):
             None,
         )
         prev_entry = self._dm_threads_mem[idx] if idx is not None else None
+        prev_name = str(prev_entry["user_name"] or "").strip() if prev_entry else ""
+        if raw_name and raw_name != clean_id:
+            chosen_name = raw_name
+        elif prev_name and prev_name != clean_id:
+            chosen_name = prev_name
+        else:
+            chosen_name = raw_name or prev_name or clean_id
         entry = {
             "user_id": clean_id,
-            "user_name": clean_name or (prev_entry["user_name"] if prev_entry else clean_id),
+            "user_name": chosen_name,
             "avatar_url": clean_av or (prev_entry["avatar_url"] if prev_entry else ""),
             "last_preview": clean_prev or (prev_entry["last_preview"] if prev_entry else ""),
         }
@@ -4185,12 +4813,12 @@ class DiscordVoicePanel(QWidget):
         )
         live_msgs = list(data.get("messages") or [])[-80:]
         if kind == "dm":
-            peer_name = str(
-                data.get("peer_name")
-                or clean_title.replace("DM · ", "").strip()
-                or tid
-            )
-            peer_av = str(data.get("peer_avatar_url") or "")
+            raw_pn = str(
+                data.get("peer_name") or clean_title.replace("DM · ", "").strip() or ""
+            ).strip()
+            known_name, known_av = self._resolve_known_dm_peer(tid)
+            peer_name = raw_pn if (raw_pn and raw_pn != tid) else known_name
+            peer_av = str(data.get("peer_avatar_url") or known_av or "")
             self._upsert_dm_thread_local(
                 tid, peer_name, peer_av, touch_timestamp=False
             )
@@ -4232,14 +4860,21 @@ class DiscordVoicePanel(QWidget):
             self._unread_channels.pop(tid, None)
         elif kind == "dm":
             self._unread_dms.pop(tid, None)
-            self._active_dm_peer_name = str(
-                data.get("peer_name")
-                or clean_title.replace("DM · ", "").strip()
-                or self._active_dm_peer_name
-                or tid
-            )
+            raw_pn = str(
+                data.get("peer_name") or clean_title.replace("DM · ", "").strip() or ""
+            ).strip()
+            known_name, known_av = self._resolve_known_dm_peer(tid)
+            if raw_pn and raw_pn != tid:
+                resolved_pn = raw_pn
+            elif known_name:
+                resolved_pn = known_name
+            elif self._active_dm_peer_name and self._active_dm_peer_name != tid:
+                resolved_pn = self._active_dm_peer_name
+            else:
+                resolved_pn = tid
+            self._active_dm_peer_name = resolved_pn
             self._active_dm_peer_avatar = str(
-                data.get("peer_avatar_url") or self._active_dm_peer_avatar or ""
+                data.get("peer_avatar_url") or known_av or self._active_dm_peer_avatar or ""
             )
         self._emit_unread_count()
         self.chat_title_lbl.setText(clean_title)
@@ -4261,7 +4896,12 @@ class DiscordVoicePanel(QWidget):
             can_send,
             can_attach,
         )
-        if not self._sync_chat_selection_in_place():
+        stale_dm_btn = False
+        if kind == "dm" and tid in self._dm_buttons:
+            want_txt = f"  @ {self._active_dm_peer_name}"
+            if self._dm_buttons[tid].text() != want_txt:
+                stale_dm_btn = True
+        if stale_dm_btn or not self._sync_chat_selection_in_place():
             self._render_channels(force=True)
             self._render_dm_threads()
         self._render_chat_messages(can_read=can_read)
@@ -4299,10 +4939,26 @@ class DiscordVoicePanel(QWidget):
                     c_msgs = c_msgs[-80:]
                 cached["messages"] = c_msgs
         if kind == "dm" and tid:
-            peer_name = str(
-                data.get("peer_name") or self._active_dm_peer_name or tid
+            raw_pn = str(data.get("peer_name") or "").strip()
+            known_name, known_av = self._resolve_known_dm_peer(tid)
+            if raw_pn and raw_pn != tid:
+                peer_name = raw_pn
+            elif known_name:
+                peer_name = known_name
+            elif (
+                self._active_chat_kind == "dm"
+                and self._active_chat_id == tid
+                and self._active_dm_peer_name
+                and self._active_dm_peer_name != tid
+            ):
+                peer_name = self._active_dm_peer_name
+            else:
+                peer_name = ""
+            peer_av = str(
+                data.get("peer_avatar_url")
+                or known_av
+                or (self._active_dm_peer_avatar if self._active_chat_kind == "dm" and self._active_chat_id == tid else "")
             )
-            peer_av = str(data.get("peer_avatar_url") or self._active_dm_peer_avatar or "")
             self._save_dm_message_local(tid, msg, peer_name=peer_name, peer_avatar_url=peer_av)
             self._render_dm_threads()
         if kind != self._active_chat_kind or tid != self._active_chat_id:
@@ -4342,11 +4998,18 @@ class DiscordVoicePanel(QWidget):
 
         dm_patched: dict[str, Any] | None = None
         if kind == "dm":
+            known_name, known_av = self._resolve_known_dm_peer(tid)
             dm_msgs = self._load_dm_messages_local(tid)
             for m in dm_msgs:
                 if str(m.get("id") or "") == mid:
                     dm_patched = _patch_entry(m)
-                    self._save_dm_message_local(tid, dm_patched, touch_timestamp=False)
+                    self._save_dm_message_local(
+                        tid,
+                        dm_patched,
+                        peer_name=known_name,
+                        peer_avatar_url=known_av,
+                        touch_timestamp=False,
+                    )
                     break
 
         if kind == self._active_chat_kind and tid == self._active_chat_id:
@@ -5401,3 +6064,487 @@ class DiscordVoicePanel(QWidget):
     def _on_user_vol_value_changed(self, uid: str, value: int) -> None:
         self._user_volumes[uid] = value
         self.svc.set_user_volume(uid, value)
+
+    # ------------------------------------------------------------------ #
+    # Compartida de pantalla aislada + visor nativo libmpv lazy          #
+    # ------------------------------------------------------------------ #
+
+    def _sync_screen_share_icons(self) -> None:
+        p = self.palette
+        if hasattr(self, "screen_share_btn"):
+            sharing = self._screen_share_state in ("starting", "sharing")
+            self.screen_share_btn.setIcon(
+                render_icon(
+                    "screen_share_off" if sharing else "screen_share",
+                    "#F87171" if sharing else p.text,
+                    14,
+                )
+            )
+        if hasattr(self, "screen_viewer_mute_btn"):
+            self.screen_viewer_mute_btn.setIcon(
+                render_icon("mute" if self._screen_viewer_muted else "volume", p.text, 14)
+            )
+
+    def _current_guild_text_channels(self) -> list[tuple[str, str]]:
+        gid = str(self.guild_combo.currentData() or self._selected_guild_id or "")
+        guild = next((g for g in self._guilds if str(g.get("id")) == gid), None)
+        if not guild:
+            return []
+        hidden = set(self.cfg.discord_hidden_channels)
+        out: list[tuple[str, str]] = []
+        for tc in guild.get("text_channels") or ():
+            cid = str(tc.get("id") or "")
+            if not cid or cid in hidden:
+                continue
+            cname = str(tc.get("name") or "general")
+            out.append((cid, cname))
+        return out
+
+    def _current_dm_targets(self) -> list[tuple[str, str]]:
+        targets: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        def _add(uid: str, name: str, suffix: str = "") -> None:
+            clean_uid = str(uid or "").strip()
+            clean_name = str(name or "").strip()
+            if not clean_uid or not clean_name or clean_uid in seen:
+                return
+            seen.add(clean_uid)
+            targets.append((clean_uid, f"{clean_name}{suffix}"))
+
+        for part in self._voice_state.get("participants") or ():
+            if part.get("is_self") or part.get("is_bot"):
+                continue
+            _add(str(part.get("id") or ""), str(part.get("name") or ""), " (en voz)")
+
+        for dm in self._load_dm_threads():
+            _add(str(dm.get("user_id") or ""), str(dm.get("user_name") or ""))
+
+        for pool in (self._channel_members, self._members):
+            for mem in pool:
+                if mem.get("is_bot"):
+                    continue
+                _add(str(mem.get("id") or ""), str(mem.get("name") or ""))
+        return targets
+
+    def _on_screen_share_btn_clicked(self) -> None:
+        if self._screen_share_state in ("starting", "sharing"):
+            self._stop_screen_share()
+            return
+        channels = self._current_guild_text_channels()
+        dm_targets = self._current_dm_targets()
+        default_target: tuple[str, str] | None = None
+        if self._active_chat_kind in ("channel", "dm") and self._active_chat_id:
+            default_target = (self._active_chat_kind, str(self._active_chat_id))
+        dlg = _ScreenShareSetupDialog(
+            self.screen_share_svc,
+            self.palette,
+            channels,
+            dm_targets=dm_targets,
+            default_target=default_target,
+            parent=self.window() or self,
+        )
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            opts = dlg.selected_options()
+        finally:
+            dlg.deleteLater()
+
+        self._screen_share_pending_opts = opts
+        self.screen_share_btn.setEnabled(False)
+        self.screen_share_btn.setText(" Iniciando...")
+        self.screen_share_svc.start_share(
+            source_id=str(opts["source_id"]),
+            quality=str(opts["quality"]),
+            fps=int(opts["fps"]),
+            include_audio=bool(opts["include_audio"]),
+            title=str(opts["title"]),
+            use_tunnel=True,
+            exclude_pid=int(self.svc.worker_pid or 0),
+        )
+
+    def _on_screen_share_reconfigure_clicked(self) -> None:
+        if self._screen_share_state != "sharing":
+            return
+        info = dict(self._screen_share_info)
+        channels = self._current_guild_text_channels()
+        dm_targets = self._current_dm_targets()
+        dlg = _ScreenShareSetupDialog(
+            self.screen_share_svc,
+            self.palette,
+            channels,
+            dm_targets=dm_targets,
+            is_live_edit=True,
+            current_source_id=str(info.get("source_id") or ""),
+            current_quality=str(info.get("quality") or "720p"),
+            current_fps=int(info.get("fps") or 30),
+            current_include_audio=bool(info.get("include_audio", info.get("has_audio", True))),
+            parent=self.window() or self,
+        )
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            opts = dlg.selected_options()
+        finally:
+            dlg.deleteLater()
+
+        self._screen_share_pending_opts = opts
+        self.share_settings_btn.setEnabled(False)
+        self.share_settings_btn.setText("Cambiando...")
+        self.screen_share_svc.reconfigure_share(
+            source_id=str(opts["source_id"]),
+            quality=str(opts["quality"]),
+            fps=int(opts["fps"]),
+            include_audio=bool(opts["include_audio"]),
+            title=str(opts["title"]),
+            exclude_pid=int(self.svc.worker_pid or 0),
+        )
+
+    def _on_screen_share_worker_ram(self, ws_mb: float, priv_mb: float) -> None:
+        self._screen_share_ws_mb = max(0.0, float(ws_mb))
+        self._screen_share_priv_mb = max(0.0, float(priv_mb))
+        if self._screen_share_state == "sharing":
+            self._refresh_share_live_strip()
+        self.screen_share_ram_updated.emit(self._screen_share_ws_mb, self._screen_share_priv_mb)
+
+    def _on_screen_share_state_changed(self, state: str, data: dict[str, Any]) -> None:
+        self._screen_share_state = state
+        self.screen_share_btn.setEnabled(True)
+        self.share_settings_btn.setEnabled(True)
+        self.share_settings_btn.setText("Cambiar")
+        if state == "starting":
+            self.screen_share_btn.setText(" Iniciando...")
+            self._sync_screen_share_icons()
+            return
+
+        if state == "sharing":
+            is_reconf = bool(data.get("reconfigured", False))
+            self._screen_share_info = dict(data)
+            if not is_reconf:
+                self._screen_share_stats = {}
+            self.screen_share_btn.setText(" Dejar de compartir")
+            self.screen_share_btn.setObjectName("DangerBtn")
+            self.screen_share_btn.style().unpolish(self.screen_share_btn)
+            self.screen_share_btn.style().polish(self.screen_share_btn)
+            self._sync_screen_share_icons()
+            self._refresh_share_live_strip()
+            self.share_live_strip.setVisible(True)
+            self._set_pane_visible("voice", True)
+
+            opts = self._screen_share_pending_opts
+            self._screen_share_pending_opts = None
+            targets = list((opts or {}).get("targets") or [])
+            if opts and opts.get("announce") and targets:
+                txt = format_screen_share_announcement(
+                    watch_url=str(data.get("watch_url") or ""),
+                    quality=str(data.get("quality") or "720p"),
+                    fps=int(data.get("fps") or 30),
+                    has_audio=bool(data.get("has_audio", False)),
+                    title=str(data.get("title") or "Pantalla compartida"),
+                )
+                for tgt_kind, tgt_id in targets:
+                    fut = self.svc.send_chat_message(tgt_kind, tgt_id, txt, await_result=True)
+                    if fut is not None:
+                        def _on_sent(
+                            f: Any, k: str = str(tgt_kind), tid: str = str(tgt_id)
+                        ) -> None:
+                            try:
+                                res = f.result()
+                                if isinstance(res, dict) and res.get("message_id"):
+                                    self.screen_share_announced.emit(
+                                        k, tid, str(res["message_id"])
+                                    )
+                            except Exception:
+                                pass
+
+                        fut.add_done_callback(_on_sent)
+
+            if is_reconf and self._screen_viewer_active and self._screen_viewer_is_local_preview:
+                local_url = str(
+                    data.get("local_stream_url") or data.get("stream_url") or ""
+                ).strip()
+                if local_url and self._screen_player is not None:
+                    self.screen_viewer_title_lbl.setText(
+                        f"Vista previa · {data.get('title') or 'Tu pantalla'}"
+                    )
+                    self._screen_player.play_stream(local_url, is_live=True, low_latency=True)
+                    QTimer.singleShot(80, self.screen_video_surface.force_native_redraw)
+
+            self.toast_requested.emit(
+                "Transmisión actualizada en vivo."
+                if is_reconf
+                else "Compartida de pantalla iniciada."
+            )
+            return
+
+        # Idle
+        self._screen_share_info = {}
+        self._screen_share_stats = {}
+        self._screen_share_ws_mb = 0.0
+        self._screen_share_priv_mb = 0.0
+        self._screen_share_pending_opts = None
+        self.screen_share_btn.setText(" Compartir pantalla")
+        self.screen_share_btn.setObjectName("PillBtn")
+        self.screen_share_btn.style().unpolish(self.screen_share_btn)
+        self.screen_share_btn.style().polish(self.screen_share_btn)
+        self._sync_screen_share_icons()
+        self.share_live_strip.setVisible(False)
+        if self._screen_viewer_active and self._screen_viewer_is_local_preview:
+            self._close_screen_share_viewer()
+        self._mark_announced_share_ended()
+        self.screen_share_ram_updated.emit(0.0, 0.0)
+
+    def _on_screen_share_announced(
+        self, kind: str, target_id: str, message_id: str
+    ) -> None:
+        if self._screen_share_state == "sharing":
+            self._screen_share_announces.append(
+                (str(kind), str(target_id), str(message_id))
+            )
+
+    def _mark_announced_share_ended(self) -> None:
+        anns = list(self._screen_share_announces)
+        self._screen_share_announces.clear()
+        if anns and self.svc.is_connected:
+            for kind, tid, mid in anns:
+                try:
+                    self.svc.edit_chat_message(
+                        kind, tid, mid, f"⏹️ {SCREEN_SHARE_ENDED_MARKER}."
+                    )
+                except Exception:
+                    pass
+
+    def _on_screen_share_stats_updated(self, stats: dict[str, Any]) -> None:
+        self._screen_share_stats = dict(stats)
+        if self._screen_share_state == "sharing":
+            self._refresh_share_live_strip()
+
+    def _refresh_share_live_strip(self) -> None:
+        info = self._screen_share_info
+        st = self._screen_share_stats
+        q = str(st.get("quality") or info.get("quality") or "720p")
+        fps = int(st.get("fps") or info.get("fps") or 30)
+        enc = str(st.get("encoder") or info.get("encoder") or "h264")
+        enc_lbl = enc.replace("h264_", "").upper()
+        viewers = int(st.get("viewers") or 0)
+        kbps = int(st.get("bitrate_kbps") or 0)
+        br_txt = f" · {kbps / 1000.0:.1f} Mbps" if kbps > 0 else ""
+        v_txt = f"{viewers} espectador" if viewers == 1 else f"{viewers} espectadores"
+        self.share_live_lbl.setText(
+            f"🔴 Compartiendo · {q} {fps}fps · {enc_lbl}{br_txt} · {v_txt}"
+        )
+        ram_tip = (
+            f"Consumo real de compartida (worker + FFmpeg + túnel): "
+            f"{self._screen_share_ws_mb:.1f} MB (Priv: {self._screen_share_priv_mb:.1f} MB)"
+            if self._screen_share_ws_mb > 0.0
+            else "Midiendo consumo del worker de pantalla..."
+        )
+        self.share_live_lbl.setToolTip(ram_tip)
+
+    def _on_screen_share_error(self, msg: str) -> None:
+        self._screen_share_pending_opts = None
+        self.screen_share_btn.setEnabled(True)
+        self._on_screen_share_state_changed("idle", {})
+        self.toast_requested.emit(f"Pantalla compartida: {msg}")
+
+    def _stop_screen_share(self) -> None:
+        if self._screen_viewer_active and self._screen_viewer_is_local_preview:
+            self._close_screen_share_viewer()
+        self._mark_announced_share_ended()
+        self.screen_share_svc.stop_share()
+
+    def _copy_active_share_url(self) -> None:
+        url = str(self._screen_share_info.get("watch_url") or "").strip()
+        if not url:
+            return
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(url)
+            self.toast_requested.emit("Enlace de pantalla compartida copiado")
+
+    def _open_local_share_preview(self) -> None:
+        url = str(
+            self._screen_share_info.get("local_stream_url")
+            or self._screen_share_info.get("stream_url")
+            or ""
+        ).strip()
+        watch = str(
+            self._screen_share_info.get("watch_url")
+            or self._screen_share_info.get("local_watch_url")
+            or ""
+        ).strip()
+        if not url:
+            return
+        self._open_screen_share_viewer(
+            {
+                "title": f"Vista previa · {self._screen_share_info.get('title') or 'Tu pantalla'}",
+                "stream_url": url,
+                "watch_url": watch,
+                "is_local_preview": True,
+                "start_muted": True,
+            }
+        )
+
+    def _on_remote_screen_share_detected(self, data: dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        if data.get("is_self") and self._screen_share_state == "sharing":
+            return
+        self._remote_screen_share = dict(data)
+        author = str(data.get("author_name") or "Usuario")
+        ch_name = str(data.get("channel_name") or "")
+        if data.get("is_dm") or ch_name.startswith("DM"):
+            loc = f" ({ch_name})" if ch_name else " (DM)"
+        else:
+            loc = f" en #{ch_name}" if ch_name else ""
+        self.remote_share_lbl.setText(f"🖥️ {author} está compartiendo pantalla{loc}")
+        self.remote_share_banner.setVisible(True)
+
+    def _on_remote_screen_share_ended(self, data: dict[str, Any]) -> None:
+        mid = str((data or {}).get("message_id") or "")
+        cur_mid = str((self._remote_screen_share or {}).get("message_id") or "")
+        if not mid or (cur_mid and cur_mid == mid):
+            self._remote_screen_share = None
+            self.remote_share_banner.setVisible(False)
+            if self._screen_viewer_active and cur_mid and cur_mid == mid:
+                self._close_screen_share_viewer()
+                self.toast_requested.emit("La transmisión de pantalla ha finalizado.")
+
+    def _dismiss_remote_share_banner(self) -> None:
+        self.remote_share_banner.setVisible(False)
+
+    def _watch_detected_remote_share(self) -> None:
+        if self._remote_screen_share:
+            self._open_screen_share_viewer(self._remote_screen_share)
+
+    def _open_detected_remote_in_browser(self) -> None:
+        if not self._remote_screen_share:
+            return
+        url = str(self._remote_screen_share.get("watch_url") or "").strip()
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _on_screen_player_vo_error(self, _detail: str) -> None:
+        if self._screen_viewer_active and self._screen_player is not None:
+            if self._screen_player.refresh_video_output():
+                QTimer.singleShot(120, self.screen_video_surface.force_native_redraw)
+            else:
+                self.screen_video_surface.force_native_redraw()
+
+    def _ensure_screen_player(self) -> MediaPlayer:
+        if self._screen_player is None:
+            self._screen_player = MediaPlayer(
+                wid=int(self.screen_video_surface.winId()),
+                initial_volume=self._screen_viewer_volume,
+                normalization=False,
+                lazy=True,
+                parent=self,
+            )
+            self._screen_player.vo_error_detected.connect(self._on_screen_player_vo_error)
+        return self._screen_player
+
+    def _open_screen_share_viewer(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        stream_url = str(payload.get("stream_url") or "").strip()
+        watch_url = str(payload.get("watch_url") or "").strip()
+        if not stream_url:
+            return
+        author = str(payload.get("author_name") or "").strip()
+        title = str(payload.get("title") or "").strip()
+        header = title or (f"Pantalla de {author}" if author else "Pantalla compartida")
+
+        self._screen_viewer_stream_url = stream_url
+        self._screen_viewer_watch_url = watch_url
+        self._screen_viewer_active = True
+        self._screen_viewer_is_local_preview = bool(payload.get("is_local_preview", False))
+        if "start_muted" in payload:
+            self._screen_viewer_muted = bool(payload.get("start_muted"))
+        elif not self._screen_viewer_is_local_preview:
+            self._screen_viewer_muted = False
+        self.screen_viewer_title_lbl.setText(header)
+        self.screen_viewer_card.setVisible(True)
+        self._set_pane_visible("voice", True)
+
+        player = self._ensure_screen_player()
+        player.set_volume(0 if self._screen_viewer_muted else self._screen_viewer_volume)
+        player.play_stream(stream_url, is_live=True, low_latency=True)
+        self._sync_screen_share_icons()
+        QTimer.singleShot(45, self.screen_video_surface.force_native_redraw)
+
+    def _close_screen_share_viewer(self) -> None:
+        self._screen_viewer_active = False
+        self._screen_viewer_is_local_preview = False
+        self._screen_viewer_expanded = False
+        self._screen_viewer_stream_url = ""
+        self._screen_viewer_watch_url = ""
+        self.screen_viewer_expand_btn.setText("Expandir")
+        self.participants_scroll.setVisible(True)
+        self.screen_viewer_card.setVisible(False)
+        if self._screen_player is not None:
+            try:
+                self._screen_player.unload()
+            except Exception:
+                pass
+
+    def _toggle_screen_viewer_expanded(self) -> None:
+        if not self._screen_viewer_active:
+            return
+        self._screen_viewer_expanded = not self._screen_viewer_expanded
+        self.participants_scroll.setVisible(not self._screen_viewer_expanded)
+        self.screen_viewer_expand_btn.setText(
+            "Mostrar miembros" if self._screen_viewer_expanded else "Expandir"
+        )
+        QTimer.singleShot(45, self.screen_video_surface.force_native_redraw)
+
+    def _toggle_screen_viewer_mute(self) -> None:
+        self._screen_viewer_muted = not self._screen_viewer_muted
+        if self._screen_player is not None:
+            self._screen_player.set_volume(
+                0 if self._screen_viewer_muted else self._screen_viewer_volume
+            )
+        self._sync_screen_share_icons()
+
+    def _on_screen_viewer_vol_changed(self, value: int) -> None:
+        self._screen_viewer_volume = max(0, min(100, int(value)))
+        if self._screen_viewer_volume > 0 and self._screen_viewer_muted:
+            self._screen_viewer_muted = False
+        elif self._screen_viewer_volume == 0:
+            self._screen_viewer_muted = True
+        if self._screen_player is not None:
+            self._screen_player.set_volume(
+                0 if self._screen_viewer_muted else self._screen_viewer_volume
+            )
+        self._sync_screen_share_icons()
+
+    def _open_current_viewer_in_browser(self) -> None:
+        if self._screen_viewer_watch_url:
+            QDesktopServices.openUrl(QUrl(self._screen_viewer_watch_url))
+
+    def stop_screen_share_session(self) -> None:
+        """Detiene compartida y visor al desconectar Discord, manteniendo el servicio reutilizable."""
+        self._remote_screen_share = None
+        if hasattr(self, "remote_share_banner"):
+            self.remote_share_banner.setVisible(False)
+        self._close_screen_share_viewer()
+        self._mark_announced_share_ended()
+        if hasattr(self, "screen_share_svc"):
+            try:
+                self.screen_share_svc.stop_share()
+            except Exception:
+                pass
+
+    def shutdown_screen_share(self) -> None:
+        self.stop_screen_share_session()
+        if self._screen_player is not None:
+            try:
+                self._screen_player.shutdown()
+            except Exception:
+                pass
+            self._screen_player = None
+        if hasattr(self, "screen_share_svc"):
+            try:
+                self.screen_share_svc.close()
+            except Exception:
+                pass

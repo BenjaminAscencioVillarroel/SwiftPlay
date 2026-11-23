@@ -19,12 +19,17 @@ SwiftPlay is engineered around strict **RAM minimization** and **crash/dependenc
 
 3. **Discord Voice & Gateway Subprocess (`swiftplay.discord_worker` via `DiscordService`)**
    - Spawned only when the user clicks **Conectar Bot**; consumes **0 MB** beforehand and upon disconnect/kill (`connect_bot` queued ahead of audio enumeration).
-   - Runs asyncio `discord.py[voice]` Gateway client over an explicit IPv4 `aiohttp.TCPConnector(limit=0, family=socket.AF_INET)`, parallel `AudioEngine.start()` + `channel.connect()`, DAVE E2EE voice transport (`davey` with `can_passthrough` fallback and unencrypted `OPUS_SILENCE`), `OP 11` + DAVE SSRC probing, RTP/AEAD audio mixer (`VoiceAudioMixer`), `sounddevice` input/output audio streams (`AudioEngine` skipping WDM-KS when WASAPI/MME exist, offloaded via `asyncio.to_thread`), bounded `2.5s` `vc.disconnect()`, noise suppression (`ai_max` DeepFilterNet3 + Silero VAD v6, `ai` with non-blocking warmup & instant WebRTC fallback, `webrtc`, `off`), AGC, per-user volume (`0–200%`), `connect_diag` timing telemetry, guild/channel/member snapshot emission, live `presence` events, and DM/channel chat IPC.
+   - Runs asyncio `discord.py[voice]` Gateway client over an explicit IPv4 `aiohttp.TCPConnector(limit=0, family=socket.AF_INET)`, parallel `AudioEngine.start()` + `channel.connect()`, DAVE E2EE voice transport (`davey` with `can_passthrough` fallback and unencrypted `OPUS_SILENCE`), `OP 11` + DAVE SSRC probing, RTP/AEAD audio mixer (`VoiceAudioMixer`), `sounddevice` input/output audio streams (`AudioEngine` skipping WDM-KS when WASAPI/MME exist, offloaded via `asyncio.to_thread`), bounded `2.5s` `vc.disconnect()`, noise suppression (`ai_max` DeepFilterNet3 + Silero VAD v6, `ai` with non-blocking warmup & instant WebRTC fallback, `webrtc`, `off`), AGC, per-user volume (`0–200%`), `connect_diag` timing telemetry, guild/channel/member snapshot emission, live `presence` events, DM/channel chat IPC, and screen-share link detection (`screen_share_detected` / `screen_share_ended`).
 
-4. **Dual Lazy `libmpv` Players (`swiftplay.player:MediaPlayer`)**
+4. **Screen Share Subprocess (`swiftplay.screen_share_worker` via `ScreenShareService`)**
+   - Spawned on demand when configuring/starting a screen share; terminates completely (`0 MB` idle) when stopped or disconnected.
+   - Captures Windows monitors (`ddagrab` -> `gdigrab` fallback) or windows (`gdigrab`) with `-threads 2` and hardware H.264 (`h264_nvenc`/`h264_amf`/`h264_qsv`/`libx264` fallback) + pure-`ctypes` COM Process Loopback audio (`VAD\Process_Loopback` excluding `DiscordService.worker_pid` with 20 ms silence padding), parses fMP4 boxes (`Mp4FragmentSplitter`), serves authenticated `/watch` (WebSocket MSE HTML5 player supporting seamless `reset` hot-reconfiguration) + `/ws` + `/stream.mp4` via local `aiohttp` (`ScreenShareRelay`), exposes an ephemeral HTTPS URL via `cloudflared` quick tunnel, and reports full process-tree RAM (`worker_ram`) via `get_pid_memory_mb`.
+
+5. **Triple Lazy `libmpv` Players (`swiftplay.player:MediaPlayer`)**
    - `MainWindow.video_player`: bound to `VideoPlayerPanel.video_surface.winId()`, hardware/GPU-capable, unloads automatically after `20s` paused (`_video_idle_unload_timer`) or on `close_media_btn`.
    - `MainWindow.music_player`: headless audio-only (`wid=None`), unloads after `45s` paused (`_music_idle_unload_timer`) or on `close_media_btn`.
-   - In "Modo A" (`auto_pause_other_player=True`), starting one deck pauses the other; `Tab` rotates pages: YouTube -> YT Music -> Twitch -> Discord.
+   - `DiscordVoicePanel._screen_player`: instantiated lazily when opening a shared screen stream inside `screen_viewer_card`, played with `low_latency=True` (`cache=no`), and unloaded immediately on close.
+   - In "Modo A" (`auto_pause_other_player=True`), starting one main deck pauses the other; `Tab` rotates pages: YouTube -> YT Music -> Twitch -> Discord.
 
 ---
 

@@ -65,6 +65,8 @@ class DiscordService(QObject):
     chat_message_edited = Signal(dict)
     channel_message_incoming = Signal(dict)
     dm_incoming = Signal(dict)
+    screen_share_detected = Signal(dict)
+    screen_share_ended = Signal(dict)
     error_occurred = Signal(str)
     warning_occurred = Signal(str)
 
@@ -88,6 +90,13 @@ class DiscordService(QObject):
     def is_worker_running(self) -> bool:
         with self._lock:
             return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def worker_pid(self) -> int | None:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return int(self._proc.pid)
+            return None
 
     @property
     def is_connected(self) -> bool:
@@ -260,6 +269,10 @@ class DiscordService(QObject):
                 self.channel_message_incoming.emit(data)
             elif event == "dm_incoming" and isinstance(data, dict):
                 self.dm_incoming.emit(data)
+            elif event == "screen_share_detected" and isinstance(data, dict):
+                self.screen_share_detected.emit(data)
+            elif event == "screen_share_ended" and isinstance(data, dict):
+                self.screen_share_ended.emit(data)
             elif event == "error" and isinstance(data, dict):
                 self.error_occurred.emit(str(data.get("message") or "Error de Discord"))
             elif event == "warning" and isinstance(data, dict):
@@ -432,7 +445,9 @@ class DiscordService(QObject):
         file_paths: list[str] | None = None,
         cleanup_paths: list[str] | None = None,
         reply_to_id: int | str | None = None,
-    ) -> None:
+        *,
+        await_result: bool = False,
+    ) -> Future[Any] | None:
         payload: dict[str, Any] = {
             "kind": str(kind),
             "target_id": str(target_id),
@@ -444,10 +459,11 @@ class DiscordService(QObject):
             payload["cleanup_paths"] = [str(p) for p in cleanup_paths if str(p or "").strip()]
         if reply_to_id is not None and str(reply_to_id).strip():
             payload["reply_to_id"] = str(reply_to_id).strip()
-        self._send_command(
+        return self._send_command(
             "send_chat_message",
             payload,
             spawn=False,
+            await_result=await_result,
         )
 
     def edit_chat_message(

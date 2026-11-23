@@ -16,6 +16,7 @@ import json
 import math
 import os
 import queue
+import re
 import struct
 import sys
 import threading
@@ -33,6 +34,23 @@ SILENCE_PCM = b"\x00" * PCM_FRAME_BYTES
 OPUS_SILENCE = b"\xf8\xff\xfe"
 
 _AUDIOOP_CACHE: Any = None
+_SCREEN_SHARE_URL_RE = re.compile(
+    r"(https://[a-z0-9-]+\.trycloudflare\.com|http://127\.0\.0\.1:\d+)/watch\?t=([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
+_SCREEN_SHARE_ENDED_MARKER = "Transmisión de pantalla finalizada"
+
+
+def _extract_screen_share_urls(content: str) -> tuple[str, str] | None:
+    txt = str(content or "")
+    if not txt or _SCREEN_SHARE_ENDED_MARKER.lower() in txt.lower():
+        return None
+    m = _SCREEN_SHARE_URL_RE.search(txt)
+    if not m:
+        return None
+    base = m.group(1).rstrip("/")
+    tok = m.group(2)
+    return f"{base}/watch?t={tok}", f"{base}/stream.mp4?t={tok}"
 
 
 def _get_audioop() -> Any:
@@ -324,6 +342,7 @@ class _DeepFilterMicDsp:
         self._silero = _SileroVoiceGate()
         self._ready = False
         self._warming = False
+        self._warmup_requested = False
         self._warmup_flag_lock = threading.Lock()
         self._failed = False
 
@@ -424,22 +443,42 @@ class _DeepFilterMicDsp:
         if self._ready or self._failed or self._mode not in ("ai", "ai_max"):
             return
         with self._warmup_flag_lock:
-            if self._warming or self._ready or self._failed or self._mode not in ("ai", "ai_max"):
+            if self._ready or self._failed or self._mode not in ("ai", "ai_max"):
+                return
+            if self._warming:
+                self._warmup_requested = True
                 return
             self._warming = True
+            self._warmup_requested = False
 
         def _bg() -> None:
+            ok_any = False
             try:
-                ok = self.warmup()
-                if ok:
+                while True:
+                    ok = False
+                    try:
+                        ok = self.warmup()
+                        ok_any = ok_any or bool(ok)
+                    except Exception:
+                        pass
+                    with self._warmup_flag_lock:
+                        need_more = bool(
+                            self._warmup_requested
+                            and not self._ready
+                            and not self._failed
+                            and self._mode in ("ai", "ai_max")
+                        )
+                        self._warmup_requested = False
+                        if not need_more:
+                            self._warming = False
+                            break
+                if ok_any:
                     try:
                         from swiftplay.windows_os import trim_process_memory
 
                         trim_process_memory(collect_gc=True)
                     except Exception:
                         pass
-            except Exception:
-                pass
             finally:
                 with self._warmup_flag_lock:
                     self._warming = False
@@ -1511,6 +1550,8 @@ class AudioEngine:
         self._out_opened_at = 0.0
         self._in_cb_count = 0
         self._out_cb_count = 0
+        self._last_in_cb_ts = 0.0
+        self._last_out_cb_ts = 0.0
         self._in_candidate_skip = 0
         self._out_candidate_skip = 0
         self._in_recoveries = 0
@@ -1657,39 +1698,55 @@ class AudioEngine:
             return None
 
     def check_and_recover_streams(self, now: float | None = None) -> tuple[bool, bool]:
-        """Reabre streams que no emitieron callbacks PortAudio tras >= 1.2s desde su apertura."""
+        """Reabre streams congelados al iniciar o bloqueados a mitad de llamada."""
         if not self._running:
             return False, False
         t = time.monotonic() if now is None else float(now)
         rec_in = False
         rec_out = False
 
-        in_stale = (t - self._in_opened_at) >= 1.2 and (
+        in_cold_stale = (t - self._in_opened_at) >= 1.2 and (
             self._input_stream is None
             or self._in_cb_count == 0
             or not getattr(self._input_stream, "active", True)
         )
-        if in_stale and self._in_recoveries < 6:
+        in_mid_stall = (
+            self._in_cb_count > 0
+            and self._last_in_cb_ts > 0.0
+            and (t - self._last_in_cb_ts) >= 2.0
+        )
+        if in_mid_stall and (self._last_in_cb_ts - self._in_opened_at) >= 10.0:
+            self._in_recoveries = 0
+        if (in_cold_stale or in_mid_stall) and self._in_recoveries < 6:
             with self._lock:
                 old_in = self._input_stream
                 self._input_stream = None
             self._close_stream(old_in)
-            self._in_candidate_skip += 1
+            if in_cold_stale:
+                self._in_candidate_skip += 1
             self._in_recoveries += 1
             self._open_input_stream()
             rec_in = True
 
-        out_stale = (t - self._out_opened_at) >= 1.2 and (
+        out_cold_stale = (t - self._out_opened_at) >= 1.2 and (
             self._output_stream is None
             or self._out_cb_count == 0
             or not getattr(self._output_stream, "active", True)
         )
-        if out_stale and self._out_recoveries < 6:
+        out_mid_stall = (
+            self._out_cb_count > 0
+            and self._last_out_cb_ts > 0.0
+            and (t - self._last_out_cb_ts) >= 1.5
+        )
+        if out_mid_stall and (self._last_out_cb_ts - self._out_opened_at) >= 10.0:
+            self._out_recoveries = 0
+        if (out_cold_stale or out_mid_stall) and self._out_recoveries < 6:
             with self._lock:
                 old_out = self._output_stream
                 self._output_stream = None
             self._close_stream(old_out)
-            self._out_candidate_skip += 1
+            if out_cold_stale:
+                self._out_candidate_skip += 1
             self._out_recoveries += 1
             self._open_output_stream()
             rec_out = True
@@ -1735,6 +1792,7 @@ class AudioEngine:
         import sounddevice as sd
 
         self._out_cb_count = 0
+        self._last_out_cb_ts = 0.0
         self._out_opened_at = time.monotonic()
         dev_cands = resolve_device_candidates(self._output_device_name, "output")
         n_cands = len(dev_cands)
@@ -1796,6 +1854,7 @@ class AudioEngine:
         import sounddevice as sd
 
         self._in_cb_count = 0
+        self._last_in_cb_ts = 0.0
         self._in_opened_at = time.monotonic()
         dev_cands = resolve_device_candidates(self._input_device_name, "input")
         n_cands = len(dev_cands)
@@ -1856,6 +1915,7 @@ class AudioEngine:
             outdata[:] = b"\x00" * needed
             return
         self._out_cb_count += 1
+        self._last_out_cb_ts = time.monotonic()
         try:
             aop = _get_audioop()
             while len(self._out_buf) < needed:
@@ -1888,6 +1948,7 @@ class AudioEngine:
         if not self._running:
             return
         self._in_cb_count += 1
+        self._last_in_cb_ts = time.monotonic()
         if self._muted and not self._loopback:
             return
         raw = bytes(indata)
@@ -3191,6 +3252,26 @@ class DiscordWorkerApp:
             ch = getattr(message, "channel", None)
             ch_id = _safe_int(getattr(ch, "id", 0))
             if guild is not None:
+                ss_urls = _extract_screen_share_urls(payload.get("content") or "")
+                if ss_urls is not None:
+                    watch_u, stream_u = ss_urls
+                    self.emit_event(
+                        "screen_share_detected",
+                        {
+                            "guild_id": str(guild.id),
+                            "guild_name": str(getattr(guild, "name", "") or ""),
+                            "channel_id": str(ch_id),
+                            "channel_name": str(getattr(ch, "name", "") or "canal"),
+                            "message_id": str(payload.get("id") or ""),
+                            "author_id": str(payload.get("author_id") or ""),
+                            "author_name": str(payload.get("author_name") or "Usuario"),
+                            "author_avatar_url": str(payload.get("author_avatar_url") or ""),
+                            "watch_url": watch_u,
+                            "stream_url": stream_u,
+                            "content": str(payload.get("content") or ""),
+                            "is_self": bool(payload.get("is_self", False)),
+                        },
+                    )
                 if self._active_chat_kind == "channel" and ch_id == self._active_chat_id:
                     self.emit_event(
                         "chat_message",
@@ -3232,14 +3313,43 @@ class DiscordWorkerApp:
                         break
             if not peer_id:
                 return
+            if recip is None:
+                try:
+                    recip = client.get_user(peer_id)
+                except Exception:
+                    recip = None
             self._dm_channels[peer_id] = ch_id
             peer_name = str(
                 getattr(recip, "display_name", "")
                 or getattr(recip, "name", "")
-                or payload["author_name"]
-                or peer_id
+                or ("" if payload["is_self"] else payload["author_name"])
+                or ""
             )
             peer_avatar = _member_avatar_url(recip) if recip is not None else ""
+            ss_urls = _extract_screen_share_urls(payload.get("content") or "")
+            if ss_urls is not None:
+                watch_u, stream_u = ss_urls
+                self.emit_event(
+                    "screen_share_detected",
+                    {
+                        "guild_id": "",
+                        "guild_name": "",
+                        "channel_id": str(ch_id),
+                        "channel_name": f"DM · {peer_name}",
+                        "message_id": str(payload.get("id") or ""),
+                        "author_id": str(payload.get("author_id") or ""),
+                        "author_name": str(payload.get("author_name") or peer_name),
+                        "author_avatar_url": str(
+                            payload.get("author_avatar_url") or peer_avatar or ""
+                        ),
+                        "watch_url": watch_u,
+                        "stream_url": stream_u,
+                        "content": str(payload.get("content") or ""),
+                        "is_self": bool(payload.get("is_self", False)),
+                        "is_dm": True,
+                        "user_id": str(peer_id),
+                    },
+                )
             if self._active_chat_kind == "dm" and peer_id == self._active_chat_id:
                 self.emit_event(
                     "chat_message",
@@ -3281,6 +3391,15 @@ class DiscordWorkerApp:
                 return
             new_content = str(raw_data.get("content") or "")[:2000]
             guild_id = _safe_int(getattr(raw_payload, "guild_id", 0))
+            if _SCREEN_SHARE_ENDED_MARKER.lower() in new_content.lower():
+                self.emit_event(
+                    "screen_share_ended",
+                    {
+                        "guild_id": str(guild_id) if guild_id else "",
+                        "channel_id": str(ch_id),
+                        "message_id": msg_id,
+                    },
+                )
             if guild_id:
                 kind = "channel"
                 tid = ch_id
@@ -3671,9 +3790,13 @@ class DiscordWorkerApp:
                 )
                 send_kwargs["mention_author"] = False
             if discord_files:
-                await ch.send(content=text or None, files=discord_files, **send_kwargs)
+                sent_msg = await ch.send(content=text or None, files=discord_files, **send_kwargs)
             else:
-                await ch.send(text, **send_kwargs)
+                sent_msg = await ch.send(text, **send_kwargs)
+            return {
+                "message_id": str(getattr(sent_msg, "id", "") or ""),
+                "channel_id": str(getattr(ch, "id", "") or ""),
+            }
         except discord.Forbidden as exc:
             raise RuntimeError(
                 "El bot no tiene permiso para enviar mensajes o adjuntar archivos aquí."
@@ -4177,7 +4300,7 @@ class DiscordWorkerApp:
                     limit=_safe_int(req.get("limit", 50)) or 50,
                 )
             elif cmd == "send_chat_message":
-                await self._send_chat_message(
+                sent_info = await self._send_chat_message(
                     str(req.get("kind") or "channel"),
                     _safe_int(req.get("target_id")),
                     str(req.get("content") or ""),
@@ -4185,6 +4308,9 @@ class DiscordWorkerApp:
                     cleanup_paths=list(req.get("cleanup_paths") or []),
                     reply_to_id=_safe_int(req.get("reply_to_id")),
                 )
+                if req_id is not None:
+                    self.emit_result(req_id, True, sent_info)
+                return
             elif cmd == "edit_chat_message":
                 await self._edit_chat_message(
                     str(req.get("kind") or "channel"),
