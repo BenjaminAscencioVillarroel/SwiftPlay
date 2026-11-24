@@ -1054,3 +1054,29 @@ def assign_process_to_child_job(proc: subprocess.Popen[Any]) -> bool:
         return bool(k32.AssignProcessToJobObject(wintypes.HANDLE(job), wintypes.HANDLE(int(handle))))
     except Exception:
         return False
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("dwTime", wintypes.DWORD),
+    ]
+
+
+def get_windows_idle_seconds() -> float:
+    """Devuelve segundos transcurridos desde la última entrada de teclado o mouse en Windows."""
+    if sys.platform != "win32":
+        return 0.0
+    try:
+        user32 = ctypes.windll.user32
+        k32 = ctypes.windll.kernel32
+        k32.GetTickCount64.restype = ctypes.c_uint64
+        lii = _LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        if not user32.GetLastInputInfo(ctypes.byref(lii)):
+            return 0.0
+        now_ms = int(k32.GetTickCount64()) & 0xFFFFFFFF
+        idle_ms = (now_ms - int(lii.dwTime)) & 0xFFFFFFFF
+        return max(0.0, idle_ms / 1000.0)
+    except Exception:
+        return 0.0

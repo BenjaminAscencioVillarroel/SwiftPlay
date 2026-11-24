@@ -29,6 +29,10 @@ logs/
 .env
 .env.*
 
+# Caché / paquetes Node y Cloudflare Wrangler
+.wrangler/
+node_modules/
+
 # Archivos del sistema / editores
 .DS_Store
 Thumbs.db

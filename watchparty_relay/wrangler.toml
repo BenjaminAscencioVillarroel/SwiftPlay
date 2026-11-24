@@ -1,0 +1,11 @@
+name = "swiftplay-watchparty"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+[[durable_objects.bindings]]
+name = "WATCHPARTY_HUB"
+class_name = "WatchPartyHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WatchPartyHub"]

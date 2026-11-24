@@ -14,6 +14,15 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-24 — WatchParty SwiftPlay-a-SwiftPlay (Cloudflare Relay, AFK 8m, Sub-Cards y Control Cruzado Dual-Deck)
+- **Files:** `watchparty_relay/` (`package.json`, `wrangler.toml`, `src/index.js`, `README.md`), `src/swiftplay/windows_os.py`, `src/swiftplay/config.py`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/ui/icons.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/watchparty_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Relay Cloudflare Worker + Durable Object (`watchparty_relay/`):** Hub WebSocket hibernable gratis sin dependencias externas (`WatchPartyHub` con SQLite DO en plan Free), autenticado por `code` + `secret` persistido, detección inmediata de `Desconectado` al cerrar SwiftPlay, búsqueda de códigos y broadcast de presencias y salas.
+  - **Presencia siempre activa y detección AFK 8 min (`windows_os.py`, `watchparty_service.py`):** `get_windows_idle_seconds()` vía `GetLastInputInfo` + `compute_presence_status()` diferencian `Activo` (reproduciendo o activo reciente/hablando en Discord), `Inactivo` (sin reproducción o `>= watchparty_afk_minutes` min en pausa sin voz ni input) y `Desconectado`.
+  - **UI WatchParty (`watchparty_panel.py`, `themes.py`, `icons.py`):** Nueva vista lateral `WatchParty` independiente de Discord con código propio copiable, gestor de servidor Cloudflare/nombre, lista de socios ordenados por estado y card expandible con **3 sub-cards** (`YouTube`, `Twitch`, `YT Music`).
+  - **Control Cruzado Dual-Deck (`main_window.py`):** `video` (YouTube ↔ Twitch intercambiables entre sí) y `music` (YT Music independiente coexistente) sincronizan bidireccionalmente cambio de ítem, play/pausa, seek, velocidad y cierre con guardia anti-eco (`_wp_suppress_until`) e interruptor opcional de anfitrión para bloquear invitados.
+- **Verified:** `node --check watchparty_relay\src\index.js`, `py_compile`, y suite `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]` con prueba WebSocket E2E de 2 clientes y smoke Qt6 de sub-cards.
+
 ## 2026-11-23 (2) — Insignia EN VIVO en Canales, Auto-Mute al Ensordecer, Nuevo Logo, Anti-Pantallazo Azul y Modificador de Voz
 
 ### Cambios implementados

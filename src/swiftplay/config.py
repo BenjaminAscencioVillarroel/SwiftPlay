@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -76,6 +78,34 @@ def validate_theme(value: str) -> str:
     return key if key in VALID_THEMES else "matte_silver"
 
 
+_WP_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def generate_watchparty_code(seed_name: str = "") -> str:
+    """Genera un código corto y legible de WatchParty (ej. BENJA-4K8P)."""
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", str(seed_name or "")).upper()
+    prefix = (cleaned[:5] or "SWIFT")
+    suffix = "".join(secrets.choice(_WP_CODE_ALPHABET) for _ in range(4))
+    return f"{prefix}-{suffix}"
+
+
+def generate_watchparty_secret() -> str:
+    return secrets.token_hex(24)
+
+
+def normalize_watchparty_relay_url(raw: str) -> str:
+    url = str(raw or "").strip()
+    if not url:
+        return ""
+    if url.startswith("https://"):
+        url = "wss://" + url[len("https://") :]
+    elif url.startswith("http://"):
+        url = "ws://" + url[len("http://") :]
+    elif "://" not in url:
+        url = "wss://" + url
+    return url.rstrip("/")
+
+
 @dataclass
 class AppConfig:
     theme: str = "matte_silver"
@@ -134,6 +164,15 @@ class AppConfig:
     discord_sound_volumes: dict[str, int] = field(
         default_factory=lambda: dict(DEFAULT_DISCORD_SOUND_VOLUMES)
     )
+    watchparty_enabled: bool = True
+    watchparty_relay_url: str = ""
+    watchparty_code: str = ""
+    watchparty_secret: str = ""
+    watchparty_display_name: str = ""
+    watchparty_share_activity: bool = True
+    watchparty_allow_guest_control: bool = True
+    watchparty_afk_minutes: int = 8
+    watchparty_friends: list[dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.theme = validate_theme(self.theme)
@@ -274,6 +313,41 @@ class AppConfig:
             self.discord_voice_fx_echo = max(0, min(100, int(self.discord_voice_fx_echo)))
         except (TypeError, ValueError):
             self.discord_voice_fx_echo = 0
+
+        self.watchparty_enabled = bool(self.watchparty_enabled)
+        self.watchparty_relay_url = normalize_watchparty_relay_url(self.watchparty_relay_url)
+        raw_wp_code = re.sub(r"[^A-Za-z0-9_-]", "", str(self.watchparty_code or "")).upper()[:24]
+        self.watchparty_code = raw_wp_code if len(raw_wp_code) >= 4 else generate_watchparty_code(
+            self.watchparty_display_name
+        )
+        raw_wp_sec = str(self.watchparty_secret or "").strip()
+        self.watchparty_secret = raw_wp_sec if len(raw_wp_sec) >= 16 else generate_watchparty_secret()
+        self.watchparty_display_name = str(self.watchparty_display_name or "").strip()[:64]
+        self.watchparty_share_activity = bool(self.watchparty_share_activity)
+        self.watchparty_allow_guest_control = bool(self.watchparty_allow_guest_control)
+        try:
+            self.watchparty_afk_minutes = max(1, min(60, int(self.watchparty_afk_minutes)))
+        except (TypeError, ValueError):
+            self.watchparty_afk_minutes = 8
+        clean_wp_friends: list[dict[str, str]] = []
+        seen_wp_codes: set[str] = set()
+        for entry in (self.watchparty_friends or []):
+            if isinstance(entry, str):
+                f_code = re.sub(r"[^A-Za-z0-9_-]", "", entry).upper()[:24]
+                f_name = f_code
+                f_avatar = ""
+            elif isinstance(entry, dict):
+                f_code = re.sub(r"[^A-Za-z0-9_-]", "", str(entry.get("code") or "")).upper()[:24]
+                f_name = str(entry.get("name") or "").strip()[:64] or f_code
+                f_avatar = str(entry.get("avatar_url") or "").strip()[:512]
+            else:
+                continue
+            if len(f_code) >= 4 and f_code != self.watchparty_code and f_code not in seen_wp_codes:
+                seen_wp_codes.add(f_code)
+                clean_wp_friends.append(
+                    {"code": f_code, "name": f_name, "avatar_url": f_avatar}
+                )
+        self.watchparty_friends = clean_wp_friends
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:

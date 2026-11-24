@@ -306,8 +306,47 @@ def test_storage_config_themes() -> None:
     assert "border-left: 3px" not in qss, "NavBtn activo debe usar borde redondeado uniforme sin esquinas de 90 grados"
     assert "QFrame#ResourceMonitorCard" in qss and "QFrame#DiscordVoiceHeader" in qss
     assert qss.count("{") == qss.count("}"), "QSS tiene llaves desbalanceadas"
-    for sel in ("QFrame#DiscordChatCard", "QFrame#DiscordVoiceArea", "QFrame#DiscordDeckCard", "QFrame#DiscordSidebarMiniCard"):
+    for sel in (
+        "QFrame#DiscordChatCard",
+        "QFrame#DiscordVoiceArea",
+        "QFrame#DiscordDeckCard",
+        "QFrame#DiscordSidebarMiniCard",
+        "QFrame#WatchPartyFriendCard",
+        "QFrame#WatchPartySubCard",
+    ):
         assert sel in qss, f"Falta selector {sel} en QSS"
+
+    # Config WatchParty, URLs relay, estado 8 min AFK + cálculo de posición en vivo
+    from swiftplay.config import AppConfig, normalize_watchparty_relay_url
+    from swiftplay.watchparty_service import (
+        compute_live_position,
+        compute_presence_status,
+        normalize_relay_ws_url,
+    )
+
+    assert normalize_watchparty_relay_url("https://demo.workers.dev/") == "wss://demo.workers.dev"
+    assert normalize_relay_ws_url("https://demo.workers.dev") == "wss://demo.workers.dev/ws"
+    wp_cfg = AppConfig(
+        watchparty_display_name="Benja",
+        watchparty_relay_url="https://mi-relay.workers.dev",
+        watchparty_afk_minutes=8,
+        watchparty_friends=[
+            {"code": "finz-99", "name": "Finz"},
+            {"code": "FINZ-99", "name": "Dup"},
+        ],
+    )
+    assert len(wp_cfg.watchparty_code) >= 6 and wp_cfg.watchparty_code.startswith("BENJA-")
+    assert len(wp_cfg.watchparty_secret) >= 16
+    assert wp_cfg.watchparty_relay_url == "wss://mi-relay.workers.dev"
+    assert len(wp_cfg.watchparty_friends) == 1 and wp_cfg.watchparty_friends[0]["code"] == "FINZ-99"
+
+    assert compute_live_position({"kind": "video", "pos": 100.0, "paused": False, "speed": 2.0, "updated_at": 1000.0}, now=1010.0) == 120.0
+    assert compute_live_position({"kind": "video", "pos": 100.0, "paused": True, "speed": 2.0, "updated_at": 1000.0}, now=1010.0) == 100.0
+    assert compute_presence_status(None, None, 0.0, False, 8) == "idle"
+    assert compute_presence_status({"video_id": "v1", "paused": False}, None, 900.0, False, 8) == "active"
+    assert compute_presence_status({"video_id": "v1", "paused": True}, None, 120.0, False, 8) == "active"
+    assert compute_presence_status({"video_id": "v1", "paused": True}, None, 500.0, False, 8) == "idle"
+    assert compute_presence_status({"video_id": "v1", "paused": True}, None, 500.0, True, 8) == "active"
     for legacy_hex in ("#10141C", "#171C27", "#1E2534"):
         assert legacy_hex not in qss, f"No debe permanecer tono azulado antiguo {legacy_hex} en QSS Discord"
     assert "QFrame#DiscordDeckCard QLabel" in qss, "El popover DiscordDeckCard debe forzar fondo transparente en sus controles internos"
@@ -1854,6 +1893,67 @@ def test_gui_and_libmpv_smoke(
                 win._video_item = prev_vid_item
                 win._music_item = prev_mus_item
                 win._switch_page(win.PAGE_DISCORD)
+
+            # Verificar WatchParty GUI: card persona expandible -> 3 subcards (YT / Twitch / Music) y anti-eco
+            win._switch_page(win.PAGE_WATCHPARTY)
+            app.processEvents()
+            wp_pnl = win.watchparty_panel
+            demo_friends = [
+                {
+                    "code": "FINZ-1111",
+                    "name": "Finz",
+                    "status": "active",
+                    "share_enabled": True,
+                    "allow_guest_control": True,
+                    "video": {
+                        "video_id": "illo_live",
+                        "title": "Directo Demo Twitch",
+                        "author": "IlloJuan",
+                        "kind": "twitch",
+                        "is_live": True,
+                        "paused": False,
+                    },
+                    "music": {
+                        "video_id": "song_99",
+                        "title": "Synthwave Theme",
+                        "author": "Artista",
+                        "kind": "music",
+                        "paused": False,
+                        "pos": 45.0,
+                        "duration_sec": 180,
+                    },
+                },
+                {"code": "SOCIO-2222", "name": "SocioAFK", "status": "idle", "video": None, "music": None},
+                {"code": "OFF-3333", "name": "Offline", "status": "offline", "video": None, "music": None},
+            ]
+            wp_pnl.set_friends_data(demo_friends)
+            app.processEvents()
+            finz_card = wp_pnl._cards.get("FINZ-1111")
+            assert finz_card is not None
+            assert finz_card.subcards_box.isHidden(), "Al iniciar la card de persona debe estar colapsada"
+            finz_card._on_header_clicked()
+            app.processEvents()
+            assert not finz_card.subcards_box.isHidden(), "Al clickear debe expandir las 3 sub-cards"
+            assert finz_card.yt_sub.slot_kind == "youtube" and finz_card.tw_sub.slot_kind == "twitch" and finz_card.mus_sub.slot_kind == "music"
+            assert "Sin video en YouTube" in finz_card.yt_sub.title_lbl.text()
+            assert "Directo Demo Twitch" in finz_card.tw_sub.title_lbl.text()
+            assert "Synthwave Theme" in finz_card.mus_sub.title_lbl.text()
+            assert finz_card.status_lbl.text() == "Activo"
+            assert wp_pnl._cards["SOCIO-2222"].status_lbl.text() == "Inactivo"
+            assert wp_pnl._cards["OFF-3333"].status_lbl.text() == "Desconectado"
+            prev_wp_url = win.cfg.watchparty_relay_url
+            try:
+                win.cfg.watchparty_relay_url = "wss://demo.workers.dev"
+                wp_pnl.set_connection_state("connected", "")
+                wp_pnl.refresh_from_config()
+                assert wp_pnl.status_pill.text() == "● En línea", (
+                    f"refresh_from_config no debe pisar el estado En línea: {wp_pnl.status_pill.text()}"
+                )
+            finally:
+                win.cfg.watchparty_relay_url = prev_wp_url
+                wp_pnl.set_connection_state("disconnected", "")
+            wp_pnl.set_friends_data([])
+            win._switch_page(win.PAGE_DISCORD)
 
             # Verificar tinte dinámico según color del avatar
             from swiftplay.ui.discord_panel import _extract_avatar_tint
@@ -4172,6 +4272,246 @@ print("SCREEN_SHARE_RELAY_OK")
     assert not ss_svc.is_worker_running and ss_svc.active_pids == [], (
         "El worker de pantalla debe terminar por completo tras close()"
     )
+
+    # 5. Prueba end-to-end WebSocket WatchPartyService (2 clientes reales, control cruzado dual-deck)
+    import asyncio as _wp_asyncio
+    import threading as _wp_threading
+    import time as _wp_time
+    import websockets.asyncio.server as _wp_srv
+    from swiftplay.watchparty_service import WatchPartyService
+
+    _wp_clients: dict[str, tuple[object, dict[str, object]]] = {}
+    _wp_rooms: dict[tuple[str, str], set[str]] = {}
+    _wp_ready = _wp_threading.Event()
+    _wp_port_box = [0]
+    _wp_srv_stop: _wp_asyncio.Event | None = None
+    _wp_srv_loop: _wp_asyncio.AbstractEventLoop | None = None
+
+    async def _wp_handler(ws) -> None:
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(ws.request.path).query)
+        code = (qs.get("code", [""])[0]).upper()
+        info: dict[str, object] = {
+            "code": code,
+            "name": code,
+            "status": "idle",
+            "share_enabled": True,
+            "allow_guest_control": True,
+            "video": None,
+            "music": None,
+            "friends": [],
+        }
+        _wp_clients[code] = (ws, info)
+
+        def _snap(fc: str) -> dict[str, object]:
+            if fc in _wp_clients:
+                _, fi = _wp_clients[fc]
+                return {
+                    "code": fc,
+                    "name": fi["name"],
+                    "status": fi["status"],
+                    "share_enabled": fi["share_enabled"],
+                    "allow_guest_control": fi["allow_guest_control"],
+                    "video": fi["video"],
+                    "music": fi["music"],
+                }
+            return {"code": fc, "name": fc, "status": "offline", "video": None, "music": None}
+
+        try:
+            async for raw in ws:
+                msg = json.loads(raw)
+                t = msg.get("type")
+                if t == "hello":
+                    info["name"] = msg.get("name", code)
+                    info["status"] = msg.get("status", "idle")
+                    info["friends"] = list(msg.get("friends") or [])
+                    info["video"] = msg.get("video")
+                    info["music"] = msg.get("music")
+                    await ws.send(json.dumps({"type": "friends_snapshot", "friends": [_snap(f) for f in info["friends"]]}))
+                    for oc, (ows, oi) in list(_wp_clients.items()):
+                        if oc != code and code in oi["friends"]:
+                            await ows.send(json.dumps({"type": "friend_state", "friend": _snap(code)}))
+                elif t == "set_friends":
+                    info["friends"] = list(msg.get("friends") or [])
+                    await ws.send(json.dumps({"type": "friends_snapshot", "friends": [_snap(f) for f in info["friends"]]}))
+                elif t == "presence":
+                    for k in ("status", "share_enabled", "allow_guest_control", "video", "music"):
+                        if k in msg:
+                            info[k] = msg[k]
+                    for oc, (ows, oi) in list(_wp_clients.items()):
+                        if oc != code and code in oi["friends"]:
+                            await ows.send(json.dumps({"type": "friend_state", "friend": _snap(code)}))
+                elif t == "join_party":
+                    hc = str(msg["host_code"]).upper()
+                    dk = msg["deck"]
+                    room = _wp_rooms.setdefault((hc, dk), set())
+                    room.add(hc)
+                    room.add(code)
+                    _, hi = _wp_clients[hc]
+                    await ws.send(json.dumps({
+                        "type": "party_state",
+                        "host_code": hc,
+                        "host_name": hi["name"],
+                        "deck": dk,
+                        "reason": "join",
+                        "action": "join",
+                        "rev": 1,
+                        "state": hi["music"] if dk == "music" else hi["video"],
+                        "updated_by": hc,
+                        "updated_by_name": hi["name"],
+                        "allow_guest_control": hi["allow_guest_control"],
+                        "members": [{"code": m} for m in sorted(room)],
+                    }))
+                elif t == "party_sync":
+                    hc = str(msg["host_code"]).upper()
+                    dk = msg["deck"]
+                    _, hi = _wp_clients[hc]
+                    if code != hc and not hi["allow_guest_control"]:
+                        await ws.send(json.dumps({"type": "party_notice", "message": "El anfitrión desactivó el control compartido"}))
+                        continue
+                    hi["music" if dk == "music" else "video"] = msg.get("state")
+                    room = _wp_rooms.get((hc, dk), set())
+                    for mc in list(room):
+                        if mc == code or mc not in _wp_clients:
+                            continue
+                        mws, _ = _wp_clients[mc]
+                        await mws.send(json.dumps({
+                            "type": "party_state",
+                            "host_code": hc,
+                            "host_name": hi["name"],
+                            "deck": dk,
+                            "reason": "sync",
+                            "action": msg.get("action", "sync"),
+                            "rev": 2,
+                            "state": msg.get("state"),
+                            "updated_by": code,
+                            "updated_by_name": info["name"],
+                            "allow_guest_control": hi["allow_guest_control"],
+                            "members": [{"code": m} for m in sorted(room)],
+                        }))
+        finally:
+            _wp_clients.pop(code, None)
+            for oc, (ows, oi) in list(_wp_clients.items()):
+                if code in oi["friends"]:
+                    try:
+                        await ows.send(json.dumps({"type": "friend_state", "friend": _snap(code)}))
+                    except Exception:
+                        pass
+
+    def _run_wp_srv() -> None:
+        nonlocal _wp_srv_stop, _wp_srv_loop
+        loop = _wp_asyncio.new_event_loop()
+        _wp_srv_loop = loop
+        stop_ev = _wp_asyncio.Event()
+        _wp_srv_stop = stop_ev
+
+        async def _serve() -> None:
+            async with _wp_srv.serve(_wp_handler, "127.0.0.1", 0) as srv:
+                _wp_port_box[0] = srv.sockets[0].getsockname()[1]
+                _wp_ready.set()
+                await stop_ev.wait()
+
+        loop.run_until_complete(_serve())
+        loop.close()
+
+    srv_th = _wp_threading.Thread(target=_run_wp_srv, daemon=True)
+    srv_th.start()
+    assert _wp_ready.wait(timeout=5.0)
+    relay_url = f"ws://127.0.0.1:{_wp_port_box[0]}/ws"
+
+    wp_a = WatchPartyService()
+    wp_b = WatchPartyService()
+    a_events: list[dict] = []
+    b_events: list[dict] = []
+    b_notices: list[str] = []
+    wp_a.party_state_received.connect(a_events.append)
+    wp_b.party_state_received.connect(b_events.append)
+    wp_b.party_notice.connect(b_notices.append)
+    app = QApplication.instance()
+    try:
+        wp_a.configure_and_start(
+            enabled=True,
+            relay_url=relay_url,
+            code="ALFA-1111",
+            secret="0123456789abcdef0123456789abcdef",
+            display_name="Benja",
+            friend_codes=["BETA-2222"],
+            allow_guest_control=True,
+        )
+        wp_b.configure_and_start(
+            enabled=True,
+            relay_url=relay_url,
+            code="BETA-2222",
+            secret="fedcba9876543210fedcba9876543210",
+            display_name="Finz",
+            friend_codes=["ALFA-1111"],
+            allow_guest_control=True,
+        )
+        deadline = _wp_time.monotonic() + 5.0
+        while _wp_time.monotonic() < deadline and not (wp_a.is_connected and wp_b.is_connected):
+            if app is not None:
+                app.processEvents()
+            _wp_time.sleep(0.05)
+        assert wp_a.is_connected and wp_b.is_connected
+
+        wp_a.update_local_presence(
+            status="active",
+            share_enabled=True,
+            allow_guest_control=True,
+            video_state={"video_id": "yt_1", "title": "Video 1", "kind": "video", "paused": False, "pos": 15.0},
+            music_state={"video_id": "mus_1", "title": "Song 1", "kind": "music", "paused": False, "pos": 10.0},
+            force=True,
+        )
+        _wp_time.sleep(0.15)
+        wp_b.join_party("ALFA-1111", "video")
+        wp_b.join_party("ALFA-1111", "music")
+        deadline = _wp_time.monotonic() + 3.0
+        while _wp_time.monotonic() < deadline and len(b_events) < 2:
+            if app is not None:
+                app.processEvents()
+            _wp_time.sleep(0.05)
+        assert len(b_events) >= 2
+        assert {ev["deck"] for ev in b_events} == {"video", "music"}
+
+        # Invitado cambia de YT -> Twitch en video mientras Music sigue intacto (control cruzado)
+        wp_b.send_party_sync(
+            "ALFA-1111",
+            "video",
+            "play_item",
+            {"video_id": "tw_live", "title": "TwitchLive", "kind": "twitch", "is_live": True, "paused": False},
+        )
+        deadline = _wp_time.monotonic() + 3.0
+        while _wp_time.monotonic() < deadline and not a_events:
+            if app is not None:
+                app.processEvents()
+            _wp_time.sleep(0.05)
+        assert a_events and a_events[-1]["deck"] == "video" and a_events[-1]["state"]["kind"] == "twitch"
+
+        # Si el anfitrión desactiva control cruzado, rechaza cambios de invitados
+        wp_a.update_local_presence(
+            status="active",
+            share_enabled=True,
+            allow_guest_control=False,
+            video_state=None,
+            music_state=None,
+            force=True,
+        )
+        _wp_time.sleep(0.1)
+        wp_b.send_party_sync("ALFA-1111", "music", "pause", {"video_id": "mus_1", "title": "Song 1", "kind": "music", "paused": True})
+        deadline = _wp_time.monotonic() + 3.0
+        while _wp_time.monotonic() < deadline and not b_notices:
+            if app is not None:
+                app.processEvents()
+            _wp_time.sleep(0.05)
+        assert b_notices, "Debe notificar cuando el anfitrión bloquea el control cruzado"
+    finally:
+        wp_b.stop()
+        wp_a.stop()
+        if _wp_srv_loop is not None and _wp_srv_stop is not None:
+            _wp_srv_loop.call_soon_threadsafe(_wp_srv_stop.set)
+        srv_th.join(timeout=2.0)
+
+    print("   WatchParty WS E2E OK (presencias, sub-decks YT/Twitch vs Music, control cruzado).")
     print("   OK: DPAPI Bot, mezclador PCM, descifrado AEAD+DAVE, ScreenShare y workers 0 MB verificados.")
 
 

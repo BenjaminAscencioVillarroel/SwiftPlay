@@ -1320,6 +1320,42 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
         color: #FFFFFF;
         border-color: #EF4444;
     }}
+
+    QFrame#WatchPartyFriendCard {{
+        background-color: {p.surface1};
+        border: 1px solid {p.border};
+        border-radius: 12px;
+    }}
+
+    QFrame#WatchPartyFriendCard:hover {{
+        border-color: {p.border_bright};
+    }}
+
+    QFrame#WatchPartySubCard {{
+        background-color: {p.surface2};
+        border: 1px solid {p.border};
+        border-radius: 10px;
+    }}
+
+    QFrame#WatchPartySubCard:hover {{
+        border-color: {p.border_bright};
+    }}
+
+    QFrame#WatchPartyActiveBar {{
+        background-color: {p.surface2};
+        border: 1px solid {p.accent};
+        border-radius: 10px;
+    }}
+
+    QLabel#WatchPartyCodePill {{
+        background-color: {p.surface2};
+        color: {p.accent};
+        border: 1px solid {p.border_bright};
+        border-radius: 8px;
+        padding: 4px 10px;
+        font-size: 12px;
+        font-weight: 700;
+    }}
     """
 
 

@@ -428,6 +428,18 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
             p.drawLine(QPointF(s * 0.61, s * 0.43), QPointF(s * 0.50, s * 0.32))
         else:
             p.drawLine(QPointF(s * 0.20, s * 0.22), QPointF(s * 0.80, s * 0.70))
+    elif name == "watchparty":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPointF(s * 0.36, s * 0.34), s * 0.14, s * 0.14)
+        arc1 = QPainterPath()
+        arc1.moveTo(s * 0.14, s * 0.80)
+        arc1.cubicTo(s * 0.14, s * 0.56, s * 0.58, s * 0.56, s * 0.58, s * 0.80)
+        p.drawPath(arc1)
+        p.drawEllipse(QPointF(s * 0.68, s * 0.38), s * 0.11, s * 0.11)
+        arc2 = QPainterPath()
+        arc2.moveTo(s * 0.54, s * 0.78)
+        arc2.cubicTo(s * 0.58, s * 0.60, s * 0.86, s * 0.60, s * 0.86, s * 0.78)
+        p.drawPath(arc2)
 
     p.end()
     return QIcon(pm)
