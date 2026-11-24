@@ -81,6 +81,25 @@ function sanitizeDeckState(raw, deck) {
   return out;
 }
 
+function meaningfulDeckKey(state) {
+  if (!state || typeof state !== "object") return "null";
+  const key = {
+    video_id: state.video_id || "",
+    kind: state.kind || "video",
+    is_live: Boolean(state.is_live),
+    paused: Boolean(state.paused),
+    speed: Number(state.speed ?? 1.0),
+  };
+  if (key.paused) {
+    key.pos = Math.round(Number(state.pos ?? 0) * 10) / 10;
+  }
+  if (Array.isArray(state.queue)) {
+    key.queue = state.queue.map((q) => (q && q.video_id) || "");
+    key.queue_index = Number(state.queue_index ?? 0);
+  }
+  return JSON.stringify(key);
+}
+
 export class WatchPartyHub {
   constructor(ctx, env) {
     this.ctx = ctx;
@@ -537,8 +556,8 @@ export class WatchPartyHub {
 
     if (type === "presence") {
       const prevAllow = att.allow_guest_control !== false;
-      const prevVideoKey = JSON.stringify(att.video || null);
-      const prevMusicKey = JSON.stringify(att.music || null);
+      const prevVideoKey = meaningfulDeckKey(att.video);
+      const prevMusicKey = meaningfulDeckKey(att.music);
 
       if (msg.name !== undefined) {
         att.name = String(msg.name || att.name || att.code).trim().slice(0, 64) || att.code;
@@ -568,14 +587,14 @@ export class WatchPartyHub {
         this._broadcastRoomMembers(att.code, "music");
       }
 
-      if (prevVideoKey !== JSON.stringify(att.video || null)) {
+      if (prevVideoKey !== meaningfulDeckKey(att.video)) {
         const vidSet = this._rooms.get(this._roomKey(att.code, "video"));
         if (vidSet && vidSet.size > 0) {
           this._bumpRev(att.code, "video");
           this._broadcastPartyState(att.code, "video", "sync", "presence", att.code, att.name, att.code);
         }
       }
-      if (prevMusicKey !== JSON.stringify(att.music || null)) {
+      if (prevMusicKey !== meaningfulDeckKey(att.music)) {
         const musSet = this._rooms.get(this._roomKey(att.code, "music"));
         if (musSet && musSet.size > 0) {
           this._bumpRev(att.code, "music");

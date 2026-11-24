@@ -175,17 +175,20 @@ class MediaPlayer(QObject):
                 audio_pitch_correction=True,
                 ytdl=False,
                 cache="yes",
-                cache_secs=3,
-                cache_pause_initial="no",
+                cache_secs=20,
+                cache_pause_initial="yes",
+                cache_pause_wait=1.5,
+                demuxer_readahead_secs=20,
                 vd_lavc_threads=2,
                 demuxer_lavf_probesize=1048576,
                 demuxer_lavf_analyzeduration=0.5,
                 demuxer_donate_buffer="no",
-                demuxer_hysteresis_secs=0,
-                stream_buffer_size="128KiB",
+                demuxer_hysteresis_secs=3,
+                stream_buffer_size="512KiB",
                 audio_buffer=0.1,
                 demuxer_lavf_o=(
-                    "http_persistent=0,reconnect=1,reconnect_streamed=1,reconnect_delay_max=3"
+                    "http_persistent=1,reconnect=1,reconnect_streamed=1,"
+                    "reconnect_at_eof=1,reconnect_delay_max=3"
                 ),
                 volume=self._volume,
                 speed=self._speed,
@@ -202,16 +205,16 @@ class MediaPlayer(QObject):
                 kwargs["icc_cache"] = "no"
                 kwargs["background"] = "color"
                 kwargs["background_color"] = "#FF000000"
-                kwargs["demuxer_max_bytes"] = "3MiB"
-                kwargs["demuxer_max_back_bytes"] = "512KiB"
+                kwargs["demuxer_max_bytes"] = "24MiB"
+                kwargs["demuxer_max_back_bytes"] = "4MiB"
                 kwargs["cursor_autohide"] = "no"
                 kwargs["msg_level"] = "all=no,vo=error"
                 kwargs["log_handler"] = self._on_mpv_log
             else:
                 kwargs["vo"] = "null"
                 kwargs["vid"] = "no"
-                kwargs["demuxer_max_bytes"] = "2MiB"
-                kwargs["demuxer_max_back_bytes"] = "256KiB"
+                kwargs["demuxer_max_bytes"] = "4MiB"
+                kwargs["demuxer_max_back_bytes"] = "1MiB"
 
             try:
                 self._mpv = mpv_mod.MPV(**kwargs)
@@ -373,6 +376,7 @@ class MediaPlayer(QObject):
         is_live: bool = False,
         allow_seek: bool = False,
         low_latency: bool = False,
+        start_paused: bool = False,
     ) -> None:
         with self._lock:
             live_flag = bool(is_live)
@@ -406,6 +410,9 @@ class MediaPlayer(QObject):
                 player["hwdec"] = "no"
                 player["cache"] = "no"
                 player["cache-secs"] = 0.4
+                player["cache-pause-initial"] = "no"
+                player["demuxer-readahead-secs"] = 0.4
+                player["demuxer-hysteresis-secs"] = 0
                 player["demuxer-lavf-probesize"] = 32768
                 player["demuxer-lavf-analyzeduration"] = 0.25
                 player["audio-buffer"] = 0.05
@@ -417,39 +424,49 @@ class MediaPlayer(QObject):
                 if not self._is_audio_only_instance:
                     player["hwdec"] = "d3d11va-copy"
                 player["cache"] = "yes"
-                player["cache-secs"] = 2
+                player["cache-secs"] = 4
+                player["cache-pause-initial"] = "no"
+                player["demuxer-readahead-secs"] = 4
+                player["demuxer-hysteresis-secs"] = 1
                 player["demuxer-lavf-probesize"] = 1048576
                 player["demuxer-lavf-analyzeduration"] = 0.5
                 player["audio-buffer"] = 0.1
-                player["demuxer-max-bytes"] = "2MiB"
-                player["demuxer-max-back-bytes"] = "128KiB"
+                player["demuxer-max-bytes"] = "6MiB"
+                player["demuxer-max-back-bytes"] = "256KiB"
                 player.start = "none"
                 player.speed = 1.0
             elif live_flag and live_seekable:
                 if not self._is_audio_only_instance:
                     player["hwdec"] = "d3d11va-copy"
                 player["cache"] = "yes"
-                player["cache-secs"] = 3
+                player["cache-secs"] = 6
+                player["cache-pause-initial"] = "no"
+                player["demuxer-readahead-secs"] = 6
+                player["demuxer-hysteresis-secs"] = 1
                 player["demuxer-lavf-probesize"] = 1048576
                 player["demuxer-lavf-analyzeduration"] = 0.5
                 player["audio-buffer"] = 0.1
-                player["demuxer-max-bytes"] = "4MiB"
-                player["demuxer-max-back-bytes"] = "512KiB"
+                player["demuxer-max-bytes"] = "8MiB"
+                player["demuxer-max-back-bytes"] = "1MiB"
                 player.start = "none"
                 player.speed = self._speed
             else:
                 if not self._is_audio_only_instance:
                     player["hwdec"] = "d3d11va-copy"
                 player["cache"] = "yes"
-                player["cache-secs"] = 3
+                player["cache-secs"] = 20
+                player["cache-pause-initial"] = "yes"
+                player["cache-pause-wait"] = 1.5
+                player["demuxer-readahead-secs"] = 20
+                player["demuxer-hysteresis-secs"] = 3
                 player["demuxer-lavf-probesize"] = 1048576
                 player["demuxer-lavf-analyzeduration"] = 0.5
                 player["audio-buffer"] = 0.1
                 player["demuxer-max-bytes"] = (
-                    "2MiB" if self._is_audio_only_instance else "3MiB"
+                    "4MiB" if self._is_audio_only_instance else "24MiB"
                 )
                 player["demuxer-max-back-bytes"] = (
-                    "256KiB" if self._is_audio_only_instance else "512KiB"
+                    "1MiB" if self._is_audio_only_instance else "4MiB"
                 )
                 player.start = f"+{start_pos:.1f}" if start_pos > 0.5 else "none"
                 player.speed = self._speed
@@ -471,7 +488,7 @@ class MediaPlayer(QObject):
             ]
             player.http_header_fields = extra_headers
             player["audio-files"] = [audio_url] if audio_url else []
-            player.pause = False
+            player.pause = bool(start_paused)
             player.loadfile(primary_url, "replace")
             self._streams_played += 1
             self._last_was_live = live_flag

@@ -281,8 +281,20 @@ class MainWindow(QMainWindow):
         self.watchparty_svc = WatchPartyService(self)
         self._wp_suppress_until: dict[str, float] = {"video": 0.0, "music": 0.0}
         self._wp_suppress_auto_pause: bool = False
+        self._wp_applying_remote_play: bool = False
         self._wp_pending_video_pause: bool | None = None
         self._wp_pending_music_pause: bool | None = None
+        self._wp_pending_video_sync: dict[str, Any] | None = None
+        self._wp_pending_music_sync: dict[str, Any] | None = None
+        self._wp_user_pause_intent: dict[str, float] = {"video": 0.0, "music": 0.0}
+        self._wp_last_remote_seek_ts: dict[str, float] = {"video": 0.0, "music": 0.0}
+        self._video_resolving_id: str | None = None
+        self._music_resolving_id: str | None = None
+        self._video_buffering: bool = False
+        self._video_buffering_ui_timer = QTimer(self)
+        self._video_buffering_ui_timer.setSingleShot(True)
+        self._video_buffering_ui_timer.setInterval(650)
+        self._video_buffering_ui_timer.timeout.connect(self._show_debounced_video_buffering)
         self._wp_presence_status: str = "idle"
         self._wp_overlay_spectators: list[dict[str, Any]] = []
         self._wp_personal_snapshots: dict[str, dict[str, Any] | None] = {
@@ -4851,8 +4863,18 @@ class MainWindow(QMainWindow):
 
         self._video_play_gen += 1
         gen = self._video_play_gen
-        self._wp_pending_video_pause = None
-        self._notify_wp_local_event("video", "play_item", paused_override=False)
+        self._video_resolving_id = item.video_id
+        self._video_buffering = False
+        self._video_buffering_ui_timer.stop()
+        if not self._wp_applying_remote_play:
+            self._wp_pending_video_pause = None
+            self._wp_pending_video_sync = None
+        self._notify_wp_local_event(
+            "video",
+            "play_item",
+            paused_override=False,
+            broadcast_sync=not self._wp_applying_remote_play,
+        )
         self._run_async(
             lambda: self.yt.resolve_stream(
                 item.video_id,
@@ -4910,6 +4932,9 @@ class MainWindow(QMainWindow):
     ) -> None:
         if gen != self._video_play_gen:
             return
+        self._video_resolving_id = None
+        self._video_buffering = False
+        self._video_buffering_ui_timer.stop()
         self.video_panel.set_loading_state(False)
         self.video_panel.set_status("")
         is_yt_live = bool(
@@ -4961,20 +4986,51 @@ class MainWindow(QMainWindow):
             self.fs_overlay.set_live_display_offset(0.0)
         if stream.duration > 0:
             self._on_video_dur_changed(stream.duration)
+
+        resolved_vid = stream.video_id or (self._video_item.video_id if self._video_item else "")
+        pending_sync = self._wp_pending_video_sync
+        if isinstance(pending_sync, dict) and pending_sync.get("video_id") == resolved_vid:
+            self._wp_pending_video_sync = None
+            self._wp_pending_video_pause = None
+            raw_state = pending_sync.get("state")
+            effective_start = (
+                0.0
+                if is_yt_live
+                else compute_live_position(raw_state if isinstance(raw_state, dict) else None)
+            )
+            if not is_yt_live:
+                want_speed = clamp_speed(float(pending_sync.get("want_speed") or 1.0))
+                self.cfg.video_speed = want_speed
+                self.video_player.set_speed(want_speed)
+                self.video_panel.set_speed_silent(want_speed)
+                self.fs_overlay.set_speed_silent(want_speed)
+            start_paused = False if is_yt_live else bool(pending_sync.get("want_paused", False))
+            self._wp_suppress_until["video"] = max(
+                self._wp_suppress_until["video"], time.monotonic() + 3.5
+            )
+        else:
+            effective_start = 0.0 if is_yt_live else start_pos
+            start_paused = bool(self._wp_pending_video_pause is True)
+            self._wp_pending_video_pause = None
+
+        self._video_pos = effective_start
+        if not is_yt_live and effective_start > 0.0:
+            self.video_panel.set_position(effective_start)
+            self.fs_overlay.set_position(effective_start)
+
         self.video_player.play_stream(
             primary_url=stream.primary_url,
             audio_url=stream.audio_url,
             video_enabled=stream.video_enabled,
             http_headers=stream.http_headers,
-            start_pos=0.0 if is_yt_live else start_pos,
+            start_pos=effective_start,
             is_live=is_yt_live,
             allow_seek=is_yt_live,
+            start_paused=start_paused,
         )
-        if self._wp_pending_video_pause is True:
-            self._wp_pending_video_pause = None
-            self.video_player.set_pause(True)
-        else:
-            self._wp_pending_video_pause = None
+        self._video_paused = start_paused
+        self.video_panel.set_paused(start_paused)
+        self.fs_overlay.set_paused(start_paused)
         self._sync_bottom_bar()
         self._update_bottom_bar_visibility()
         self._refresh_close_media_btn()
@@ -4983,6 +5039,11 @@ class MainWindow(QMainWindow):
     def _on_video_play_error(self, gen: int, err: str) -> None:
         if gen != self._video_play_gen:
             return
+        self._video_resolving_id = None
+        self._wp_pending_video_sync = None
+        self._wp_pending_video_pause = None
+        self._video_buffering = False
+        self._video_buffering_ui_timer.stop()
         self.video_panel.set_loading_state(False)
         self.video_panel.set_status("Error")
         prefix = (
@@ -5036,8 +5097,18 @@ class MainWindow(QMainWindow):
 
         self._video_play_gen += 1
         gen = self._video_play_gen
-        self._wp_pending_video_pause = None
-        self._notify_wp_local_event("video", "play_item", paused_override=False)
+        self._video_resolving_id = item.video_id
+        self._video_buffering = False
+        self._video_buffering_ui_timer.stop()
+        if not self._wp_applying_remote_play:
+            self._wp_pending_video_pause = None
+            self._wp_pending_video_sync = None
+        self._notify_wp_local_event(
+            "video",
+            "play_item",
+            paused_override=False,
+            broadcast_sync=not self._wp_applying_remote_play,
+        )
         login = item.video_id
         self._run_async(
             lambda: self.twitch.resolve_live_stream(
@@ -5050,6 +5121,11 @@ class MainWindow(QMainWindow):
     def _on_twitch_stream_resolved(self, gen: int, stream: ResolvedStream) -> None:
         if gen != self._video_play_gen:
             return
+        self._video_resolving_id = None
+        self._wp_pending_video_sync = None
+        self._wp_pending_video_pause = None
+        self._video_buffering = False
+        self._video_buffering_ui_timer.stop()
         self.video_panel.set_loading_state(False)
         self.video_panel.set_status("")
         self.video_player.play_stream(
@@ -5322,8 +5398,16 @@ class MainWindow(QMainWindow):
 
         self._music_play_gen += 1
         gen = self._music_play_gen
-        self._wp_pending_music_pause = None
-        self._notify_wp_local_event("music", "play_item", paused_override=False)
+        self._music_resolving_id = item.video_id
+        if not self._wp_applying_remote_play:
+            self._wp_pending_music_pause = None
+            self._wp_pending_music_sync = None
+        self._notify_wp_local_event(
+            "music",
+            "play_item",
+            paused_override=False,
+            broadcast_sync=not self._wp_applying_remote_play,
+        )
         self._run_async(
             lambda: self.yt.resolve_stream(item.video_id, audio_only=True),
             on_done=lambda stream: self._on_music_stream_resolved(gen, stream, eff_start),
@@ -5335,20 +5419,39 @@ class MainWindow(QMainWindow):
     ) -> None:
         if gen != self._music_play_gen:
             return
+        self._music_resolving_id = None
         if stream.duration > 0:
             self._on_music_dur_changed(stream.duration)
+
+        resolved_vid = stream.video_id or (self._music_item.video_id if self._music_item else "")
+        pending_sync = self._wp_pending_music_sync
+        if isinstance(pending_sync, dict) and pending_sync.get("video_id") == resolved_vid:
+            self._wp_pending_music_sync = None
+            self._wp_pending_music_pause = None
+            raw_state = pending_sync.get("state")
+            effective_start = compute_live_position(
+                raw_state if isinstance(raw_state, dict) else None
+            )
+            start_paused = bool(pending_sync.get("want_paused", False))
+            self._wp_suppress_until["music"] = max(
+                self._wp_suppress_until["music"], time.monotonic() + 3.5
+            )
+        else:
+            effective_start = start_pos
+            start_paused = bool(self._wp_pending_music_pause is True)
+            self._wp_pending_music_pause = None
+
+        self._music_pos = effective_start
         self.music_player.play_stream(
             primary_url=stream.primary_url,
             audio_url=None,
             video_enabled=False,
             http_headers=stream.http_headers,
-            start_pos=start_pos,
+            start_pos=effective_start,
+            start_paused=start_paused,
         )
-        if self._wp_pending_music_pause is True:
-            self._wp_pending_music_pause = None
-            self.music_player.set_pause(True)
-        else:
-            self._wp_pending_music_pause = None
+        self._music_paused = start_paused
+        self.music_panel.set_playing_state(not start_paused)
         self._sync_bottom_bar()
         self._update_bottom_bar_visibility()
         self._refresh_close_media_btn()
@@ -5368,6 +5471,9 @@ class MainWindow(QMainWindow):
     def _on_music_play_error(self, gen: int, err: str) -> None:
         if gen != self._music_play_gen:
             return
+        self._music_resolving_id = None
+        self._wp_pending_music_sync = None
+        self._wp_pending_music_pause = None
         self.show_toast(f"No se pudo reproducir la canción: {err}")
 
     def _get_effective_deck(self) -> Literal["video", "music"]:
@@ -5403,6 +5509,7 @@ class MainWindow(QMainWindow):
             if self._video_paused:
                 self._pause_other_if_auto("video")
                 self._active_deck = "video"
+            self._wp_user_pause_intent["video"] = time.monotonic() + 2.0
             self.video_player.toggle_pause()
         else:
             if self._music_item is None:
@@ -5413,6 +5520,7 @@ class MainWindow(QMainWindow):
             if self._music_paused:
                 self._pause_other_if_auto("music")
                 self._active_deck = "music"
+            self._wp_user_pause_intent["music"] = time.monotonic() + 2.0
             self.music_player.toggle_pause()
 
     def toggle_play_pause(self) -> None:
@@ -5544,14 +5652,31 @@ class MainWindow(QMainWindow):
                 )
         self._sync_bottom_bar()
         self._sync_mini_bar()
+        user_intent = time.monotonic() <= float(self._wp_user_pause_intent.get("video", 0.0))
+        self._wp_user_pause_intent["video"] = 0.0
         self._notify_wp_local_event(
             "video",
             "pause" if paused else "resume",
             paused_override=paused,
+            broadcast_sync=(user_intent and self._video_resolving_id is None),
         )
 
     def _on_video_buffering_changed(self, buffering: bool) -> None:
-        self.video_panel.set_status("Buffering..." if buffering else "")
+        self._video_buffering = bool(buffering)
+        if self._video_buffering:
+            if not self._video_buffering_ui_timer.isActive():
+                self._video_buffering_ui_timer.start()
+        else:
+            self._video_buffering_ui_timer.stop()
+            self.video_panel.set_status("")
+
+    def _show_debounced_video_buffering(self) -> None:
+        if (
+            self._video_buffering
+            and self._video_item is not None
+            and self._video_resolving_id is None
+        ):
+            self.video_panel.set_status("Buffering...")
 
     def _on_music_pos_changed(self, pos: float) -> None:
         self._music_pos = pos
@@ -5580,10 +5705,13 @@ class MainWindow(QMainWindow):
                 self._music_idle_unload_timer.start()
         self._sync_bottom_bar()
         self._sync_mini_bar()
+        user_intent = time.monotonic() <= float(self._wp_user_pause_intent.get("music", 0.0))
+        self._wp_user_pause_intent["music"] = 0.0
         self._notify_wp_local_event(
             "music",
             "pause" if paused else "resume",
             paused_override=paused,
+            broadcast_sync=(user_intent and self._music_resolving_id is None),
         )
 
     # ------------------------------------------------------------------
@@ -6327,28 +6455,51 @@ class MainWindow(QMainWindow):
             (time.monotonic() - self._last_discord_speak_ts) < 90.0,
             afk_minutes=int(self.cfg.watchparty_afk_minutes or 8),
         )
+        prev_status = self._wp_presence_status
         self._wp_presence_status = status
         name, av = self._watchparty_identity()
         pres_vid = self._presence_state_for_deck("video", vid_state)
         pres_mus = self._presence_state_for_deck("music", mus_state)
+
+        active_party = (
+            self.watchparty_svc.active_party_for(deck)
+            if hasattr(self, "watchparty_svc")
+            else None
+        )
+        will_broadcast_sync = bool(
+            broadcast_sync
+            and time.monotonic() >= float(self._wp_suppress_until.get(deck, 0.0))
+            and active_party
+            and active_party.get("host_code")
+        )
+        is_host_sync = bool(
+            will_broadcast_sync
+            and str(active_party.get("host_code") or "").upper()
+            == str(self.cfg.watchparty_code or "").upper()
+        )
+        deck_state = vid_state if deck == "video" else mus_state
+
         if self.watchparty_svc.is_connected:
-            self.watchparty_svc.update_local_presence(
-                status=status,
-                share_enabled=self.cfg.watchparty_share_activity,
-                allow_guest_control=self.cfg.watchparty_allow_guest_control,
-                video_state=pres_vid,
-                music_state=pres_mus,
-                display_name=name,
-                avatar_url=av,
-                force=force_presence,
-            )
+            if is_host_sync and not force_presence and status == prev_status:
+                # Host ya difunde estado en `party_sync`; evita un `presence` duplicado en el relay.
+                self.watchparty_svc.record_local_deck_state(
+                    deck,
+                    pres_vid if deck == "video" else pres_mus,
+                    status=status,
+                )
+            else:
+                self.watchparty_svc.update_local_presence(
+                    status=status,
+                    share_enabled=self.cfg.watchparty_share_activity,
+                    allow_guest_control=self.cfg.watchparty_allow_guest_control,
+                    video_state=pres_vid,
+                    music_state=pres_mus,
+                    display_name=name,
+                    avatar_url=av,
+                    force=force_presence,
+                )
 
-        if not broadcast_sync or time.monotonic() < float(self._wp_suppress_until.get(deck, 0.0)):
-            return
-
-        active_party = self.watchparty_svc.active_party_for(deck)
-        if active_party and active_party.get("host_code"):
-            deck_state = vid_state if deck == "video" else mus_state
+        if will_broadcast_sync and active_party and active_party.get("host_code"):
             self.watchparty_svc.send_party_sync(
                 str(active_party["host_code"]),
                 deck,
@@ -6437,7 +6588,8 @@ class MainWindow(QMainWindow):
                 self.show_toast("Te uniste a la sala (aún no hay reproducción activa)")
             return
 
-        self._wp_suppress_until[deck] = time.monotonic() + 1.8
+        now_m = time.monotonic()
+        self._wp_suppress_until[deck] = max(self._wp_suppress_until.get(deck, 0.0), now_m + 3.0)
         pos = compute_live_position(state)
         want_paused = bool(state.get("paused", False))
         want_speed = max(0.5, min(2.5, float(state.get("speed") or 1.0)))
@@ -6473,22 +6625,50 @@ class MainWindow(QMainWindow):
                 return
 
         player = self.video_player if deck == "video" else self.music_player
+        resolving_same = (
+            self._video_resolving_id == vid_id
+            if deck == "video"
+            else self._music_resolving_id == vid_id
+        )
+
+        pending_payload = {
+            "video_id": vid_id,
+            "state": dict(state),
+            "want_paused": want_paused,
+            "want_speed": want_speed,
+        }
+        if same_item and resolving_same and not player.has_active_stream:
+            # Evita reiniciar yt-dlp en paralelo si llegan snapshots repetidos durante la carga.
+            if deck == "video":
+                self._wp_pending_video_sync = pending_payload
+                self._wp_pending_video_pause = want_paused
+            else:
+                self._wp_pending_music_sync = pending_payload
+                self._wp_pending_music_pause = want_paused
+            self._wp_suppress_until[deck] = max(self._wp_suppress_until[deck], now_m + 6.0)
+            return
 
         if not same_item or not player.has_active_stream:
+            self._wp_suppress_until[deck] = max(self._wp_suppress_until[deck], now_m + 8.0)
             self._wp_suppress_auto_pause = True
+            self._wp_applying_remote_play = True
             try:
                 if deck == "video":
                     if item_kind == "twitch":
+                        self._wp_pending_video_sync = None
                         self._wp_pending_video_pause = None
                         self.play_twitch_stream(new_item)
                     else:
+                        self._wp_pending_video_sync = pending_payload
                         self._wp_pending_video_pause = want_paused
                         self.play_video(new_item, start_pos=pos)
                         self.video_player.set_speed(want_speed)
                 else:
+                    self._wp_pending_music_sync = pending_payload
                     self._wp_pending_music_pause = want_paused
                     self._play_music_item(new_item, start_pos=pos)
             finally:
+                self._wp_applying_remote_play = False
                 self._wp_suppress_auto_pause = False
 
             if reason == "join":
@@ -6499,17 +6679,41 @@ class MainWindow(QMainWindow):
 
         # Ya tienen el mismo video/directo/canción: sincronizar velocidad, segundo y play/pausa
         if deck == "video" and item_kind != "twitch":
-            self.video_player.set_speed(want_speed)
-            self.video_panel.set_speed_silent(want_speed)
-            self.fs_overlay.set_speed_silent(want_speed)
+            cur_speed = float(self.cfg.video_speed or 1.0)
+            if abs(cur_speed - want_speed) > 0.01:
+                self.cfg.video_speed = want_speed
+                self.video_player.set_speed(want_speed)
+                self.video_panel.set_speed_silent(want_speed)
+                self.fs_overlay.set_speed_silent(want_speed)
 
-        if item_kind != "twitch" and not bool(state.get("is_live")):
+        is_live_media = item_kind == "twitch" or bool(state.get("is_live"))
+        cur_paused = self._video_paused if deck == "video" else self._music_paused
+        if not is_live_media:
             cur_pos = self._video_pos if deck == "video" else self._music_pos
-            if action == "seek" or abs(cur_pos - pos) > 2.0:
+            last_seek = float(self._wp_last_remote_seek_ts.get(deck, 0.0))
+            is_buf = self._video_buffering if deck == "video" else False
+            drift = abs(cur_pos - pos)
+            should_seek = False
+            if action == "seek":
+                should_seek = drift >= 0.8
+            elif action == "presence":
+                should_seek = (not is_buf) and drift > 6.0 and (now_m - last_seek) >= 8.0
+            else:
+                should_seek = (
+                    drift > 3.5
+                    and (now_m - last_seek) >= 4.0
+                    and (cur_paused != want_paused or not is_buf)
+                )
+            if should_seek:
+                self._wp_last_remote_seek_ts[deck] = now_m
+                if deck == "video":
+                    self._video_pos = pos
+                else:
+                    self._music_pos = pos
                 player.seek(pos)
 
-        cur_paused = self._video_paused if deck == "video" else self._music_paused
-        if item_kind != "twitch" and cur_paused != want_paused:
+        if not is_live_media and cur_paused != want_paused:
+            self._wp_suppress_until[deck] = max(self._wp_suppress_until[deck], now_m + 2.5)
             player.set_pause(want_paused)
             if reason != "join":
                 self.show_toast(
@@ -6875,6 +7079,11 @@ class MainWindow(QMainWindow):
             self._save_current_video_progress(force=True)
             was_twitch = self._video_item is not None and self._video_item.kind == "twitch"
             self._video_play_gen += 1
+            self._video_resolving_id = None
+            self._wp_pending_video_sync = None
+            self._wp_pending_video_pause = None
+            self._video_buffering = False
+            self._video_buffering_ui_timer.stop()
             self.video_player.unload()
             self._video_item = None
             self._video_pos = 0.0
@@ -6900,6 +7109,9 @@ class MainWindow(QMainWindow):
         elif deck == "music":
             self._music_idle_unload_timer.stop()
             self._music_play_gen += 1
+            self._music_resolving_id = None
+            self._wp_pending_music_sync = None
+            self._wp_pending_music_pause = None
             self.music_player.unload()
             self._music_item = None
             self._music_pos = 0.0

@@ -81,6 +81,63 @@ def compute_live_position(state: dict[str, Any] | None, now: float | None = None
     return round(est, 2)
 
 
+def _presence_deck_fingerprint(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Construye una huella estable de presencia omitiendo `updated_at` y `pos` en curso."""
+    if not isinstance(state, dict):
+        return None
+    paused = bool(state.get("paused"))
+    fp: dict[str, Any] = {
+        "video_id": str(state.get("video_id") or ""),
+        "title": str(state.get("title") or ""),
+        "author": str(state.get("author") or ""),
+        "kind": str(state.get("kind") or "video"),
+        "is_live": bool(state.get("is_live")),
+        "paused": paused,
+        "duration_sec": int(state.get("duration_sec") or 0),
+        "speed": float(state.get("speed") or 1.0),
+    }
+    if paused:
+        try:
+            fp["pos"] = round(max(0.0, float(state.get("pos") or 0.0)), 1)
+        except (TypeError, ValueError):
+            fp["pos"] = 0.0
+    if "queue" in state:
+        fp["queue"] = [
+            str(q.get("video_id") or "")
+            for q in (state.get("queue") or [])
+            if isinstance(q, dict)
+        ]
+        fp["queue_index"] = int(state.get("queue_index", 0) or 0)
+    return fp
+
+
+def _has_large_live_pos_jump(
+    prev: dict[str, Any] | None,
+    curr: dict[str, Any] | None,
+) -> bool:
+    """Detecta saltos grandes de posición (>= 4 s) sobre el mismo medio en reproducción."""
+    if not isinstance(prev, dict) or not isinstance(curr, dict):
+        return False
+    if (
+        str(prev.get("video_id") or "") != str(curr.get("video_id") or "")
+        or str(prev.get("kind") or "") != str(curr.get("kind") or "")
+    ):
+        return False
+    if bool(prev.get("paused")) or bool(curr.get("paused")):
+        return False
+    if (
+        bool(prev.get("is_live"))
+        or bool(curr.get("is_live"))
+        or prev.get("kind") == "twitch"
+        or curr.get("kind") == "twitch"
+    ):
+        return False
+    now_ts = time.time()
+    return abs(
+        compute_live_position(prev, now=now_ts) - compute_live_position(curr, now=now_ts)
+    ) >= 4.0
+
+
 def compute_presence_status(
     video_state: dict[str, Any] | None,
     music_state: dict[str, Any] | None,
@@ -281,6 +338,38 @@ class WatchPartyService(QObject):
             return
         self._enqueue({"type": "lookup", "code": clean})
 
+    def _compute_presence_fp_locked(self) -> str:
+        vid = self._video_state if self._share_enabled else None
+        mus = self._music_state if self._share_enabled else None
+        norm = {
+            "name": self._display_name,
+            "avatar_url": self._avatar_url,
+            "status": self._local_status,
+            "share_enabled": self._share_enabled,
+            "allow_guest_control": self._allow_guest_control,
+            "video": _presence_deck_fingerprint(vid),
+            "music": _presence_deck_fingerprint(mus),
+        }
+        return json.dumps(norm, sort_keys=True, ensure_ascii=False)
+
+    def record_local_deck_state(
+        self,
+        deck: Literal["video", "music"],
+        state: dict[str, Any] | None,
+        *,
+        status: Literal["active", "idle"] | None = None,
+    ) -> None:
+        """Sincroniza en memoria el snapshot local tras enviar `party_sync` como anfitrión."""
+        with self._lock:
+            if status is not None:
+                self._local_status = "idle" if status == "idle" else "active"
+            copy_state = dict(state) if isinstance(state, dict) else None
+            if deck == "music":
+                self._music_state = copy_state
+            else:
+                self._video_state = copy_state
+            self._last_presence_fp = self._compute_presence_fp_locked()
+
     def update_local_presence(
         self,
         *,
@@ -294,6 +383,8 @@ class WatchPartyService(QObject):
         force: bool = False,
     ) -> None:
         with self._lock:
+            prev_vid = self._video_state if self._share_enabled else None
+            prev_mus = self._music_state if self._share_enabled else None
             if display_name is not None:
                 self._display_name = str(display_name).strip() or self._code
             if avatar_url is not None:
@@ -304,6 +395,16 @@ class WatchPartyService(QObject):
             self._video_state = dict(video_state) if isinstance(video_state, dict) else None
             self._music_state = dict(music_state) if isinstance(music_state, dict) else None
 
+            new_vid = self._video_state if self._share_enabled else None
+            new_mus = self._music_state if self._share_enabled else None
+            fp = self._compute_presence_fp_locked()
+            pos_jumped = _has_large_live_pos_jump(prev_vid, new_vid) or _has_large_live_pos_jump(
+                prev_mus, new_mus
+            )
+            if not force and not pos_jumped and fp == self._last_presence_fp:
+                return
+            self._last_presence_fp = fp
+
             payload = {
                 "type": "presence",
                 "name": self._display_name,
@@ -311,13 +412,9 @@ class WatchPartyService(QObject):
                 "status": self._local_status,
                 "share_enabled": self._share_enabled,
                 "allow_guest_control": self._allow_guest_control,
-                "video": self._video_state if self._share_enabled else None,
-                "music": self._music_state if self._share_enabled else None,
+                "video": new_vid,
+                "music": new_mus,
             }
-            fp = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-            if not force and fp == self._last_presence_fp:
-                return
-            self._last_presence_fp = fp
         self._enqueue(payload)
 
     def join_party(self, host_code: str, deck: Literal["video", "music"]) -> None:

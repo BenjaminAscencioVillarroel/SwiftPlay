@@ -359,6 +359,22 @@ def test_storage_config_themes() -> None:
     assert compute_presence_status({"video_id": "v1", "paused": True}, None, 120.0, False, 8) == "active"
     assert compute_presence_status({"video_id": "v1", "paused": True}, None, 500.0, False, 8) == "idle"
     assert compute_presence_status({"video_id": "v1", "paused": True}, None, 500.0, True, 8) == "active"
+
+    # WatchPartyService debe deduplicar `updated_at` y avance normal en presencia periódica
+    import time as _wp_test_t
+    from swiftplay.watchparty_service import WatchPartyService
+    wp_dedup = WatchPartyService()
+    enqueued_pres: list[dict] = []
+    wp_dedup._enqueue = lambda p: enqueued_pres.append(dict(p))  # type: ignore[method-assign]
+    _now_t = _wp_test_t.time()
+    st_t1 = {"video_id": "v_wp_cache", "title": "Demo", "kind": "video", "paused": False, "pos": 10.0, "speed": 1.0, "updated_at": _now_t - 10.0}
+    st_t2 = {"video_id": "v_wp_cache", "title": "Demo", "kind": "video", "paused": False, "pos": 20.0, "speed": 1.0, "updated_at": _now_t}
+    wp_dedup.update_local_presence(status="active", share_enabled=True, allow_guest_control=True, video_state=st_t1, music_state=None)
+    wp_dedup.update_local_presence(status="active", share_enabled=True, allow_guest_control=True, video_state=st_t2, music_state=None)
+    assert len(enqueued_pres) == 1, f"Presencia periódica sin cambios reales no debe reenviar frames: {len(enqueued_pres)}"
+    st_paused = {"video_id": "v_wp_cache", "title": "Demo", "kind": "video", "paused": True, "pos": 21.0, "speed": 1.0, "updated_at": _now_t + 1.0}
+    wp_dedup.update_local_presence(status="active", share_enabled=True, allow_guest_control=True, video_state=st_paused, music_state=None)
+    assert len(enqueued_pres) == 2, "Pausar sí debe actualizar presencia inmediatamente"
     for legacy_hex in ("#10141C", "#171C27", "#1E2534"):
         assert legacy_hex not in qss, f"No debe permanecer tono azulado antiguo {legacy_hex} en QSS Discord"
     assert "QFrame#DiscordDeckCard QLabel" in qss, "El popover DiscordDeckCard debe forzar fondo transparente en sus controles internos"
@@ -2243,6 +2259,186 @@ def test_gui_and_libmpv_smoke(
                 win._on_wp_restore_secondary_clicked()
                 app.processEvents()
                 assert win._video_item is None and not win.wp_restore_bar.isVisible()
+
+                # Estabilidad WatchParty + Caché VOD YouTube (sin duplicar resolve, sin loop de pausa ni seeks por presencia)
+                from swiftplay.player import MediaPlayer as _MPTest
+
+                class _FakeMpvHandle(dict):
+                    def __init__(self, **kw: object) -> None:
+                        super().__init__()
+                        self._kwargs = dict(kw)
+                        self.vid = "auto"
+                        self.start = "none"
+                        self.speed = 1.0
+                        self.volume = 80
+                        self.af = ""
+                        self.user_agent = ""
+                        self.http_header_fields: list[str] = []
+                        self.pause = False
+                        self.loaded: list[tuple[str, str]] = []
+
+                    def loadfile(self, url: str, mode: str) -> None:
+                        self.loaded.append((url, mode))
+
+                    def property_observer(self, _name: str):
+                        return lambda fn: fn
+
+                    def event_callback(self, _name: str):
+                        return lambda fn: fn
+
+                    def command(self, *_args: object) -> None:
+                        pass
+
+                    def terminate(self) -> None:
+                        pass
+
+                fake_handles: list[_FakeMpvHandle] = []
+
+                class _FakeMpvMod:
+                    MPV = staticmethod(lambda **kw: fake_handles.append(_FakeMpvHandle(**kw)) or fake_handles[-1])
+
+                mp_vod = _MPTest(wid=12345)
+                mp_vod._is_audio_only_instance = False
+                mp_vod._mpv = None
+                orig_get_mpv = __import__("swiftplay.player", fromlist=["_get_mpv_module"])._get_mpv_module
+                import swiftplay.player as _player_mod
+                _player_mod._get_mpv_module = lambda: _FakeMpvMod  # type: ignore[assignment]
+                try:
+                    mp_vod.play_stream("https://demo/v.mp4", audio_url="https://demo/a.m4a", start_pos=15.0, start_paused=True)
+                    h_vod = fake_handles[-1]
+                    assert h_vod._kwargs["cache_secs"] >= 15
+                    assert "http_persistent=1" in str(h_vod._kwargs["demuxer_lavf_o"])
+                    assert h_vod["cache"] == "yes" and float(h_vod["cache-secs"]) >= 15.0
+                    assert h_vod["demuxer-max-bytes"] == "24MiB" and h_vod.pause is True
+                    mp_vod.play_stream("http://127.0.0.1/ss.mp4", is_live=True, low_latency=True)
+                    h_ll = fake_handles[-1]
+                    assert h_ll["cache"] == "no" and h_ll["hwdec"] == "no"
+                finally:
+                    _player_mod._get_mpv_module = orig_get_mpv  # type: ignore[assignment]
+
+                # 1) Mismo video llegando repetido mientras yt-dlp sigue resolviendo NO debe relanzar play_video
+                play_calls_dup: list[str] = []
+                seek_calls_wp: list[float] = []
+                sync_calls_wp: list[tuple[str, str, str]] = []
+                orig_play_vid3 = win.play_video
+                orig_vp_seek = win.video_player.seek
+                orig_send_sync2 = win.watchparty_svc.send_party_sync
+                win.play_video = lambda it, start_pos=None, force_fresh=False: (  # type: ignore[method-assign]
+                    play_calls_dup.append(it.video_id),
+                    setattr(win, "_video_item", it),
+                    setattr(win, "_video_resolving_id", it.video_id),
+                )
+                win.video_player.seek = lambda s: seek_calls_wp.append(float(s))  # type: ignore[method-assign]
+                win.watchparty_svc.send_party_sync = (  # type: ignore[method-assign]
+                    lambda hc, dk, act, st: sync_calls_wp.append((hc, dk, act))
+                )
+                try:
+                    win.watchparty_svc._active_parties["video"] = {
+                        "host_code": "FINZ-1111",
+                        "host_name": "Finz",
+                        "members": [{"code": "FINZ-1111", "name": "Finz"}, {"code": win.cfg.watchparty_code, "name": "Benja"}],
+                    }
+                    win._video_item = None
+                    win._video_resolving_id = None
+                    win._wp_pending_video_sync = None
+                    win._on_watchparty_state_received(
+                        {
+                            "host_code": "FINZ-1111",
+                            "host_name": "Finz",
+                            "deck": "video",
+                            "reason": "sync",
+                            "action": "play_item",
+                            "updated_by": "FINZ-1111",
+                            "state": {"video_id": "v_dup", "title": "Dup Test", "kind": "video", "paused": False, "pos": 10.0},
+                        }
+                    )
+                    win._on_watchparty_state_received(
+                        {
+                            "host_code": "FINZ-1111",
+                            "host_name": "Finz",
+                            "deck": "video",
+                            "reason": "sync",
+                            "action": "pause",
+                            "updated_by": "FINZ-1111",
+                            "state": {"video_id": "v_dup", "title": "Dup Test", "kind": "video", "paused": True, "pos": 14.5},
+                        }
+                    )
+                    assert play_calls_dup == ["v_dup"], (
+                        f"Snapshot repetido durante resolve no debe relanzar yt-dlp: {play_calls_dup}"
+                    )
+                    assert win._wp_pending_video_sync is not None and win._wp_pending_video_sync["want_paused"] is True
+
+                    # 2) Pausa interna de libmpv sin intención de usuario no difunde sync; toggle_deck_play_pause sí
+                    win._video_resolving_id = None
+                    win._wp_suppress_until["video"] = 0.0
+                    win._wp_user_pause_intent["video"] = 0.0
+                    win._on_video_paused_changed(True)
+                    assert not sync_calls_wp, f"Evento pasivo de libmpv no debe enviar party_sync: {sync_calls_wp}"
+
+                    win.video_player.__class__.has_active_stream = property(lambda _s: True)  # type: ignore[assignment]
+                    orig_vp_toggle = win.video_player.toggle_pause
+                    win.video_player.toggle_pause = lambda: win._on_video_paused_changed(True)  # type: ignore[method-assign]
+                    try:
+                        win._video_pos = 20.0
+                        win.toggle_deck_play_pause("video")
+                        assert any(a == "pause" for _h, _d, a in sync_calls_wp), (
+                            f"Pausa iniciada por usuario sí debe enviarse al WatchParty: {sync_calls_wp}"
+                        )
+                    finally:
+                        win.video_player.toggle_pause = orig_vp_toggle  # type: ignore[method-assign]
+                        win.video_player.__class__.has_active_stream = orig_has_stream  # type: ignore[assignment]
+
+                    # 3) Presencia con deriva moderada (2.5s) no hace seek destructivo; seek explícito sí lo hace
+                    win.video_player.__class__.has_active_stream = property(lambda _s: True)  # type: ignore[assignment]
+                    try:
+                        win._video_pos = 30.0
+                        win._video_paused = False
+                        win._wp_last_remote_seek_ts["video"] = 0.0
+                        win._on_watchparty_state_received(
+                            {
+                                "host_code": "FINZ-1111",
+                                "host_name": "Finz",
+                                "deck": "video",
+                                "reason": "sync",
+                                "action": "presence",
+                                "updated_by": "FINZ-1111",
+                                "state": {"video_id": "v_dup", "title": "Dup Test", "kind": "video", "paused": False, "pos": 32.5},
+                            }
+                        )
+                        assert not seek_calls_wp, f"Presencia con deriva < 6s no debe hacer seek: {seek_calls_wp}"
+                        win._on_watchparty_state_received(
+                            {
+                                "host_code": "FINZ-1111",
+                                "host_name": "Finz",
+                                "deck": "video",
+                                "reason": "sync",
+                                "action": "seek",
+                                "updated_by": "FINZ-1111",
+                                "state": {"video_id": "v_dup", "title": "Dup Test", "kind": "video", "paused": False, "pos": 95.0},
+                            }
+                        )
+                        assert seek_calls_wp == [95.0], f"Seek explícito debe aplicarse: {seek_calls_wp}"
+                    finally:
+                        win.video_player.__class__.has_active_stream = orig_has_stream  # type: ignore[assignment]
+
+                    # 4) Alerta 'Buffering...' con histéresis de 650ms (no parpadea en micro-stalls)
+                    win.video_panel.set_status("")
+                    win._on_video_buffering_changed(True)
+                    assert win._video_buffering_ui_timer.isActive()
+                    assert "Buffering" not in win.video_panel.status_lbl.text()
+                    win._on_video_buffering_changed(False)
+                    assert not win._video_buffering_ui_timer.isActive()
+                    assert win.video_panel.status_lbl.text() == ""
+                finally:
+                    win._video_resolving_id = None
+                    win._wp_pending_video_sync = None
+                    win._wp_pending_video_pause = None
+                    win._video_buffering = False
+                    win._video_buffering_ui_timer.stop()
+                    win.play_video = orig_play_vid3  # type: ignore[method-assign]
+                    win.video_player.seek = orig_vp_seek  # type: ignore[method-assign]
+                    win.watchparty_svc.send_party_sync = orig_send_sync2  # type: ignore[method-assign]
+                    win.watchparty_svc._active_parties.clear()
             finally:
                 win._play_music_item = orig_play_music  # type: ignore[method-assign]
                 win.cfg.auto_pause_other_player = prev_auto_pause

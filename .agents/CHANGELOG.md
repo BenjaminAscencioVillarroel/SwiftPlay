@@ -14,6 +14,13 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-24 (3) — WatchParty YouTube: Caché estable en `libmpv` y sincronización sin re-resoluciones ni buffering repetido
+- **Files:** `src/swiftplay/player.py`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/ui/main_window.py`, `watchparty_relay/src/index.js`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Caché VOD y HTTP keep-alive en `player.py`:** `MediaPlayer._ensure_mpv` y `play_stream` amplían el buffer de YouTube VOD/Audio (`cache_secs=20`, `demuxer_readahead_secs=20`, `demuxer_max_bytes="24MiB"`/`"4MiB"`, `demuxer_hysteresis_secs=3`, `cache_pause_initial="yes"`, `cache_pause_wait=1.5`, `stream_buffer_size="512KiB"`) con `http_persistent=1,reconnect_at_eof=1` y añaden `start_paused: bool = False`, conservando `low_latency=True` intacto para compartir pantalla en Discord.
+  - **Eliminación de tormentas de `party_sync` y re-resoluciones `yt-dlp`:** `WatchPartyService.update_local_presence` y `watchparty_relay` (`meaningfulDeckKey`) ignoran campos volátiles (`updated_at` y `pos` en curso), el anfitrión registra su estado localmente (`record_local_deck_state`) al emitir `party_sync`, `MainWindow` consolida snapshots repetidos mientras `_video_resolving_id`/`_music_resolving_id` sigue en curso (`_wp_pending_video_sync`/`_wp_pending_music_sync`), exige intención explícita (`_wp_user_pause_intent`) para reenviar `pause`/`resume`, aplica histéresis en seeks remotos e incorpora debounce de `650 ms` para `"Buffering..."`.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]` + validación sintáctica de `watchparty_relay/src/index.js`.
+
 ## 2026-11-24 (2) — Fix YouTube Cookies Fallback (`Requested format is not available`) y Anti-Bombazos DAVE/Opus en Discord
 - **Files:** `src/swiftplay/ytdlp_worker.py`, `src/swiftplay/discord_worker.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**
