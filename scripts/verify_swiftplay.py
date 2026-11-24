@@ -344,6 +344,14 @@ def test_storage_config_themes() -> None:
         assert load_config(th_cfg_p).theme == "rose_sakura"
         assert AppConfig(theme="tema_inexistente").theme == "matte_silver"
 
+    assets_dir = Path(__file__).resolve().parents[1] / "assets"
+    assert (assets_dir / "swiftplay.png").exists() and (assets_dir / "swiftplay.png").stat().st_size > 1000, (
+        "Falta el ícono renovado assets/swiftplay.png"
+    )
+    assert (assets_dir / "swiftplay.ico").exists() and (assets_dir / "swiftplay.ico").stat().st_size > 1000, (
+        "Falta el ícono renovado assets/swiftplay.ico"
+    )
+
     mock_it_data = {
         "contents": [
             {
@@ -1142,6 +1150,65 @@ def test_gui_and_libmpv_smoke(
             dp._mic_test_active = False
             dp._mic_test_prev_flags = None
             dp._sync_mic_test_ui()
+
+        # Verificar controles de Modificador de Voz en popover de audio
+        orig_vfx = (
+            win.cfg.discord_voice_fx_enabled,
+            win.cfg.discord_voice_fx_preset,
+            win.cfg.discord_voice_fx_pitch,
+            win.cfg.discord_voice_fx_tone,
+            win.cfg.discord_voice_fx_robot,
+            win.cfg.discord_voice_fx_echo,
+        )
+        try:
+            assert dp.voice_fx_body.isHidden(), "Los ajustes finos del modificador de voz inician colapsados"
+            dp.voice_fx_expand_btn.click()
+            assert not dp.voice_fx_body.isHidden(), "Al expandir deben mostrarse los sliders de tono/timbre/robot/eco"
+            dp.voice_fx_check.setChecked(True)
+            deep_idx = dp.voice_fx_preset_combo.findData("deep")
+            assert deep_idx >= 0
+            dp.voice_fx_preset_combo.setCurrentIndex(deep_idx)
+            assert dp.voice_fx_pitch_slider.value() < 0
+            assert win.cfg.discord_voice_fx_enabled is True
+            assert win.cfg.discord_voice_fx_preset == "deep"
+            dp.voice_fx_pitch_slider.setValue(7)
+            assert win.cfg.discord_voice_fx_preset == "custom" and win.cfg.discord_voice_fx_pitch == 7
+            dp.voice_fx_reset_btn.click()
+            assert win.cfg.discord_voice_fx_preset == "normal" and dp.voice_fx_pitch_slider.value() == 0
+            dp.voice_fx_expand_btn.click()
+            assert dp.voice_fx_body.isHidden()
+        finally:
+            (
+                win.cfg.discord_voice_fx_enabled,
+                win.cfg.discord_voice_fx_preset,
+                win.cfg.discord_voice_fx_pitch,
+                win.cfg.discord_voice_fx_tone,
+                win.cfg.discord_voice_fx_robot,
+                win.cfg.discord_voice_fx_echo,
+            ) = orig_vfx
+            dp.voice_fx_check.blockSignals(True)
+            dp.voice_fx_check.setChecked(orig_vfx[0])
+            dp.voice_fx_check.blockSignals(False)
+            p_idx = dp.voice_fx_preset_combo.findData(orig_vfx[1])
+            if p_idx >= 0:
+                dp.voice_fx_preset_combo.blockSignals(True)
+                dp.voice_fx_preset_combo.setCurrentIndex(p_idx)
+                dp.voice_fx_preset_combo.blockSignals(False)
+            dp.voice_fx_pitch_slider.blockSignals(True)
+            dp.voice_fx_tone_slider.blockSignals(True)
+            dp.voice_fx_robot_slider.blockSignals(True)
+            dp.voice_fx_echo_slider.blockSignals(True)
+            dp.voice_fx_pitch_slider.setValue(orig_vfx[2])
+            dp.voice_fx_tone_slider.setValue(orig_vfx[3])
+            dp.voice_fx_robot_slider.setValue(orig_vfx[4])
+            dp.voice_fx_echo_slider.setValue(orig_vfx[5])
+            dp.voice_fx_pitch_slider.blockSignals(False)
+            dp.voice_fx_tone_slider.blockSignals(False)
+            dp.voice_fx_robot_slider.blockSignals(False)
+            dp.voice_fx_echo_slider.blockSignals(False)
+            dp._update_voice_fx_labels()
+            save_config(win.cfg)
+
         dp.close_audio_popover()
         assert dp.audio_popup.isHidden()
         dp._toggle_text_channels_section()
@@ -1724,6 +1791,20 @@ def test_gui_and_libmpv_smoke(
                 assert not dp.is_screen_viewer_fullscreen
                 assert win._is_discord_screen_fs is False
 
+                # Prevención de pantallazo azul: no aplicar QGraphicsOpacityEffect sobre HWND activo y refrescar salida
+                dp._animate_center_widget(dp.voice_pane)
+                assert dp.voice_pane.graphicsEffect() is None, (
+                    "No debe aplicarse QGraphicsOpacityEffect en voice_pane con visor activo"
+                )
+                win._switch_page(win.PAGE_VIDEO_SEARCH)
+                win._switch_page(win.PAGE_DISCORD)
+                assert win.stack.currentWidget().graphicsEffect() is None, (
+                    "Cambiar a Discord con visor activo no debe aplicar QGraphicsOpacityEffect al stack"
+                )
+                assert dp._screen_refresh_timer.isActive(), (
+                    "Al volver a Discord con visor activo debe programarse refresco del HWND de video"
+                )
+
                 dp._close_screen_share_viewer()
                 assert not dp.is_screen_viewer_active
             finally:
@@ -2098,22 +2179,85 @@ def test_gui_and_libmpv_smoke(
                 f"Historial de sonidos inesperado: {win.sound_fx._played_history!r}"
             )
 
-            # Sonidos al iniciar / reconfigurar / finalizar transmisión de pantalla
+            # Verificar badge EN VIVO en CANALES DE VOZ al transmitir + sonidos de transmisión
             win.sound_fx._played_history.clear()
             dp._screen_share_state = "idle"
-            dp._on_screen_share_state_changed(
-                "sharing",
-                {"watch_url": "https://example.com/watch", "quality": "720p", "fps": 30, "has_audio": True},
-            )
-            dp._on_screen_share_state_changed(
-                "sharing",
-                {"watch_url": "https://example.com/watch", "quality": "1080p", "fps": 60, "has_audio": True, "reconfigured": True},
-            )
-            dp._on_screen_share_state_changed("idle", {})
+            prev_ch_guilds = list(dp._guilds)
+            prev_ch_vstate = dict(dp._voice_state)
+            try:
+                dp._guilds = [
+                    {
+                        "id": "10",
+                        "name": "SrvDemo",
+                        "voice_channels": [
+                            {
+                                "id": "101",
+                                "name": "Sala",
+                                "can_connect": True,
+                                "members": [
+                                    {"id": "1", "name": "TuBot", "is_bot": True, "is_self": True, "muted": False, "deafened": False}
+                                ],
+                            }
+                        ],
+                        "text_channels": [],
+                    }
+                ]
+                dp._voice_state = {"in_voice": True, "guild_id": "10", "channel_id": "101", "participants": []}
+                dp._on_screen_share_state_changed(
+                    "sharing",
+                    {"watch_url": "https://example.com/watch", "quality": "720p", "fps": 30, "has_audio": True},
+                )
+                app.processEvents()
+                vc_live_badges = [
+                    b for b in dp.vc_list_widget.findChildren(QPushButton)
+                    if b.objectName() == "ScreenShareLiveBadge" and b.text() == "EN VIVO"
+                ]
+                assert len(vc_live_badges) >= 1, (
+                    "El canal de voz debe mostrar la insignia EN VIVO junto al miembro que transmite"
+                )
+                dp._on_screen_share_state_changed(
+                    "sharing",
+                    {"watch_url": "https://example.com/watch", "quality": "1080p", "fps": 60, "has_audio": True, "reconfigured": True},
+                )
+                dp._on_screen_share_state_changed("idle", {})
+                app.processEvents()
+                vc_live_badges_after = [
+                    b for b in dp.vc_list_widget.findChildren(QPushButton)
+                    if b.objectName() == "ScreenShareLiveBadge"
+                ]
+                assert len(vc_live_badges_after) == 0, "Al detener el directo debe desaparecer EN VIVO del canal"
+            finally:
+                dp._guilds = prev_ch_guilds
+                dp._voice_state = prev_ch_vstate
+                dp._render_channels(force=True)
             assert win.sound_fx._played_history == ["stream_start", "stream_stop"], (
                 f"Sonidos de transmisión inesperados: {win.sound_fx._played_history!r}"
             )
             assert win._discord_streaming is False
+
+            # Auto-mute al ensordecerse y restauración al des-ensordecerse / des-silenciarse
+            prev_m, prev_d, prev_mbd = dp._muted, dp._deafened, dp._muted_before_deaf
+            try:
+                dp._muted = False
+                dp._deafened = False
+                dp._muted_before_deaf = False
+                dp._toggle_deaf()
+                assert dp._deafened is True and dp._muted is True, "Ensordecerse debe silenciar también el micrófono"
+                dp._toggle_deaf()
+                assert dp._deafened is False and dp._muted is False, "Des-ensordecerse debe restaurar micrófono abierto"
+                dp._muted = True
+                dp._muted_before_deaf = False
+                dp._toggle_deaf()
+                assert dp._deafened is True and dp._muted is True
+                dp._toggle_deaf()
+                assert dp._deafened is False and dp._muted is True, "Si ya estaba muteado antes, debe seguir muteado"
+                dp._toggle_deaf()
+                assert dp._deafened is True and dp._muted is True
+                dp._toggle_mute()
+                assert dp._muted is False and dp._deafened is False, "Quitar mute ensordecido debe quitar también sordera"
+            finally:
+                dp._muted, dp._deafened, dp._muted_before_deaf = prev_m, prev_d, prev_mbd
+                dp._refresh_mute_deaf_buttons()
 
             # Verificar SettingsDialog (12 temas multitono, combo overlay 3 modos, paleta 7 colores y acordeón 11 sonidos)
             from swiftplay.sound_effects import SOUND_EVENTS
@@ -2295,8 +2439,11 @@ def test_gui_and_libmpv_smoke(
             assert dp._muted is True
             assert win.discord_mini_vu_bar.value() == 0
             win.discord_mini_deaf_btn.click()
-            assert dp._deafened is True
+            assert dp._deafened is True and dp._muted is True
             win.discord_mini_mute_btn.click()
+            assert not dp._muted and not dp._deafened
+            win.discord_mini_deaf_btn.click()
+            assert dp._deafened is True and dp._muted is True
             win.discord_mini_deaf_btn.click()
             assert not dp._muted and not dp._deafened
             win._on_discord_state_changed_for_log("disconnected", {})
@@ -2845,6 +2992,12 @@ def test_discord_voice_bridge() -> None:
             discord_sounds_enabled=True,
             discord_sound_pack="minimal",
             discord_sound_volumes={"message": 35, "mute_on": 0, "user_join": 140},
+            discord_voice_fx_enabled=True,
+            discord_voice_fx_preset="robot",
+            discord_voice_fx_pitch=-4,
+            discord_voice_fx_tone=25,
+            discord_voice_fx_robot=65,
+            discord_voice_fx_echo=30,
         )
         cfg_full_p = Path(tmp) / "config_full.json"
         save_config(cfg_full, cfg_full_p)
@@ -2853,6 +3006,19 @@ def test_discord_voice_bridge() -> None:
         assert cfg_full2.discord_sound_pack == "minimal"
         assert cfg_full2.discord_sound_volumes["message"] == 35
         assert cfg_full2.discord_sound_volumes["mute_on"] == 0
+        assert cfg_full2.discord_voice_fx_enabled is True and cfg_full2.discord_voice_fx_preset == "robot"
+        assert cfg_full2.discord_voice_fx_pitch == -4 and cfg_full2.discord_voice_fx_tone == 25
+        assert cfg_full2.discord_voice_fx_robot == 65 and cfg_full2.discord_voice_fx_echo == 30
+        clamped_vfx = AppConfig(
+            discord_voice_fx_preset="no_existe",
+            discord_voice_fx_pitch=-99,
+            discord_voice_fx_tone=999,
+            discord_voice_fx_robot=-10,
+            discord_voice_fx_echo=300,
+        )
+        assert clamped_vfx.discord_voice_fx_preset == "normal"
+        assert clamped_vfx.discord_voice_fx_pitch == -12 and clamped_vfx.discord_voice_fx_tone == 100
+        assert clamped_vfx.discord_voice_fx_robot == 0 and clamped_vfx.discord_voice_fx_echo == 100
         assert cfg_full2.discord_sound_volumes["user_join"] == 100
 
         from swiftplay.sound_effects import (
@@ -3638,6 +3804,33 @@ _asyncio.run(snap_app._set_mic_test(True))
 assert snap_app._mic_test_active is True and snap_app._muted is True and snap_app._deafened is True
 _asyncio.run(snap_app._set_mic_test(False))
 assert snap_app._mic_test_active is False and snap_app._muted is False and snap_app._deafened is False
+if snap_app._audio is not None:
+    snap_app._audio.close()
+
+from swiftplay.discord_worker import VoiceModifierDsp
+import math as _math
+_vfx_dsp = VoiceModifierDsp()
+_tone_samples = [int(8000 * _math.sin(2.0 * _math.pi * 220.0 * k / 48000.0)) for k in range(960)]
+_raw_frame = _st.pack("<960h", *_tone_samples)
+assert _vfx_dsp.process_20ms(_raw_frame) == _raw_frame, "Con modificador apagado debe haber bypass exacto"
+for _p_st in (-6, 6):
+    _vfx_dsp.reset()
+    _vfx_dsp.configure(enabled=True, pitch=_p_st, tone=-20 if _p_st < 0 else 25, robot=0, echo=0)
+    _out_p = _vfx_dsp.process_20ms(_raw_frame)
+    _out_p = _vfx_dsp.process_20ms(_raw_frame)
+    assert len(_out_p) == 1920 and _out_p != _raw_frame
+    assert any(v != 0 for v in _st.unpack("<960h", _out_p))
+_vfx_dsp.configure(enabled=True, pitch=0, tone=15, robot=75, echo=60)
+_out_fx = _vfx_dsp.process_20ms(_raw_frame)
+assert len(_out_fx) == 1920 and _out_fx != _raw_frame
+
+snap_app._muted = False
+snap_app._deafened = False
+_asyncio.run(snap_app.handle_command({"cmd": "set_deaf", "deafened": True}))
+assert snap_app._deafened is True and snap_app._muted is True, "Worker set_deaf=True debe mutear micrófono"
+_asyncio.run(snap_app.handle_command({"cmd": "set_voice_fx", "enabled": True, "pitch": -5, "tone": -20, "robot": 40, "echo": 25}))
+_app_vfx = snap_app._audio._mic_proc._voice_fx
+assert _app_vfx._enabled is True and _app_vfx._pitch == -5 and _app_vfx._tone == -20 and _app_vfx._robot == 40 and _app_vfx._echo == 25
 if snap_app._audio is not None:
     snap_app._audio.close()
 

@@ -14,6 +14,22 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-23 (2) — Insignia EN VIVO en Canales, Auto-Mute al Ensordecer, Nuevo Logo, Anti-Pantallazo Azul y Modificador de Voz
+
+### Cambios implementados
+- **Insignia `EN VIVO` en CANALES DE VOZ ([`discord_panel.py`](src/swiftplay/ui/discord_panel.py)):** `_build_voice_channel_row` y `_channels_signature` ahora detectan al bot/usuario actual (`is_self_member`) y renderizan el botón interactivo `EN VIVO` (`ScreenShareLiveBadge`) junto a su nombre en la lista de canales cuando `_screen_share_state == "sharing"`, abriendo la vista previa local al hacer clic; además `_on_screen_share_state_changed` fuerza el re-render de canales.
+- **Auto-silencio al ensordecerse ([`discord_panel.py`](src/swiftplay/ui/discord_panel.py), [`discord_worker.py`](src/swiftplay/discord_worker.py)):** Al activar sordera (`_toggle_deaf` / `set_deaf`), el micrófono se silencia automáticamente guardando `_muted_before_deaf` para restaurarlo al quitar la sordera (y des-silenciarse mientras se está ensordecido quita ambos estados).
+- **Rediseño del logotipo de SwiftPlay ([`scripts/generate_icon.py`](scripts/generate_icon.py), `assets/swiftplay.png`, `assets/swiftplay.ico`):** Nuevo emblema vectorial *Obsidian Prism Play* (`1024x1024`) con squircle obsidiana oscuro, borde degradado violeta-cían-índigo, prisma de reproducción con brillo vítreo y cintas cinéticas inferiores.
+- **Fix de pantallazos azules ocasionales en el visor de pantalla de Discord ([`player.py`](src/swiftplay/player.py), [`discord_panel.py`](src/swiftplay/ui/discord_panel.py), [`main_window.py`](src/swiftplay/ui/main_window.py)):**
+  - `MediaPlayer._ensure_mpv` fija `background="#000000"` y `play_stream(..., low_latency=True)` desactiva decodificación por hardware D3D11VA (`hwdec="no"`) en fMP4 de baja latencia evitando corrupción/flashes de framebuffer al iniciar o reenganchar D3D11.
+  - `DiscordVoicePanel` añade refresco diferido (`_screen_refresh_timer`, `_screen_post_reinit_timer`, `schedule_screen_viewer_refresh`) y omite `QGraphicsOpacityEffect` en `_animate_center_widget` y `MainWindow._switch_page` cuando `_screen_viewer_active` está activo para no crear capas compuestas sobre un HWND nativo de video.
+- **Modificador de voz en tiempo real ([`config.py`](src/swiftplay/config.py), [`discord_service.py`](src/swiftplay/discord_service.py), [`discord_worker.py`](src/swiftplay/discord_worker.py), [`discord_panel.py`](src/swiftplay/ui/discord_panel.py)):**
+  - Nuevo procesador DSP `VoiceModifierDsp` en el proceso aislado `discord_worker.py` (48 kHz mono 20 ms sin importar `numpy` en GUI): cambio de tono grave/agudo con doble tap con ventana Hann (`-12` a `+12` semitonos), filtro de timbre (`-100` a `+100`), modulador robótico (`0..100%`) y eco con retroalimentación amortiguada (`0..100%`), compatible con el modo `Probar micrófono`.
+  - Nuevos campos persistidos en `AppConfig` + presets (`Normal`, `Grave`, `Gigante`, `Agudo`, `Ardilla`, `Robot`, `Radio`, `Cueva`, `Personalizado`) y controles colapsables en el popover de audio de Discord.
+- **Verificación (`scripts/verify_swiftplay.py`):** Añadidas pruebas para los nuevos iconos, insignia `EN VIVO` en canales de voz, auto-mute al ensordecerse, prevención de `QGraphicsOpacityEffect` sobre visor activo, presets/sliders/config del modificador de voz y DSP + comandos IPC del worker.
+
+---
+
 ## 2026-11-23 — Sonido/Overlay de Transmisión en Vivo, 12 Temas Multitono en Sistema y Animaciones UI
 - **Files:** `src/swiftplay/sound_effects.py`, `src/swiftplay/themes.py`, `src/swiftplay/config.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/discord_overlay.py`, `src/swiftplay/ui/discord_notification.py`, `src/swiftplay/ui/settings_dialog.py`, `src/swiftplay/ui/main_window.py`, `src/swiftplay/ui/widgets.py`, `src/swiftplay/ui/music_player_panel.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

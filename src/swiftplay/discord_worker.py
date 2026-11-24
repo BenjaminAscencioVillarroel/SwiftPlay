@@ -595,8 +595,192 @@ class _DeepFilterMicDsp:
                 return None
 
 
+class VoiceModifierDsp:
+    """Modificador de voz en tiempo real sobre frames de 20 ms @ 48 kHz mono (aislado en worker)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._enabled = False
+        self._pitch = 0
+        self._tone = 0
+        self._robot = 0
+        self._echo = 0
+        self._np: Any = None
+
+        self._ring_len = 4096
+        self._ring: Any = None
+        self._ring_w = 0
+        self._win_len = 1344  # ~28 ms Hann overlap
+        self._tap_phase = 0.0
+        self._tone_lp = 0.0
+        self._robot_phase = 0.0
+        self._echo_len = 7200  # 150 ms @ 48 kHz
+        self._echo_buf: Any = None
+        self._echo_idx = 0
+        self._echo_lp = 0.0
+
+    def _ensure_buffers(self) -> Any:
+        np = self._np
+        if np is None:
+            import numpy as np_mod
+
+            self._np = np_mod
+            np = np_mod
+        if self._ring is None:
+            self._ring = np.zeros(self._ring_len, dtype=np.float32)
+        if self._echo_buf is None:
+            self._echo_buf = np.zeros(self._echo_len, dtype=np.float32)
+        return np
+
+    def configure(
+        self,
+        *,
+        enabled: bool | None = None,
+        pitch: int | None = None,
+        tone: int | None = None,
+        robot: int | None = None,
+        echo: int | None = None,
+    ) -> None:
+        with self._lock:
+            if enabled is not None:
+                self._enabled = bool(enabled)
+            if pitch is not None:
+                self._pitch = max(-12, min(12, int(pitch)))
+            if tone is not None:
+                self._tone = max(-100, min(100, int(tone)))
+            if robot is not None:
+                self._robot = max(0, min(100, int(robot)))
+            if echo is not None:
+                self._echo = max(0, min(100, int(echo)))
+
+    def reset(self) -> None:
+        with self._lock:
+            if self._ring is not None:
+                self._ring.fill(0.0)
+            if self._echo_buf is not None:
+                self._echo_buf.fill(0.0)
+            self._ring_w = 0
+            self._tap_phase = 0.0
+            self._tone_lp = 0.0
+            self._robot_phase = 0.0
+            self._echo_idx = 0
+            self._echo_lp = 0.0
+
+    def process_20ms(self, raw_mono_frame: bytes) -> bytes:
+        with self._lock:
+            enabled = self._enabled
+            pitch = self._pitch
+            tone = self._tone
+            robot = self._robot
+            echo = self._echo
+        if not enabled or (pitch == 0 and tone == 0 and robot == 0 and echo == 0):
+            return raw_mono_frame
+        if not raw_mono_frame:
+            return raw_mono_frame
+
+        np = self._ensure_buffers()
+        x = np.frombuffer(raw_mono_frame, dtype=np.int16).astype(np.float32) * (1.0 / 32768.0)
+        n = int(x.shape[0])
+        if n <= 0:
+            return raw_mono_frame
+
+        # 1) Pitch shifter de doble tap con ventana Hann (sin clics, baja latencia)
+        if pitch != 0:
+            ratio = 2.0 ** (float(pitch) / 12.0)
+            ring = self._ring
+            rlen = self._ring_len
+            wlen = self._win_len
+            w_idx = (self._ring_w + np.arange(n, dtype=np.int32)) % rlen
+            ring[w_idx] = x
+            self._ring_w = (self._ring_w + n) % rlen
+
+            step = (1.0 - ratio) / float(wlen)
+            phases = (self._tap_phase + np.arange(n, dtype=np.float32) * step) % 1.0
+            self._tap_phase = float((self._tap_phase + n * step) % 1.0)
+
+            p1 = phases
+            p2 = (phases + 0.5) % 1.0
+            d1 = p1 * float(wlen)
+            d2 = p2 * float(wlen)
+            pos1 = (w_idx.astype(np.float32) - d1) % float(rlen)
+            pos2 = (w_idx.astype(np.float32) - d2) % float(rlen)
+
+            i1 = np.floor(pos1).astype(np.int32) % rlen
+            f1 = pos1 - np.floor(pos1)
+            s1 = ring[i1] * (1.0 - f1) + ring[(i1 + 1) % rlen] * f1
+
+            i2 = np.floor(pos2).astype(np.int32) % rlen
+            f2 = pos2 - np.floor(pos2)
+            s2 = ring[i2] * (1.0 - f2) + ring[(i2 + 1) % rlen] * f2
+
+            g1 = np.sin(np.pi * p1) ** 2
+            g2 = 1.0 - g1
+            x = s1 * g1 + s2 * g2
+
+        # 2) Moldeador de timbre (cálido/oscuro para valores negativos, brillante/radio para positivos)
+        if tone != 0:
+            t_norm = float(tone) / 100.0
+            if t_norm < 0.0:
+                amt = -t_norm
+                alpha = max(0.06, 0.34 - 0.25 * amt)
+                lp = self._tone_lp
+                out_t = np.empty_like(x)
+                for i in range(n):
+                    lp = lp + alpha * (float(x[i]) - lp)
+                    out_t[i] = lp
+                self._tone_lp = lp
+                x = x * (1.0 - 0.85 * amt) + out_t * (0.85 * amt)
+            else:
+                amt = t_norm
+                alpha = 0.22
+                lp = self._tone_lp
+                out_hp = np.empty_like(x)
+                for i in range(n):
+                    v = float(x[i])
+                    lp = lp + alpha * (v - lp)
+                    out_hp[i] = v - lp
+                self._tone_lp = lp
+                x = x * (1.0 - 0.30 * amt) + out_hp * (0.95 * amt)
+
+        # 3) Modulador en anillo robótico (portadora continua 75 Hz + 150 Hz)
+        if robot > 0:
+            r_mix = (float(robot) / 100.0) * 0.85
+            ph = self._robot_phase + (2.0 * math.pi * 75.0 / 48000.0) * np.arange(n, dtype=np.float32)
+            self._robot_phase = float((self._robot_phase + n * (2.0 * math.pi * 75.0 / 48000.0)) % (2.0 * math.pi))
+            carrier = 0.72 * np.sin(ph) + 0.28 * np.sin(2.0 * ph)
+            x = x * (1.0 - r_mix) + (x * carrier * 1.35) * r_mix
+
+        # 4) Eco / reverberación con realimentación amortiguada
+        if echo > 0:
+            e_amt = float(echo) / 100.0
+            wet = 0.48 * e_amt
+            fb = 0.42 * e_amt
+            ebuf = self._echo_buf
+            elen = self._echo_len
+            eidx = self._echo_idx
+            elp = self._echo_lp
+            out_e = np.empty_like(x)
+            for i in range(n):
+                delayed = float(ebuf[eidx])
+                elp = elp + 0.32 * (delayed - elp)
+                dry_s = float(x[i])
+                ebuf[eidx] = max(-1.2, min(1.2, dry_s + elp * fb))
+                out_e[i] = dry_s + delayed * wet
+                eidx += 1
+                if eidx >= elen:
+                    eidx = 0
+            self._echo_idx = eidx
+            self._echo_lp = elp
+            x = out_e
+
+        # Limitador suave para evitar saturación
+        x = 0.96 * np.tanh(x * (1.0 / 0.96))
+        pcm_out = np.clip(x * 32767.0, -32768.0, 32767.0).astype(np.int16)
+        return pcm_out.tobytes()
+
+
 class MicProcessor:
-    """Supresión de ruido neuronal (DeepFilterNet3 + Silero / WebRTC), AGC suave, limitador y VAD."""
+    """Supresión de ruido neuronal (DeepFilterNet3 + Silero / WebRTC), AGC suave, modificador de voz y VAD."""
 
     def __init__(
         self,
@@ -622,6 +806,7 @@ class MicProcessor:
         self._enable_webrtc = dsp_active
         self._df_dsp = _DeepFilterMicDsp(self._noise_suppression) if dsp_active else None
         self._webrtc_dsp = _WebRtcMicDsp("webrtc") if dsp_active else None
+        self._voice_fx = VoiceModifierDsp()
         self._hangover_sec = float(hangover_sec)
         self._preroll: deque[bytes] = deque(maxlen=max(1, int(preroll_frames)))
         self._speaking = False
@@ -665,6 +850,7 @@ class MicProcessor:
         agc_enabled: bool | None = None,
         vad_threshold: int | None = None,
         noise_suppression: str | None = None,
+        voice_fx: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
             if mic_gain_pct is not None:
@@ -680,10 +866,19 @@ class MicProcessor:
             cur_ns = self._noise_suppression
             df_dsp = self._df_dsp
             webrtc_dsp = self._webrtc_dsp
+            vfx = self._voice_fx
         if df_dsp is not None:
             df_dsp.reconfigure(cur_ns)
         if webrtc_dsp is not None:
             webrtc_dsp.reconfigure("webrtc" if cur_ns != "off" else "off")
+        if isinstance(voice_fx, dict):
+            vfx.configure(
+                enabled=voice_fx.get("enabled"),
+                pitch=voice_fx.get("pitch"),
+                tone=voice_fx.get("tone"),
+                robot=voice_fx.get("robot"),
+                echo=voice_fx.get("echo"),
+            )
 
     def reset(self) -> None:
         with self._lock:
@@ -694,10 +889,12 @@ class MicProcessor:
             self._voice_env = 0.0
             df_dsp = self._df_dsp
             webrtc_dsp = self._webrtc_dsp
+            vfx = self._voice_fx
         if df_dsp is not None:
             df_dsp.reset()
         if webrtc_dsp is not None:
             webrtc_dsp.reset()
+        vfx.reset()
 
     def check_hangover(self, now: float) -> bool:
         """Devuelve True si expiró el hangover estando en reposo y se cerró el micrófono."""
@@ -793,6 +990,7 @@ class MicProcessor:
             total_gain = 29500.0 / float(work_peak)
 
         processed = _pcm_scale(work_frame, total_gain)
+        processed = self._voice_fx.process_20ms(processed)
         out_rms = _pcm_rms(processed)
         if out_rms <= 20:
             level = 0
@@ -1594,6 +1792,7 @@ class AudioEngine:
         agc_enabled: bool | None = None,
         vad_threshold: int | None = None,
         noise_suppression: str | None = None,
+        voice_fx: dict[str, Any] | None = None,
         input_device_name: str | None = None,
         output_device_name: str | None = None,
     ) -> None:
@@ -1615,6 +1814,7 @@ class AudioEngine:
             agc_enabled=agc_enabled,
             vad_threshold=vad_threshold,
             noise_suppression=noise_suppression,
+            voice_fx=voice_fx,
         )
         if noise_suppression is not None and self._running:
             self._mic_proc.ensure_warmup_async()
@@ -4967,6 +5167,9 @@ class DiscordWorkerApp:
                         self._audio.configure(loopback=False)
                 self._deafened = bool(req.get("deafened", False))
                 self._mixer.set_deafened(self._deafened)
+                if self._deafened:
+                    self._muted = True
+                    self._ensure_audio_engine().configure(muted=True, loopback=False)
                 await self._sync_voice_flags()
             elif cmd == "set_mic_test":
                 await self._set_mic_test(bool(req.get("enabled", False)))
@@ -4983,6 +5186,16 @@ class DiscordWorkerApp:
             elif cmd == "set_vad_threshold":
                 self._ensure_audio_engine().configure(
                     vad_threshold=_safe_int(req.get("threshold", 18))
+                )
+            elif cmd == "set_voice_fx":
+                self._ensure_audio_engine().configure(
+                    voice_fx={
+                        "enabled": bool(req.get("enabled", False)),
+                        "pitch": _safe_int(req.get("pitch", 0)),
+                        "tone": _safe_int(req.get("tone", 0)),
+                        "robot": _safe_int(req.get("robot", 0)),
+                        "echo": _safe_int(req.get("echo", 0)),
+                    }
                 )
             elif cmd == "set_user_volume":
                 self._mixer.set_user_volume(
@@ -5010,6 +5223,8 @@ class DiscordWorkerApp:
                     cfg_kwargs["noise_suppression"] = str(req.get("noise_suppression") or "ai")
                 if "vad_threshold" in req:
                     cfg_kwargs["vad_threshold"] = _safe_int(req.get("vad_threshold", 18))
+                if isinstance(req.get("voice_fx"), dict):
+                    cfg_kwargs["voice_fx"] = dict(req["voice_fx"])
 
                 flags_changed = False
                 if "muted" in req:

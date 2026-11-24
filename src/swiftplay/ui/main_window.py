@@ -3085,6 +3085,8 @@ class MainWindow(QMainWindow):
             self.music_panel.play_entrance_animation()
         elif page_idx == self.PAGE_VIDEO_PLAYER and self._video_item is not None:
             self._schedule_video_surface_refresh(55)
+        elif page_idx == self.PAGE_DISCORD and self.discord_panel._screen_viewer_active:
+            self.discord_panel.schedule_screen_viewer_refresh(55)
         elif page_idx != self.PAGE_VIDEO_PLAYER and page_idx != prev_idx:
             self._animate_page_fade(self.stack.currentWidget())
         if page_idx == self.PAGE_VIDEO_SEARCH:

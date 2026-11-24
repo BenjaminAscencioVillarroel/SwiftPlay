@@ -69,7 +69,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from swiftplay.config import AppConfig, save_config
+from swiftplay.config import AppConfig, VOICE_FX_PRESETS, save_config
 from swiftplay.discord_service import DiscordService
 from swiftplay.paths import USER_DATA_DIR
 from swiftplay.player import MediaPlayer
@@ -2336,6 +2336,7 @@ class DiscordVoicePanel(QWidget):
         self._speaking: dict[str, bool] = {}
         self._muted = False
         self._deafened = False
+        self._muted_before_deaf = False
         self._mic_test_active = False
         self._mic_test_prev_flags: tuple[bool, bool] | None = None
         self._bot_state = "disconnected"
@@ -2419,6 +2420,14 @@ class DiscordVoicePanel(QWidget):
         self._screen_viewer_author_id = ""
         self._screen_viewer_rev = 0
         self._screen_player: MediaPlayer | None = None
+        self._screen_refresh_timer = QTimer(self)
+        self._screen_refresh_timer.setSingleShot(True)
+        self._screen_refresh_timer.setInterval(55)
+        self._screen_refresh_timer.timeout.connect(self._refresh_screen_viewer_output)
+        self._screen_post_reinit_timer = QTimer(self)
+        self._screen_post_reinit_timer.setSingleShot(True)
+        self._screen_post_reinit_timer.setInterval(150)
+        self._screen_post_reinit_timer.timeout.connect(self._post_reinit_screen_redraw)
 
         # Estado de acordeones y vista exclusiva central (Voz o Chat)
         self._channels_visible = True
@@ -3220,6 +3229,110 @@ class DiscordVoicePanel(QWidget):
         ns_row.addWidget(self.ns_combo, 1)
         adv_lay.addLayout(ns_row)
 
+        vfx_hdr = QHBoxLayout()
+        vfx_hdr.setSpacing(6)
+        self.voice_fx_check = QCheckBox("Modificador de voz")
+        self.voice_fx_check.setChecked(self.cfg.discord_voice_fx_enabled)
+        self.voice_fx_check.setToolTip(
+            "Modifica el tono, timbre, robot o eco de tu micrófono en tiempo real"
+        )
+        self.voice_fx_check.toggled.connect(self._on_voice_fx_enabled_toggled)
+        vfx_hdr.addWidget(self.voice_fx_check)
+
+        self.voice_fx_preset_combo = QComboBox()
+        for pkey, (plabel, *_vals) in VOICE_FX_PRESETS.items():
+            self.voice_fx_preset_combo.addItem(plabel, pkey)
+        pfx_idx = self.voice_fx_preset_combo.findData(self.cfg.discord_voice_fx_preset)
+        if pfx_idx >= 0:
+            self.voice_fx_preset_combo.setCurrentIndex(pfx_idx)
+        self.voice_fx_preset_combo.currentIndexChanged.connect(self._on_voice_fx_preset_changed)
+        vfx_hdr.addWidget(self.voice_fx_preset_combo, 1)
+
+        self.voice_fx_expand_btn = QPushButton("Ajustar ▸")
+        self.voice_fx_expand_btn.setObjectName("PillBtn")
+        self.voice_fx_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.voice_fx_expand_btn.clicked.connect(self._toggle_voice_fx_body)
+        vfx_hdr.addWidget(self.voice_fx_expand_btn)
+        adv_lay.addLayout(vfx_hdr)
+
+        self.voice_fx_body = QWidget()
+        self.voice_fx_body.setObjectName("TransparentBox")
+        self.voice_fx_body.setVisible(False)
+        vfx_body_lay = QVBoxLayout(self.voice_fx_body)
+        vfx_body_lay.setContentsMargins(6, 2, 2, 2)
+        vfx_body_lay.setSpacing(5)
+
+        def _add_fx_slider(
+            label_txt: str,
+            min_v: int,
+            max_v: int,
+            init_v: int,
+            tooltip: str,
+        ) -> tuple[QSlider, QLabel]:
+            r = QHBoxLayout()
+            r.setSpacing(6)
+            nm = QLabel(label_txt)
+            nm.setObjectName("MutedLabel")
+            nm.setFixedWidth(54)
+            r.addWidget(nm)
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(min_v, max_v)
+            sl.setValue(max(min_v, min(max_v, int(init_v))))
+            sl.setToolTip(tooltip)
+            sl.valueChanged.connect(self._on_voice_fx_slider_changed)
+            r.addWidget(sl, 1)
+            vl = QLabel()
+            vl.setObjectName("MutedLabel")
+            vl.setFixedWidth(54)
+            vl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            r.addWidget(vl)
+            vfx_body_lay.addLayout(r)
+            return sl, vl
+
+        self.voice_fx_pitch_slider, self.voice_fx_pitch_val = _add_fx_slider(
+            "Tono:",
+            -12,
+            12,
+            self.cfg.discord_voice_fx_pitch,
+            "Grave (-12 st) a Agudo (+12 st)",
+        )
+        self.voice_fx_tone_slider, self.voice_fx_tone_val = _add_fx_slider(
+            "Timbre:",
+            -100,
+            100,
+            self.cfg.discord_voice_fx_tone,
+            "Cálido/oscuro (-100) a Brillante/radio (+100)",
+        )
+        self.voice_fx_robot_slider, self.voice_fx_robot_val = _add_fx_slider(
+            "Robot:",
+            0,
+            100,
+            self.cfg.discord_voice_fx_robot,
+            "Modulación robótica (0%–100%)",
+        )
+        self.voice_fx_echo_slider, self.voice_fx_echo_val = _add_fx_slider(
+            "Eco:",
+            0,
+            100,
+            self.cfg.discord_voice_fx_echo,
+            "Eco / reverberación de sala (0%–100%)",
+        )
+
+        vfx_foot = QHBoxLayout()
+        vfx_foot.setSpacing(6)
+        vfx_tip = QLabel("Usa 'Probar micrófono' para escucharte en vivo")
+        vfx_tip.setObjectName("MutedLabel")
+        vfx_tip.setStyleSheet("font-size: 10.5px;")
+        vfx_foot.addWidget(vfx_tip, 1)
+        self.voice_fx_reset_btn = QPushButton("Restablecer")
+        self.voice_fx_reset_btn.setObjectName("PillBtn")
+        self.voice_fx_reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.voice_fx_reset_btn.clicked.connect(self._on_voice_fx_reset)
+        vfx_foot.addWidget(self.voice_fx_reset_btn)
+        vfx_body_lay.addLayout(vfx_foot)
+        self._update_voice_fx_labels()
+        adv_lay.addWidget(self.voice_fx_body)
+
         bottom_audio_row = QHBoxLayout()
         bottom_audio_row.setSpacing(8)
         self.agc_check = QCheckBox("Auto-ganancia")
@@ -3650,6 +3763,19 @@ class DiscordVoicePanel(QWidget):
     def _animate_center_widget(self, widget: QWidget | None) -> None:
         if widget is None or not self.isVisible():
             return
+        if widget is self.voice_pane and self._screen_viewer_active:
+            try:
+                self._center_fade_anim.stop()
+            except RuntimeError:
+                pass
+            if self._fade_target_widget is not None:
+                try:
+                    self._fade_target_widget.setGraphicsEffect(None)
+                except RuntimeError:
+                    pass
+                self._fade_target_widget = None
+            self.schedule_screen_viewer_refresh(45)
+            return
         try:
             self._center_fade_anim.stop()
         except RuntimeError:
@@ -3681,6 +3807,8 @@ class DiscordVoicePanel(QWidget):
             QTimer.singleShot(0, self._relayout_participant_cards_if_needed)
         if animate and changed:
             self._animate_center_widget(target)
+        elif target is self.voice_pane and changed and self._screen_viewer_active:
+            self.schedule_screen_viewer_refresh(55)
         self.tab_voice_btn.setProperty("active", "true" if self._voice_pane_visible else "false")
         self.tab_chat_btn.setProperty("active", "true" if self._chat_pane_visible else "false")
         for b in (self.tab_voice_btn, self.tab_chat_btn):
@@ -4216,12 +4344,22 @@ class DiscordVoicePanel(QWidget):
                     btag.setObjectName("DeckTag")
                     m_row.addWidget(btag)
                 own_bot_id = str(self.svc.bot_id or "")
+                is_self_member = bool(m.get("is_self", False)) or (
+                    bool(own_bot_id) and m_id == own_bot_id
+                )
                 m_share = m.get("screen_share") or (
                     self._remote_screen_shares.get(m_id)
-                    if (m_id and m_id != own_bot_id)
+                    if (m_id and not is_self_member)
                     else None
                 )
-                if isinstance(m_share, dict) and str(m_share.get("stream_url") or "").strip():
+                if is_self_member and self._screen_share_state == "sharing":
+                    live_btn = QPushButton("EN VIVO")
+                    live_btn.setObjectName("ScreenShareLiveBadge")
+                    live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    live_btn.setToolTip("Estás transmitiendo · clic para abrir vista previa")
+                    live_btn.clicked.connect(self._open_local_share_preview)
+                    m_row.addWidget(live_btn)
+                elif isinstance(m_share, dict) and str(m_share.get("stream_url") or "").strip():
                     live_btn = QPushButton("EN VIVO")
                     live_btn.setObjectName("ScreenShareLiveBadge")
                     live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4309,6 +4447,7 @@ class DiscordVoicePanel(QWidget):
             self._active_chat_id,
             self.cfg.discord_show_locked_channels,
             self._locked_vc_expanded,
+            self._screen_share_state == "sharing",
             tuple(self.cfg.discord_notify_channels),
             tuple(self.cfg.discord_hidden_channels),
             tuple(sorted(self._unread_channels.items())),
@@ -6325,6 +6464,16 @@ class DiscordVoicePanel(QWidget):
             self._mic_test_active = False
             self._mic_test_prev_flags = None
             self._sync_mic_test_ui()
+        if self._deafened and self._muted:
+            self._deafened = False
+            self._muted = False
+            self._muted_before_deaf = False
+            self._refresh_mute_deaf_buttons()
+            self.svc.set_deaf(False)
+            self.svc.set_mute(False)
+            self._emit_voice_status()
+            self.sound_event_requested.emit("mute_off")
+            return
         self._muted = not self._muted
         self._refresh_mute_deaf_buttons()
         self.svc.set_mute(self._muted)
@@ -6337,6 +6486,14 @@ class DiscordVoicePanel(QWidget):
             self._mic_test_prev_flags = None
             self._sync_mic_test_ui()
         self._deafened = not self._deafened
+        if self._deafened:
+            self._muted_before_deaf = self._muted
+            self._muted = True
+            self.svc.set_mute(True)
+        else:
+            self._muted = bool(self._muted_before_deaf)
+            self._muted_before_deaf = False
+            self.svc.set_mute(self._muted)
         self._refresh_mute_deaf_buttons()
         self.svc.set_deaf(self._deafened)
         self._emit_voice_status()
@@ -6386,6 +6543,128 @@ class DiscordVoicePanel(QWidget):
         self.cfg.discord_vad_threshold = value
         save_config(self.cfg)
         self.svc.set_vad_threshold(value)
+
+    def _reclamp_audio_popup(self) -> None:
+        if not hasattr(self, "audio_popup") or not self.audio_popup.isVisible():
+            return
+        self.audio_popup.adjustSize()
+        pos = self.audio_popup.pos()
+        scr = QApplication.screenAt(pos) or QApplication.primaryScreen()
+        if scr is not None:
+            geo = scr.availableGeometry()
+            tx = max(geo.left() + 8, min(geo.right() - self.audio_popup.width() - 8, pos.x()))
+            ty = max(geo.top() + 8, min(geo.bottom() - self.audio_popup.height() - 8, pos.y()))
+            self.audio_popup.move(tx, ty)
+
+    def _toggle_voice_fx_body(self) -> None:
+        show = not self.voice_fx_body.isVisible()
+        self.voice_fx_body.setVisible(show)
+        self.voice_fx_expand_btn.setText("Ajustar ▾" if show else "Ajustar ▸")
+        self._reclamp_audio_popup()
+
+    def _update_voice_fx_labels(self) -> None:
+        p = int(self.voice_fx_pitch_slider.value())
+        self.voice_fx_pitch_val.setText(f"{p:+d} st" if p != 0 else "0 st")
+        t = int(self.voice_fx_tone_slider.value())
+        if t <= -15:
+            self.voice_fx_tone_val.setText(f"Oscuro {t}")
+        elif t >= 15:
+            self.voice_fx_tone_val.setText(f"Brillo +{t}")
+        else:
+            self.voice_fx_tone_val.setText("Neutro")
+        self.voice_fx_robot_val.setText(f"{int(self.voice_fx_robot_slider.value())}%")
+        self.voice_fx_echo_val.setText(f"{int(self.voice_fx_echo_slider.value())}%")
+
+    def _sync_voice_fx_to_worker(self) -> None:
+        save_config(self.cfg)
+        self.svc.set_voice_fx(
+            enabled=self.cfg.discord_voice_fx_enabled,
+            pitch=self.cfg.discord_voice_fx_pitch,
+            tone=self.cfg.discord_voice_fx_tone,
+            robot=self.cfg.discord_voice_fx_robot,
+            echo=self.cfg.discord_voice_fx_echo,
+        )
+
+    def _on_voice_fx_enabled_toggled(self, checked: bool) -> None:
+        self.cfg.discord_voice_fx_enabled = bool(checked)
+        self._sync_voice_fx_to_worker()
+
+    def _on_voice_fx_preset_changed(self, _idx: int) -> None:
+        pkey = str(self.voice_fx_preset_combo.currentData() or "normal")
+        self.cfg.discord_voice_fx_preset = pkey
+        if pkey != "custom" and pkey in VOICE_FX_PRESETS:
+            _lbl, pitch, tone, robot, echo = VOICE_FX_PRESETS[pkey]
+            for sl, val in (
+                (self.voice_fx_pitch_slider, pitch),
+                (self.voice_fx_tone_slider, tone),
+                (self.voice_fx_robot_slider, robot),
+                (self.voice_fx_echo_slider, echo),
+            ):
+                sl.blockSignals(True)
+                sl.setValue(val)
+                sl.blockSignals(False)
+            self.cfg.discord_voice_fx_pitch = pitch
+            self.cfg.discord_voice_fx_tone = tone
+            self.cfg.discord_voice_fx_robot = robot
+            self.cfg.discord_voice_fx_echo = echo
+            self._update_voice_fx_labels()
+            if pkey != "normal" and not self.voice_fx_check.isChecked():
+                self.voice_fx_check.blockSignals(True)
+                self.voice_fx_check.setChecked(True)
+                self.voice_fx_check.blockSignals(False)
+                self.cfg.discord_voice_fx_enabled = True
+        self._sync_voice_fx_to_worker()
+
+    def _on_voice_fx_slider_changed(self, _val: int) -> None:
+        self._update_voice_fx_labels()
+        self.cfg.discord_voice_fx_pitch = int(self.voice_fx_pitch_slider.value())
+        self.cfg.discord_voice_fx_tone = int(self.voice_fx_tone_slider.value())
+        self.cfg.discord_voice_fx_robot = int(self.voice_fx_robot_slider.value())
+        self.cfg.discord_voice_fx_echo = int(self.voice_fx_echo_slider.value())
+        self.cfg.discord_voice_fx_preset = "custom"
+        c_idx = self.voice_fx_preset_combo.findData("custom")
+        if c_idx >= 0 and self.voice_fx_preset_combo.currentIndex() != c_idx:
+            self.voice_fx_preset_combo.blockSignals(True)
+            self.voice_fx_preset_combo.setCurrentIndex(c_idx)
+            self.voice_fx_preset_combo.blockSignals(False)
+        if not self.voice_fx_check.isChecked() and (
+            self.cfg.discord_voice_fx_pitch != 0
+            or self.cfg.discord_voice_fx_tone != 0
+            or self.cfg.discord_voice_fx_robot != 0
+            or self.cfg.discord_voice_fx_echo != 0
+        ):
+            self.voice_fx_check.blockSignals(True)
+            self.voice_fx_check.setChecked(True)
+            self.voice_fx_check.blockSignals(False)
+            self.cfg.discord_voice_fx_enabled = True
+        self._sync_voice_fx_to_worker()
+
+    def _on_voice_fx_reset(self) -> None:
+        n_idx = self.voice_fx_preset_combo.findData("normal")
+        if n_idx >= 0:
+            self.voice_fx_preset_combo.blockSignals(True)
+            self.voice_fx_preset_combo.setCurrentIndex(n_idx)
+            self.voice_fx_preset_combo.blockSignals(False)
+        for sl in (
+            self.voice_fx_pitch_slider,
+            self.voice_fx_tone_slider,
+            self.voice_fx_robot_slider,
+            self.voice_fx_echo_slider,
+        ):
+            sl.blockSignals(True)
+            sl.setValue(0)
+            sl.blockSignals(False)
+        self.voice_fx_check.blockSignals(True)
+        self.voice_fx_check.setChecked(False)
+        self.voice_fx_check.blockSignals(False)
+        self.cfg.discord_voice_fx_enabled = False
+        self.cfg.discord_voice_fx_preset = "normal"
+        self.cfg.discord_voice_fx_pitch = 0
+        self.cfg.discord_voice_fx_tone = 0
+        self.cfg.discord_voice_fx_robot = 0
+        self.cfg.discord_voice_fx_echo = 0
+        self._update_voice_fx_labels()
+        self._sync_voice_fx_to_worker()
 
     def _on_user_vol_value_changed(self, uid: str, value: int) -> None:
         self._user_volumes[uid] = value
@@ -6614,6 +6893,7 @@ class DiscordVoicePanel(QWidget):
                 self.sound_event_requested.emit("stream_start")
             self.screen_share_active_changed.emit(True)
             self._render_participants()
+            self._render_channels()
             if self.svc.is_connected and data.get("watch_url"):
                 self.svc.set_screen_share_presence(
                     {
@@ -6675,7 +6955,7 @@ class DiscordVoicePanel(QWidget):
                         f"Vista previa · {data.get('title') or 'Tu pantalla'}"
                     )
                     self._screen_player.play_stream(local_url, is_live=True, low_latency=True)
-                    QTimer.singleShot(80, self.screen_video_surface.force_native_redraw)
+                    self.schedule_screen_viewer_refresh(80)
 
             self.toast_requested.emit(
                 "Transmisión actualizada en vivo."
@@ -6706,6 +6986,7 @@ class DiscordVoicePanel(QWidget):
             self.sound_event_requested.emit("stream_stop")
         self.screen_share_active_changed.emit(False)
         self._render_participants()
+        self._render_channels()
         self.screen_share_ram_updated.emit(0.0, 0.0)
 
     def _on_screen_share_announced(
@@ -6923,12 +7204,24 @@ class DiscordVoicePanel(QWidget):
         if url:
             QDesktopServices.openUrl(QUrl(url))
 
+    def schedule_screen_viewer_refresh(self, delay_ms: int = 55) -> None:
+        if self._screen_viewer_active:
+            self._screen_refresh_timer.start(max(10, int(delay_ms)))
+
+    def _refresh_screen_viewer_output(self) -> None:
+        if not self._screen_viewer_active or self._screen_player is None:
+            return
+        self.screen_video_surface.force_native_redraw()
+        if self._screen_player.refresh_video_output():
+            self._screen_post_reinit_timer.start(150)
+
+    def _post_reinit_screen_redraw(self) -> None:
+        if self._screen_viewer_active:
+            self.screen_video_surface.force_native_redraw()
+
     def _on_screen_player_vo_error(self, _detail: str) -> None:
         if self._screen_viewer_active and self._screen_player is not None:
-            if self._screen_player.refresh_video_output():
-                QTimer.singleShot(120, self.screen_video_surface.force_native_redraw)
-            else:
-                self.screen_video_surface.force_native_redraw()
+            self.schedule_screen_viewer_refresh(30)
 
     def _ensure_screen_player(self) -> MediaPlayer:
         if self._screen_player is None:
@@ -7023,7 +7316,7 @@ class DiscordVoicePanel(QWidget):
             self.screen_viewer_theater_btn.style().polish(self.screen_viewer_theater_btn)
         self._sync_screen_share_icons()
         if self._screen_viewer_active:
-            QTimer.singleShot(45, self.screen_video_surface.force_native_redraw)
+            self.schedule_screen_viewer_refresh(45)
 
     def _open_screen_share_viewer(self, payload: dict[str, Any]) -> None:
         if not isinstance(payload, dict):
@@ -7065,9 +7358,11 @@ class DiscordVoicePanel(QWidget):
         player.play_stream(stream_url, is_live=True, low_latency=True)
         self._sync_screen_share_icons()
         self._emit_screen_viewer_state()
-        QTimer.singleShot(45, self.screen_video_surface.force_native_redraw)
+        self.schedule_screen_viewer_refresh(45)
 
     def _close_screen_share_viewer(self) -> None:
+        self._screen_refresh_timer.stop()
+        self._screen_post_reinit_timer.stop()
         was_fs = self._screen_viewer_fullscreen
         self._screen_viewer_active = False
         self._screen_viewer_is_local_preview = False
@@ -7213,6 +7508,8 @@ class DiscordVoicePanel(QWidget):
                 pass
 
     def shutdown_screen_share(self) -> None:
+        self._screen_refresh_timer.stop()
+        self._screen_post_reinit_timer.stop()
         self.stop_screen_share_session()
         if self._screen_player is not None:
             try:

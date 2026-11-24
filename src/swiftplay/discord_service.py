@@ -351,6 +351,13 @@ class DiscordService(QObject):
             "mic_agc": bool(cfg.discord_mic_agc),
             "noise_suppression": str(cfg.discord_noise_suppression),
             "vad_threshold": int(cfg.discord_vad_threshold),
+            "voice_fx": {
+                "enabled": bool(cfg.discord_voice_fx_enabled),
+                "pitch": int(cfg.discord_voice_fx_pitch),
+                "tone": int(cfg.discord_voice_fx_tone),
+                "robot": int(cfg.discord_voice_fx_robot),
+                "echo": int(cfg.discord_voice_fx_echo),
+            },
         }
         if muted is not None:
             payload["muted"] = bool(muted)
@@ -410,6 +417,27 @@ class DiscordService(QObject):
 
     def set_vad_threshold(self, threshold: int) -> None:
         self._send_command("set_vad_threshold", {"threshold": int(threshold)}, spawn=False)
+
+    def set_voice_fx(
+        self,
+        *,
+        enabled: bool,
+        pitch: int,
+        tone: int,
+        robot: int,
+        echo: int,
+    ) -> None:
+        self._send_command(
+            "set_voice_fx",
+            {
+                "enabled": bool(enabled),
+                "pitch": int(pitch),
+                "tone": int(tone),
+                "robot": int(robot),
+                "echo": int(echo),
+            },
+            spawn=False,
+        )
 
     def set_user_volume(self, user_id: int | str, volume: int) -> None:
         self._send_command(

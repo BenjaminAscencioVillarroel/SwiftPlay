@@ -20,6 +20,17 @@ VALID_THEMES: tuple[str, ...] = tuple(THEMES.keys())
 VALID_DISCORD_NS: tuple[str, ...] = ("off", "webrtc", "ai", "ai_max")
 VALID_DISCORD_OVERLAY_MODES: tuple[str, ...] = ("off", "status", "full")
 VALID_DISCORD_SOUND_PACKS: tuple[str, ...] = VALID_SOUND_PACKS
+VOICE_FX_PRESETS: dict[str, tuple[str, int, int, int, int]] = {
+    "normal": ("Normal", 0, 0, 0, 0),
+    "deep": ("Voz grave", -5, -40, 0, 0),
+    "giant": ("Gigante / Demonio", -8, -65, 15, 30),
+    "high": ("Voz aguda", 5, 35, 0, 0),
+    "chipmunk": ("Ardilla", 9, 55, 0, 0),
+    "robot": ("Robot", -1, 25, 85, 15),
+    "radio": ("Radio / Walkie", 0, 80, 25, 10),
+    "cave": ("Caverna / Eco", -2, -20, 0, 65),
+    "custom": ("Personalizado", 0, 0, 0, 0),
+}
 VALID_NOTIFY_COLORS: tuple[str, ...] = (
     "purple",
     "indigo",
@@ -89,6 +100,12 @@ class AppConfig:
     discord_vad_threshold: int = 18
     discord_mic_agc: bool = True
     discord_noise_suppression: str = "ai"
+    discord_voice_fx_enabled: bool = False
+    discord_voice_fx_preset: str = "normal"
+    discord_voice_fx_pitch: int = 0
+    discord_voice_fx_tone: int = 0
+    discord_voice_fx_robot: int = 0
+    discord_voice_fx_echo: int = 0
     discord_hotkey_mute: str = "Ctrl+Shift+M"
     discord_hotkey_deafen: str = "Ctrl+Shift+D"
     discord_hotkey_hangup: str = "Ctrl+Shift+H"
@@ -238,6 +255,25 @@ class AppConfig:
                 if key_s and val_s and key_s in seen_auto_targets:
                     clean_auto_names[key_s] = val_s
         self.discord_share_auto_target_names = clean_auto_names
+        self.discord_voice_fx_enabled = bool(self.discord_voice_fx_enabled)
+        fx_p = str(self.discord_voice_fx_preset or "normal").strip().lower()
+        self.discord_voice_fx_preset = fx_p if fx_p in VOICE_FX_PRESETS else "normal"
+        try:
+            self.discord_voice_fx_pitch = max(-12, min(12, int(self.discord_voice_fx_pitch)))
+        except (TypeError, ValueError):
+            self.discord_voice_fx_pitch = 0
+        try:
+            self.discord_voice_fx_tone = max(-100, min(100, int(self.discord_voice_fx_tone)))
+        except (TypeError, ValueError):
+            self.discord_voice_fx_tone = 0
+        try:
+            self.discord_voice_fx_robot = max(0, min(100, int(self.discord_voice_fx_robot)))
+        except (TypeError, ValueError):
+            self.discord_voice_fx_robot = 0
+        try:
+            self.discord_voice_fx_echo = max(0, min(100, int(self.discord_voice_fx_echo)))
+        except (TypeError, ValueError):
+            self.discord_voice_fx_echo = 0
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:

@@ -200,6 +200,8 @@ class MediaPlayer(QObject):
                 kwargs["swapchain_depth"] = 2
                 kwargs["gpu_shader_cache"] = "no"
                 kwargs["icc_cache"] = "no"
+                kwargs["background"] = "color"
+                kwargs["background_color"] = "#FF000000"
                 kwargs["demuxer_max_bytes"] = "3MiB"
                 kwargs["demuxer_max_back_bytes"] = "512KiB"
                 kwargs["cursor_autohide"] = "no"
@@ -217,6 +219,8 @@ class MediaPlayer(QObject):
                 if self._wid is not None:
                     fallback_kwargs = dict(kwargs)
                     fallback_kwargs.pop("gpu_api", None)
+                    fallback_kwargs.pop("background", None)
+                    fallback_kwargs.pop("background_color", None)
                     fallback_kwargs["d3d11_flip"] = "no"
                     fallback_kwargs["hwdec"] = "auto-safe"
                     self._mpv = mpv_mod.MPV(**fallback_kwargs)
@@ -399,6 +403,7 @@ class MediaPlayer(QObject):
                 player.vid = "auto" if video_enabled else "no"
 
             if low_latency:
+                player["hwdec"] = "no"
                 player["cache"] = "no"
                 player["cache-secs"] = 0.4
                 player["demuxer-lavf-probesize"] = 32768
@@ -409,6 +414,8 @@ class MediaPlayer(QObject):
                 player.start = "none"
                 player.speed = 1.0
             elif live_flag and not live_seekable:
+                if not self._is_audio_only_instance:
+                    player["hwdec"] = "d3d11va-copy"
                 player["cache"] = "yes"
                 player["cache-secs"] = 2
                 player["demuxer-lavf-probesize"] = 1048576
@@ -419,6 +426,8 @@ class MediaPlayer(QObject):
                 player.start = "none"
                 player.speed = 1.0
             elif live_flag and live_seekable:
+                if not self._is_audio_only_instance:
+                    player["hwdec"] = "d3d11va-copy"
                 player["cache"] = "yes"
                 player["cache-secs"] = 3
                 player["demuxer-lavf-probesize"] = 1048576
@@ -429,6 +438,8 @@ class MediaPlayer(QObject):
                 player.start = "none"
                 player.speed = self._speed
             else:
+                if not self._is_audio_only_instance:
+                    player["hwdec"] = "d3d11va-copy"
                 player["cache"] = "yes"
                 player["cache-secs"] = 3
                 player["demuxer-lavf-probesize"] = 1048576
