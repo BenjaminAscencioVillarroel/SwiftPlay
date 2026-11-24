@@ -37,7 +37,7 @@ function sanitizeDeckState(raw, deck) {
   const durNum = Number(raw.duration_sec ?? 0);
   const speedNum = Number(raw.speed ?? 1.0);
   const tsNum = Number(raw.updated_at ?? Date.now() / 1000);
-  return {
+  const out = {
     video_id: videoId,
     title,
     author: String(raw.author || "").trim().slice(0, 120),
@@ -53,6 +53,30 @@ function sanitizeDeckState(raw, deck) {
     viewer_count: Math.max(0, Math.round(Number(raw.viewer_count || 0) || 0)),
     duration: String(raw.duration || "").trim().slice(0, 24),
   };
+  if (deck === "music" && Array.isArray(raw.queue)) {
+    const cleanQueue = [];
+    for (const qItem of raw.queue.slice(0, 25)) {
+      if (!qItem || typeof qItem !== "object") continue;
+      const qId = String(qItem.video_id || qItem.id || "").trim().slice(0, 128);
+      const qTitle = String(qItem.title || "").trim().slice(0, 180);
+      if (!qId && !qTitle) continue;
+      const qDur = Number(qItem.duration_sec ?? 0);
+      cleanQueue.push({
+        video_id: qId,
+        title: qTitle,
+        author: String(qItem.author || "").trim().slice(0, 120),
+        duration: String(qItem.duration || "").trim().slice(0, 24),
+        duration_sec: Number.isFinite(qDur) && qDur >= 0 ? Math.round(qDur) : 0,
+        thumb_url: String(qItem.thumb_url || "").trim().slice(0, 512),
+      });
+    }
+    out.queue = cleanQueue;
+    const rawIdx = Number(raw.queue_index ?? 0);
+    out.queue_index = Number.isFinite(rawIdx)
+      ? Math.max(-1, Math.min(cleanQueue.length - 1, Math.trunc(rawIdx)))
+      : 0;
+  }
+  return out;
 }
 
 export class WatchPartyHub {

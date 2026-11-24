@@ -4549,8 +4549,25 @@ class MainWindow(QMainWindow):
     # Reproductor Dual Independiente (Video + Música)
     # ------------------------------------------------------------------
 
+    def _is_in_any_watchparty(self) -> bool:
+        if not hasattr(self, "watchparty_svc"):
+            return False
+        for dk in ("video", "music"):
+            ap = self.watchparty_svc.active_party_for(dk)
+            if not ap:
+                continue
+            hc = str(ap.get("host_code") or "").upper()
+            members = ap.get("members") or []
+            if (hc and hc != self.cfg.watchparty_code) or len(members) > 1:
+                return True
+        return False
+
     def _pause_other_if_auto(self, starting_deck: Literal["video", "music"]) -> None:
-        if self._wp_suppress_auto_pause or not self.cfg.auto_pause_other_player:
+        if (
+            self._wp_suppress_auto_pause
+            or self._is_in_any_watchparty()
+            or not self.cfg.auto_pause_other_player
+        ):
             return
         if starting_deck == "video" and self._music_item is not None and not self._music_paused:
             self.music_player.set_pause(True)
@@ -4945,6 +4962,14 @@ class MainWindow(QMainWindow):
     def _maybe_extend_radio(self, force: bool = False) -> None:
         if not self.cfg.autoplay_music or not self._music_queue:
             return
+        if hasattr(self, "watchparty_svc"):
+            ap_mus = self.watchparty_svc.active_party_for("music")
+            if (
+                ap_mus
+                and ap_mus.get("host_code")
+                and str(ap_mus["host_code"]).upper() != self.cfg.watchparty_code
+            ):
+                return
         if self._radio_fetching:
             return
         idx = max(0, self._queue_index)
@@ -5008,6 +5033,8 @@ class MainWindow(QMainWindow):
         self._refresh_badges()
         if self.stack.currentIndex() == self.PAGE_MUSIC_PLAYER or added > 0:
             self._render_queue()
+        if added > 0:
+            self._notify_wp_local_event("music", "queue_update")
 
         if self._pending_advance_after_radio:
             self._pending_advance_after_radio = False
@@ -5074,6 +5101,7 @@ class MainWindow(QMainWindow):
         self.show_toast(f"Agregado a la cola: {item.title}")
         if self.stack.currentIndex() == self.PAGE_MUSIC_PLAYER:
             self._render_queue()
+        self._notify_wp_local_event("music", "queue_update")
 
     def _remove_from_queue(self, item: MediaItem) -> None:
         for i, q_it in enumerate(self._music_queue):
@@ -5087,6 +5115,7 @@ class MainWindow(QMainWindow):
         self._refresh_badges()
         self.persist_session_state(force=True)
         self._render_queue()
+        self._notify_wp_local_event("music", "queue_update")
 
     def _clear_queue(self) -> None:
         self._music_queue.clear()
@@ -5095,6 +5124,7 @@ class MainWindow(QMainWindow):
         self._refresh_badges()
         self.persist_session_state(force=True)
         self._render_queue()
+        self._notify_wp_local_event("music", "queue_update")
 
     def _toggle_autoplay(self) -> None:
         self.cfg.autoplay_music = not self.cfg.autoplay_music
@@ -5604,6 +5634,86 @@ class MainWindow(QMainWindow):
                 bool(parts) and not self._is_fullscreen and not self._is_discord_screen_fs
             )
 
+    def _serialize_wp_music_queue(
+        self, current_item: MediaItem
+    ) -> tuple[list[dict[str, Any]], int]:
+        pool = list(self._music_queue)
+        if not pool:
+            pool = [current_item]
+            cur_idx = 0
+        else:
+            cur_idx = self._queue_index
+            if not (0 <= cur_idx < len(pool) and pool[cur_idx].video_id == current_item.video_id):
+                matched = next(
+                    (i for i, it in enumerate(pool) if it.video_id == current_item.video_id),
+                    -1,
+                )
+                cur_idx = matched if matched >= 0 else 0
+        start = max(0, cur_idx - 3)
+        end = start + 25
+        sliced = pool[start:end]
+        rel_idx = cur_idx - start if 0 <= cur_idx - start < len(sliced) else 0
+        out: list[dict[str, Any]] = []
+        for q_it in sliced:
+            out.append(
+                {
+                    "video_id": q_it.video_id,
+                    "title": q_it.title,
+                    "author": q_it.author,
+                    "duration": q_it.duration,
+                    "duration_sec": int(q_it.duration_sec or 0),
+                    "thumb_url": q_it.normalized_thumb(),
+                }
+            )
+        return out, rel_idx
+
+    def _apply_wp_music_queue(
+        self, state: dict[str, Any], fallback_item: MediaItem | None
+    ) -> None:
+        raw_q = state.get("queue")
+        new_queue: list[MediaItem] = []
+        if isinstance(raw_q, list):
+            for entry in raw_q[:25]:
+                if not isinstance(entry, dict):
+                    continue
+                qid = str(entry.get("video_id") or "").strip()
+                qtitle = str(entry.get("title") or "").strip()
+                if not qid and not qtitle:
+                    continue
+                new_queue.append(
+                    MediaItem(
+                        video_id=qid,
+                        title=qtitle or qid,
+                        author=str(entry.get("author") or ""),
+                        duration=str(entry.get("duration") or ""),
+                        duration_sec=int(entry.get("duration_sec") or 0),
+                        thumb_url=str(entry.get("thumb_url") or ""),
+                        kind="music",
+                    )
+                )
+        if not new_queue and fallback_item is not None:
+            new_queue = [fallback_item]
+
+        if new_queue:
+            try:
+                q_idx = int(state.get("queue_index", 0))
+            except (TypeError, ValueError):
+                q_idx = 0
+            if not (0 <= q_idx < len(new_queue)) and fallback_item is not None:
+                q_idx = next(
+                    (i for i, it in enumerate(new_queue) if it.video_id == fallback_item.video_id),
+                    0,
+                )
+            self._music_queue = new_queue
+            self._queue_index = max(0, min(len(new_queue) - 1, q_idx))
+        else:
+            self._music_queue = []
+            self._queue_index = -1
+
+        self._reset_radio_session()
+        self._refresh_badges()
+        self._render_queue()
+
     def _build_wp_deck_state(
         self,
         deck: Literal["video", "music"],
@@ -5629,7 +5739,7 @@ class MainWindow(QMainWindow):
             dur = float(item.duration_sec)
         kind = "music" if deck == "music" else ("twitch" if item.kind == "twitch" else "video")
         speed = 1.0 if (deck == "music" or kind == "twitch") else float(self.cfg.video_speed or 1.0)
-        return {
+        payload: dict[str, Any] = {
             "video_id": item.video_id,
             "title": item.title,
             "author": item.author,
@@ -5645,6 +5755,11 @@ class MainWindow(QMainWindow):
             "viewer_count": int(item.viewer_count or 0),
             "duration": item.duration,
         }
+        if deck == "music":
+            q_items, q_idx = self._serialize_wp_music_queue(item)
+            payload["queue"] = q_items
+            payload["queue_index"] = q_idx
+        return payload
 
     def _notify_wp_local_event(
         self,
@@ -5802,21 +5917,26 @@ class MainWindow(QMainWindow):
             and cur_item.video_id == vid_id
             and cur_item.kind == item_kind
         )
+        new_item = MediaItem(
+            video_id=vid_id,
+            title=str(state.get("title") or vid_id),
+            author=str(state.get("author") or ""),
+            duration=str(state.get("duration") or ""),
+            duration_sec=int(state.get("duration_sec") or 0),
+            thumb_url=str(state.get("thumb_url") or ""),
+            kind=item_kind,
+            is_live=bool(state.get("is_live") or item_kind == "twitch"),
+            game_name=str(state.get("game_name") or ""),
+            viewer_count=int(state.get("viewer_count") or 0),
+        )
+        if deck == "music":
+            self._apply_wp_music_queue(state, new_item)
+            if action == "queue_update" and same_item:
+                return
+
         player = self.video_player if deck == "video" else self.music_player
 
         if not same_item or not player.has_active_stream:
-            new_item = MediaItem(
-                video_id=vid_id,
-                title=str(state.get("title") or vid_id),
-                author=str(state.get("author") or ""),
-                duration=str(state.get("duration") or ""),
-                duration_sec=int(state.get("duration_sec") or 0),
-                thumb_url=str(state.get("thumb_url") or ""),
-                kind=item_kind,
-                is_live=bool(state.get("is_live") or item_kind == "twitch"),
-                game_name=str(state.get("game_name") or ""),
-                viewer_count=int(state.get("viewer_count") or 0),
-            )
             self._wp_suppress_auto_pause = True
             try:
                 if deck == "video":

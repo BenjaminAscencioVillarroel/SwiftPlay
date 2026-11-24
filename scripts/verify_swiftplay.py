@@ -1952,6 +1952,126 @@ def test_gui_and_libmpv_smoke(
             finally:
                 win.cfg.watchparty_relay_url = prev_wp_url
                 wp_pnl.set_connection_state("disconnected", "")
+
+            # Verificar desactivación automática de "Audio inteligente" dentro de WatchParty y sincronización de cola (A CONTINUACIÓN)
+            prev_auto_pause = win.cfg.auto_pause_other_player
+            prev_vid_wp = win._video_item
+            prev_mus_wp = win._music_item
+            prev_vid_paused = win._video_paused
+            prev_mus_paused = win._music_paused
+            prev_q = list(win._music_queue)
+            prev_qi = win._queue_index
+            prev_parties = dict(win.watchparty_svc._active_parties)
+            orig_play_music = win._play_music_item
+            try:
+                win.cfg.auto_pause_other_player = True
+                win._video_item = MediaItem(video_id="v_wp", title="Video WP", kind="video")
+                win._music_item = MediaItem(video_id="m_wp_1", title="Track 1", kind="music")
+                win._video_paused = False
+                win._music_paused = False
+
+                pause_calls: list[str] = []
+                orig_v_pause = win.video_player.set_pause
+                orig_m_pause = win.music_player.set_pause
+                win.video_player.set_pause = lambda p: pause_calls.append(f"v:{p}")  # type: ignore[method-assign]
+                win.music_player.set_pause = lambda p: pause_calls.append(f"m:{p}")  # type: ignore[method-assign]
+                try:
+                    win.watchparty_svc._active_parties["video"] = {"host_code": "FINZ-1111", "members": [{"code": "FINZ-1111"}, {"code": win.cfg.watchparty_code}]}
+                    assert win._is_in_any_watchparty() is True
+                    win._pause_other_if_auto("video")
+                    win._pause_other_if_auto("music")
+                    assert not pause_calls, f"Audio inteligente debe omitirse en WatchParty: {pause_calls}"
+
+                    win.watchparty_svc._active_parties.clear()
+                    assert win._is_in_any_watchparty() is False
+                    win._pause_other_if_auto("video")
+                    assert pause_calls == ["m:True"], f"Fuera de WatchParty sí debe pausar el otro deck: {pause_calls}"
+                finally:
+                    win.video_player.set_pause = orig_v_pause  # type: ignore[method-assign]
+                    win.music_player.set_pause = orig_m_pause  # type: ignore[method-assign]
+
+                # Sincronizar cola completa ("A continuación") vía party_state / queue_update sin cortar reproducción
+                started_mus: list[str] = []
+                win._play_music_item = lambda it, start_pos=0.0: started_mus.append(it.video_id)  # type: ignore[method-assign]
+                win._music_paused = False
+                win._on_watchparty_state_received(
+                    {
+                        "host_code": "FINZ-1111",
+                        "host_name": "Finz",
+                        "deck": "music",
+                        "reason": "join",
+                        "action": "join",
+                        "updated_by": "FINZ-1111",
+                        "updated_by_name": "Finz",
+                        "state": {
+                            "video_id": "m_wp_1",
+                            "title": "Track 1",
+                            "author": "Artista",
+                            "kind": "music",
+                            "paused": False,
+                            "pos": 12.0,
+                            "duration_sec": 180,
+                            "queue": [
+                                {"video_id": "m_wp_1", "title": "Track 1", "author": "Artista", "duration": "3:00", "duration_sec": 180},
+                                {"video_id": "m_wp_2", "title": "Track 2", "author": "Artista", "duration": "3:20", "duration_sec": 200},
+                                {"video_id": "m_wp_3", "title": "Track 3", "author": "Artista", "duration": "2:50", "duration_sec": 170},
+                            ],
+                            "queue_index": 0,
+                        },
+                    }
+                )
+                assert [it.video_id for it in win._music_queue] == ["m_wp_1", "m_wp_2", "m_wp_3"]
+                assert win._queue_index == 0
+                assert "3 canciones" in win.music_panel.queue_info_lbl.text(), (
+                    f"La lista A continuación debe mostrar las 3 canciones del otro usuario: {win.music_panel.queue_info_lbl.text()}"
+                )
+
+                started_mus.clear()
+                orig_has_stream = win.music_player.__class__.has_active_stream
+                win.music_player.__class__.has_active_stream = property(lambda _s: True)  # type: ignore[assignment]
+                try:
+                    win._on_watchparty_state_received(
+                        {
+                            "host_code": "FINZ-1111",
+                            "host_name": "Finz",
+                            "deck": "music",
+                            "reason": "sync",
+                            "action": "queue_update",
+                            "updated_by": "FINZ-1111",
+                            "updated_by_name": "Finz",
+                            "state": {
+                                "video_id": "m_wp_1",
+                                "title": "Track 1",
+                                "author": "Artista",
+                                "kind": "music",
+                                "paused": False,
+                                "pos": 20.0,
+                                "queue": [
+                                    {"video_id": "m_wp_1", "title": "Track 1", "author": "Artista", "duration_sec": 180},
+                                    {"video_id": "m_wp_4", "title": "Track 4", "author": "Artista", "duration_sec": 190},
+                                ],
+                                "queue_index": 0,
+                            },
+                        }
+                    )
+                finally:
+                    win.music_player.__class__.has_active_stream = orig_has_stream  # type: ignore[assignment]
+                assert [it.video_id for it in win._music_queue] == ["m_wp_1", "m_wp_4"]
+                assert not started_mus, "queue_update sobre la misma canción no debe reiniciar ni cortar el stream actual"
+            finally:
+                win._play_music_item = orig_play_music  # type: ignore[method-assign]
+                win.cfg.auto_pause_other_player = prev_auto_pause
+                win._video_item = prev_vid_wp
+                win._music_item = prev_mus_wp
+                win._video_paused = prev_vid_paused
+                win._music_paused = prev_mus_paused
+                win._music_queue = prev_q
+                win._queue_index = prev_qi
+                win.watchparty_svc._active_parties = prev_parties
+                win._refresh_badges()
+                win._render_queue()
+                win._sync_watchparty_bar()
+
             wp_pnl.set_friends_data([])
             win._switch_page(win.PAGE_DISCORD)
 
@@ -4459,7 +4579,18 @@ print("SCREEN_SHARE_RELAY_OK")
             share_enabled=True,
             allow_guest_control=True,
             video_state={"video_id": "yt_1", "title": "Video 1", "kind": "video", "paused": False, "pos": 15.0},
-            music_state={"video_id": "mus_1", "title": "Song 1", "kind": "music", "paused": False, "pos": 10.0},
+            music_state={
+                "video_id": "mus_1",
+                "title": "Song 1",
+                "kind": "music",
+                "paused": False,
+                "pos": 10.0,
+                "queue": [
+                    {"video_id": "mus_1", "title": "Song 1", "author": "Art"},
+                    {"video_id": "mus_2", "title": "Song 2", "author": "Art"},
+                ],
+                "queue_index": 0,
+            },
             force=True,
         )
         _wp_time.sleep(0.15)
@@ -4472,6 +4603,8 @@ print("SCREEN_SHARE_RELAY_OK")
             _wp_time.sleep(0.05)
         assert len(b_events) >= 2
         assert {ev["deck"] for ev in b_events} == {"video", "music"}
+        mus_ev = next(ev for ev in b_events if ev["deck"] == "music")
+        assert len(mus_ev["state"].get("queue") or []) == 2 and mus_ev["state"].get("queue_index") == 0
 
         # Invitado cambia de YT -> Twitch en video mientras Music sigue intacto (control cruzado)
         wp_b.send_party_sync(
