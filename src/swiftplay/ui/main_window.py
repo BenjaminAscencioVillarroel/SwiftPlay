@@ -61,11 +61,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from swiftplay.config import AppConfig, load_config, save_config, validate_theme
+from swiftplay.config import AppConfig, clamp_speed, load_config, save_config, validate_theme
 from swiftplay.discord_service import DiscordService
 from swiftplay.media_keys import GlobalMediaKeyFilter
 from swiftplay.models import ChannelInfo, FeedSection, MediaItem, ResolvedStream, format_duration
-from swiftplay.paths import APP_NAME, ICON_ICO_PATH, ICON_PNG_PATH, RAM_LOG_PATH, SESSION_STATE_PATH
+from swiftplay.paths import (
+    APP_NAME,
+    ICON_ICO_PATH,
+    ICON_PNG_PATH,
+    IS_ISOLATED_PROFILE,
+    PROFILE_NAME,
+    RAM_LOG_PATH,
+    SESSION_STATE_PATH,
+)
 from swiftplay.player import MediaPlayer
 from swiftplay.ram_logger import RamLogger
 from swiftplay.security import has_discord_token, has_saved_session, load_account_profile
@@ -244,8 +252,10 @@ class MainWindow(QMainWindow):
         self,
         session_state_path: Path | None = None,
         ram_log_path: Path | None = None,
+        initial_page: int | None = None,
     ) -> None:
         super().__init__()
+        self._initial_page = initial_page
         self._session_state_path: Path = (
             Path(session_state_path) if session_state_path is not None else SESSION_STATE_PATH
         )
@@ -274,6 +284,14 @@ class MainWindow(QMainWindow):
         self._wp_pending_video_pause: bool | None = None
         self._wp_pending_music_pause: bool | None = None
         self._wp_presence_status: str = "idle"
+        self._wp_overlay_spectators: list[dict[str, Any]] = []
+        self._wp_personal_snapshots: dict[str, dict[str, Any] | None] = {
+            "video": None,
+            "music": None,
+        }
+        self._wp_guest_decks: set[str] = set()
+        self._wp_restore_pending: dict[str, dict[str, Any]] = {}
+        self._wp_restore_active_deck: Literal["video", "music"] | None = None
         self._last_discord_speak_ts: float = 0.0
         QPixmapCache.setCacheLimit(1024)
         self.thumb_cache = ThumbnailCache(max_items=24, parent=self)
@@ -413,7 +431,9 @@ class MainWindow(QMainWindow):
         self._twitch_feed_cache: dict[str, tuple[float, list[MediaItem]]] = {}
         self._last_completer_mode: str = ""
 
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(
+            f"{APP_NAME} — Prueba ({PROFILE_NAME})" if IS_ISOLATED_PROFILE else APP_NAME
+        )
         self.resize(1160, 750)
         self.setMinimumSize(860, 560)
         if ICON_ICO_PATH.exists():
@@ -523,7 +543,12 @@ class MainWindow(QMainWindow):
         apply_window_taskbar_properties(int(self.winId()))
         self._refresh_badges()
         self._restore_last_session()
-        self._switch_page(self.PAGE_VIDEO_SEARCH)
+        start_page = (
+            self._initial_page
+            if isinstance(self._initial_page, int) and 0 <= self._initial_page < self.stack.count()
+            else self.PAGE_VIDEO_SEARCH
+        )
+        self._switch_page(start_page)
 
         self._ram_log_timer = QTimer(self)
         self._ram_log_timer.setInterval(60_000)
@@ -601,6 +626,11 @@ class MainWindow(QMainWindow):
         brand_lbl = QLabel("SwiftPlay")
         brand_lbl.setObjectName("BrandTitle")
         brand_row.addWidget(brand_lbl)
+        if IS_ISOLATED_PROFILE:
+            profile_tag = QLabel(PROFILE_NAME.upper())
+            profile_tag.setObjectName("DeckTag")
+            profile_tag.setToolTip(f"Perfil aislado: {PROFILE_NAME}")
+            brand_row.addWidget(profile_tag)
         brand_row.addStretch()
         sb_lay.addLayout(brand_row)
 
@@ -692,6 +722,34 @@ class MainWindow(QMainWindow):
             lambda: self._switch_page(self.PAGE_WATCHPARTY),
             tooltip="WatchParty de SwiftPlay (YouTube, Twitch y Música con amigos)",
         )
+        wp_nav_lay = QHBoxLayout(self.nav_watchparty)
+        wp_nav_lay.setContentsMargins(0, 0, 8, 0)
+        wp_nav_lay.setSpacing(0)
+        wp_nav_lay.addStretch(1)
+
+        self.wp_nav_eye_badge = QFrame(self.nav_watchparty)
+        self.wp_nav_eye_badge.setObjectName("WatchPartyEyeBadge")
+        self.wp_nav_eye_badge.setFixedHeight(22)
+        self.wp_nav_eye_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.wp_nav_eye_badge.setVisible(False)
+        wp_badge_lay = QHBoxLayout(self.wp_nav_eye_badge)
+        wp_badge_lay.setContentsMargins(7, 0, 7, 0)
+        wp_badge_lay.setSpacing(4)
+        self.wp_nav_eye_ico = QLabel()
+        self.wp_nav_eye_ico.setFixedSize(14, 14)
+        self.wp_nav_eye_ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.wp_nav_eye_ico.setStyleSheet("background: transparent;")
+        self.wp_nav_eye_ico.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        wp_badge_lay.addWidget(self.wp_nav_eye_ico, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.wp_nav_eye_cnt = QLabel("0")
+        self.wp_nav_eye_cnt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.wp_nav_eye_cnt.setStyleSheet(
+            "font-size: 11px; font-weight: 700; padding-bottom: 1px; background: transparent;"
+        )
+        self.wp_nav_eye_cnt.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        wp_badge_lay.addWidget(self.wp_nav_eye_cnt, 0, Qt.AlignmentFlag.AlignVCenter)
+        wp_nav_lay.addWidget(self.wp_nav_eye_badge)
+
         nav_lay.addWidget(self.nav_watchparty)
 
         nav_lay.addStretch(1)
@@ -726,6 +784,40 @@ class MainWindow(QMainWindow):
         self._sidebar_ind_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._active_nav_btn: QPushButton | None = None
         sb_lay.addWidget(self.sidebar_scroll, 1)
+
+        self.wp_mini_card = QFrame()
+        self.wp_mini_card.setObjectName("WatchPartySidebarMiniCard")
+        self.wp_mini_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.wp_mini_card.setVisible(False)
+        wp_mc_lay = QVBoxLayout(self.wp_mini_card)
+        wp_mc_lay.setContentsMargins(9, 7, 9, 7)
+        wp_mc_lay.setSpacing(3)
+
+        wp_mc_top = QHBoxLayout()
+        wp_mc_top.setContentsMargins(0, 0, 0, 0)
+        wp_mc_top.setSpacing(5)
+        self.wp_mini_eye_ico = QLabel()
+        self.wp_mini_eye_ico.setFixedSize(14, 14)
+        self.wp_mini_eye_ico.setStyleSheet("background: transparent;")
+        wp_mc_top.addWidget(self.wp_mini_eye_ico)
+
+        self.wp_mini_title = ElidedLabel("WatchParty", max_lines=1)
+        self.wp_mini_title.setStyleSheet("font-size: 11px; font-weight: 700; background: transparent;")
+        wp_mc_top.addWidget(self.wp_mini_title, 1)
+
+        self.wp_mini_open_btn = QPushButton("Ver")
+        self.wp_mini_open_btn.setObjectName("PillBtn")
+        self.wp_mini_open_btn.setStyleSheet("padding: 2px 7px; font-size: 10px;")
+        self.wp_mini_open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.wp_mini_open_btn.clicked.connect(lambda: self._switch_page(self.PAGE_WATCHPARTY))
+        wp_mc_top.addWidget(self.wp_mini_open_btn)
+        wp_mc_lay.addLayout(wp_mc_top)
+
+        self.wp_mini_sub = ElidedLabel("", max_lines=1)
+        self.wp_mini_sub.setObjectName("MutedLabel")
+        self.wp_mini_sub.setStyleSheet("font-size: 10px; background: transparent;")
+        wp_mc_lay.addWidget(self.wp_mini_sub)
+        sb_lay.addWidget(self.wp_mini_card)
 
         self.resource_card = QFrame()
         self.resource_card.setObjectName("ResourceMonitorCard")
@@ -934,6 +1026,15 @@ class MainWindow(QMainWindow):
         wp_bar_lay = QHBoxLayout(self.wp_active_bar)
         wp_bar_lay.setContentsMargins(12, 6, 12, 6)
         wp_bar_lay.setSpacing(8)
+        self.wp_bar_eye_ico = QLabel()
+        self.wp_bar_eye_ico.setFixedSize(15, 15)
+        self.wp_bar_eye_ico.setStyleSheet("background: transparent;")
+        wp_bar_lay.addWidget(self.wp_bar_eye_ico)
+
+        self.wp_bar_eye_cnt = QLabel("")
+        self.wp_bar_eye_cnt.setObjectName("DeckTag")
+        wp_bar_lay.addWidget(self.wp_bar_eye_cnt)
+
         self.wp_bar_lbl = QLabel("")
         self.wp_bar_lbl.setStyleSheet("font-size: 12px; font-weight: 600; background: transparent;")
         wp_bar_lay.addWidget(self.wp_bar_lbl, 1)
@@ -958,6 +1059,38 @@ class MainWindow(QMainWindow):
         self.wp_open_page_btn.clicked.connect(lambda: self._switch_page(self.PAGE_WATCHPARTY))
         wp_bar_lay.addWidget(self.wp_open_page_btn)
         right_col.addWidget(self.wp_active_bar)
+
+        # Barra no intrusiva al salir de un WatchParty ajeno (volver a lo tuyo / seguir / cerrar)
+        self.wp_restore_bar = QFrame()
+        self.wp_restore_bar.setObjectName("WatchPartyActiveBar")
+        self.wp_restore_bar.setVisible(False)
+        wp_res_lay = QHBoxLayout(self.wp_restore_bar)
+        wp_res_lay.setContentsMargins(12, 6, 12, 6)
+        wp_res_lay.setSpacing(8)
+        self.wp_restore_lbl = QLabel("")
+        self.wp_restore_lbl.setStyleSheet("font-size: 12px; font-weight: 600; background: transparent;")
+        wp_res_lay.addWidget(self.wp_restore_lbl, 1)
+
+        self.wp_restore_primary_btn = QPushButton("Volver a lo mío")
+        self.wp_restore_primary_btn.setObjectName("AccentBtn")
+        self.wp_restore_primary_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.wp_restore_primary_btn.clicked.connect(self._on_wp_restore_primary_clicked)
+        wp_res_lay.addWidget(self.wp_restore_primary_btn)
+
+        self.wp_restore_secondary_btn = QPushButton("Seguir con esto")
+        self.wp_restore_secondary_btn.setObjectName("PillBtn")
+        self.wp_restore_secondary_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.wp_restore_secondary_btn.clicked.connect(self._on_wp_restore_secondary_clicked)
+        wp_res_lay.addWidget(self.wp_restore_secondary_btn)
+
+        self.wp_restore_close_btn = QPushButton()
+        self.wp_restore_close_btn.setObjectName("IconBtn")
+        self.wp_restore_close_btn.setFixedSize(24, 24)
+        self.wp_restore_close_btn.setToolTip("Ocultar aviso")
+        self.wp_restore_close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.wp_restore_close_btn.clicked.connect(self._dismiss_wp_restore_prompt)
+        wp_res_lay.addWidget(self.wp_restore_close_btn)
+        right_col.addWidget(self.wp_restore_bar)
 
         # Stack de vistas
         self.stack = QStackedWidget()
@@ -1655,7 +1788,9 @@ class MainWindow(QMainWindow):
         self.tray_icon = QSystemTrayIcon(self)
         if ICON_ICO_PATH.exists():
             self.tray_icon.setIcon(QIcon(str(ICON_ICO_PATH)))
-        self.tray_icon.setToolTip(APP_NAME)
+        self.tray_icon.setToolTip(
+            f"{APP_NAME} ({PROFILE_NAME})" if IS_ISOLATED_PROFILE else APP_NAME
+        )
 
         menu = QMenu()
         act_show = QAction("Abrir SwiftPlay", self)
@@ -1688,7 +1823,8 @@ class MainWindow(QMainWindow):
 
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
-        self.tray_icon.show()
+        if not IS_ISOLATED_PROFILE:
+            self.tray_icon.show()
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
@@ -1860,13 +1996,17 @@ class MainWindow(QMainWindow):
         self._media_filter.discord_share_stop_pressed.connect(
             self._on_global_discord_share_stop
         )
-        app = QApplication.instance()
-        if app is not None:
-            app.installNativeEventFilter(self._media_filter)
-        self._media_filter.register(int(self.winId()))
-        self._apply_discord_hotkeys()
+        if not IS_ISOLATED_PROFILE:
+            app = QApplication.instance()
+            if app is not None:
+                app.installNativeEventFilter(self._media_filter)
+            self._media_filter.register(int(self.winId()))
+            self._apply_discord_hotkeys()
 
     def _apply_discord_hotkeys(self) -> dict[str, str]:
+        if IS_ISOLATED_PROFILE:
+            self._discord_hotkey_statuses = {}
+            return {}
         self._discord_hotkey_statuses = self._media_filter.configure_discord_hotkeys(
             self.cfg.discord_hotkey_mute,
             self.cfg.discord_hotkey_deafen,
@@ -1945,6 +2085,8 @@ class MainWindow(QMainWindow):
                 self.top_bar.setVisible(False)
                 if hasattr(self, "wp_active_bar"):
                     self.wp_active_bar.setVisible(False)
+                if hasattr(self, "wp_restore_bar"):
+                    self.wp_restore_bar.setVisible(False)
                 self._bottom_bar_anim.stop()
                 self._bottom_bar_hiding = False
                 self.bottom_bar_wrap.set_reveal_height(74)
@@ -2052,6 +2194,17 @@ class MainWindow(QMainWindow):
         self._refresh_discord_nav_btn()
         if hasattr(self, "nav_watchparty"):
             self.nav_watchparty.setIcon(render_icon("watchparty", p.text, 17))
+        if hasattr(self, "wp_nav_eye_ico"):
+            self.wp_nav_eye_ico.setPixmap(render_icon("eye", p.accent, 14).pixmap(14, 14))
+            self.wp_nav_eye_cnt.setStyleSheet(
+                f"font-size: 11px; font-weight: 700; padding-bottom: 1px; color: {p.text}; background: transparent;"
+            )
+        if hasattr(self, "wp_mini_eye_ico"):
+            self.wp_mini_eye_ico.setPixmap(render_icon("eye", p.accent, 14).pixmap(14, 14))
+        if hasattr(self, "wp_bar_eye_ico"):
+            self.wp_bar_eye_ico.setPixmap(render_icon("eye", p.accent, 15).pixmap(15, 15))
+        if hasattr(self, "wp_restore_close_btn"):
+            self.wp_restore_close_btn.setIcon(render_icon("close", p.text2, 13))
         if hasattr(self, "watchparty_panel"):
             self.watchparty_panel.update_theme(p)
         self.minibar_btn.setIcon(render_icon("mini_bar", p.text2, 16))
@@ -2573,7 +2726,10 @@ class MainWindow(QMainWindow):
             participants=self._discord_participants,
             speaking=self._discord_speaking,
             streaming=self._discord_streaming,
+            wp_spectators=self._wp_overlay_spectators,
         )
+        if hasattr(self, "watchparty_panel"):
+            self.watchparty_panel.sync_overlay_controls()
 
     def _on_discord_overlay_position_changed(self, x: int, y: int) -> None:
         self.cfg.discord_overlay_x = int(x)
@@ -3070,6 +3226,7 @@ class MainWindow(QMainWindow):
                 self._search_mode = "video"
                 self.search_input.setPlaceholderText("Buscar videos en YouTube... [Ctrl+L]")
                 self.watchparty_panel.refresh_from_config(self.watchparty_svc.connection_state)
+                self.watchparty_svc.request_refresh()
             elif page_idx == self.PAGE_TWITCH or is_twitch_player:
                 self._search_mode = "twitch"
                 self.search_input.setPlaceholderText(
@@ -5301,10 +5458,13 @@ class MainWindow(QMainWindow):
         self.fs_overlay.set_paused(True)
         self._sync_bottom_bar()
         self._sync_mini_bar()
+        self._notify_wp_local_event("video", "pause", paused_override=True, broadcast_sync=False)
 
 
     def _on_music_ended(self) -> None:
         if self._queue_index + 1 < len(self._music_queue):
+            if self._is_wp_guest_on_deck("music"):
+                self._wp_suppress_until["music"] = time.monotonic() + 1.5
             self._play_queue_index(self._queue_index + 1)
         elif self.cfg.autoplay_music and self._music_queue:
             self._pending_advance_after_radio = True
@@ -5313,6 +5473,7 @@ class MainWindow(QMainWindow):
             self._music_paused = True
             self._sync_bottom_bar()
             self._sync_mini_bar()
+            self._notify_wp_local_event("music", "pause", paused_override=True, broadcast_sync=False)
 
     # ------------------------------------------------------------------
     # Sincronización de ambos decks con UI, Barra Inferior, Overlay y Mini-barra
@@ -5443,7 +5604,13 @@ class MainWindow(QMainWindow):
         pnl.leave_party_requested.connect(self._leave_watchparty_deck)
         pnl.add_friend_requested.connect(self._on_watchparty_add_friend_requested)
         pnl.remove_friend_requested.connect(self._on_watchparty_remove_friend_requested)
+        pnl.refresh_requested.connect(self._on_watchparty_refresh_requested)
         pnl.config_changed.connect(self._on_watchparty_config_changed)
+        pnl.overlay_settings_changed.connect(self._sync_discord_overlay)
+        pnl.overlay_preview_requested.connect(
+            lambda op: self.discord_overlay.preview(op, overlay_mode=self.cfg.discord_overlay_mode)
+        )
+        pnl.overlay_edit_requested.connect(self._start_discord_overlay_position_edit)
         pnl.toast_requested.connect(self.show_toast)
 
     def _watchparty_identity(self) -> tuple[str, str]:
@@ -5486,6 +5653,11 @@ class MainWindow(QMainWindow):
 
     def _on_watchparty_config_changed(self) -> None:
         self._start_watchparty_service()
+        self._sync_watchparty_bar()
+
+    def _on_watchparty_refresh_requested(self) -> None:
+        self.watchparty_svc.request_refresh()
+        self._on_watchparty_presence_tick(force=True)
 
     def _on_watchparty_connection_changed(self, state: str, detail: str) -> None:
         if hasattr(self, "watchparty_panel"):
@@ -5520,9 +5692,7 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "watchparty_panel"):
             self.watchparty_panel.set_friends_data(friends)
-        active_n = sum(1 for f in friends if isinstance(f, dict) and f.get("status") == "active")
-        if hasattr(self, "nav_watchparty"):
-            self.nav_watchparty.setText(f" WatchParty ({active_n})" if active_n > 0 else " WatchParty")
+        self._sync_watchparty_bar()
 
     def _on_watchparty_add_friend_requested(self, raw_code: str) -> None:
         code = str(raw_code or "").strip().upper()
@@ -5574,6 +5744,7 @@ class MainWindow(QMainWindow):
             ap = self.watchparty_svc.active_party_for(dk)
             if ap and ap.get("host_code") == code:
                 self.watchparty_svc.leave_party(dk)  # type: ignore[arg-type]
+                self._finish_wp_guest_deck(dk)  # type: ignore[arg-type]
         self.watchparty_svc.set_friends(
             [str(f.get("code") or "").upper() for f in self.cfg.watchparty_friends]
         )
@@ -5585,20 +5756,106 @@ class MainWindow(QMainWindow):
             self.show_toast("Conecta primero el servidor de WatchParty.")
             return
         dk: Literal["video", "music"] = "music" if deck == "music" else "video"
-        self.watchparty_svc.join_party(host_code, dk)
+        hc = str(host_code or "").strip().upper()
+        if hc and hc != str(self.cfg.watchparty_code or "").upper():
+            self._capture_wp_personal_snapshot(dk)
+        self.watchparty_svc.join_party(hc, dk)
         self._sync_watchparty_bar()
 
-    def _leave_watchparty_deck(self, deck: str) -> None:
+    def _leave_watchparty_deck(
+        self, deck: str, *, offer_restore: bool = True
+    ) -> None:
         dk: Literal["video", "music"] = "music" if deck == "music" else "video"
         self.watchparty_svc.leave_party(dk)
+        self._finish_wp_guest_deck(dk, offer_restore=offer_restore)
         self._sync_watchparty_bar()
 
     def _on_watchparty_members_updated(
         self, host_code: str, deck: str, members: list, allow_guest: bool
     ) -> None:
+        dk: Literal["video", "music"] = "music" if deck == "music" else "video"
+        if not members and dk in self._wp_guest_decks:
+            self._finish_wp_guest_deck(dk, offer_restore=True)
         self._sync_watchparty_bar()
 
+    def _resolve_wp_display_name(
+        self,
+        code: str,
+        fallback: str = "",
+        members: list[dict[str, Any]] | None = None,
+    ) -> str:
+        c = str(code or "").strip().upper()
+        if c and c == str(self.cfg.watchparty_code or "").upper():
+            my_name, _ = self._watchparty_identity()
+            return my_name or fallback or c
+        for m in members or []:
+            if isinstance(m, dict) and str(m.get("code") or "").upper() == c:
+                nm = str(m.get("name") or "").strip()
+                if nm and nm.upper() != c:
+                    return nm
+        fb = str(fallback or "").strip()
+        if fb and fb.upper() != c:
+            return fb
+        if hasattr(self, "watchparty_svc"):
+            for f in self.watchparty_svc.friends_snapshot:
+                if str(f.get("code") or "").upper() == c:
+                    fn = str(f.get("name") or "").strip()
+                    if fn and fn.upper() != c:
+                        return fn
+        for entry in self.cfg.watchparty_friends or []:
+            if isinstance(entry, dict) and str(entry.get("code") or "").upper() == c:
+                fn = str(entry.get("name") or "").strip()
+                if fn and fn.upper() != c:
+                    return fn
+        return fb or c
+
+    def _resolve_wp_avatar_url(
+        self,
+        code: str,
+        fallback: str = "",
+        members: list[dict[str, Any]] | None = None,
+    ) -> str:
+        c = str(code or "").strip().upper()
+        for m in members or []:
+            if isinstance(m, dict) and str(m.get("code") or "").upper() == c:
+                av = str(m.get("avatar_url") or "").strip()
+                if av:
+                    return av
+        fb = str(fallback or "").strip()
+        if fb:
+            return fb
+        if hasattr(self, "watchparty_svc"):
+            for f in self.watchparty_svc.friends_snapshot:
+                if str(f.get("code") or "").upper() == c:
+                    av = str(f.get("avatar_url") or "").strip()
+                    if av:
+                        return av
+        for entry in self.cfg.watchparty_friends or []:
+            if isinstance(entry, dict) and str(entry.get("code") or "").upper() == c:
+                av = str(entry.get("avatar_url") or "").strip()
+                if av:
+                    return av
+        return ""
+
+    def _resolve_wp_video_kind(self, host_code: str) -> str:
+        hc = str(host_code or "").strip().upper()
+        my_code = str(self.cfg.watchparty_code or "").upper()
+        if hc == my_code and self._video_item is not None:
+            return "twitch" if self._video_item.kind == "twitch" else "youtube"
+        if hasattr(self, "watchparty_svc"):
+            for f in self.watchparty_svc.friends_snapshot:
+                if str(f.get("code") or "").upper() == hc:
+                    vid = f.get("video") if isinstance(f.get("video"), dict) else None
+                    if vid and vid.get("kind") == "twitch":
+                        return "twitch"
+                    if vid:
+                        return "youtube"
+        if self._video_item is not None:
+            return "twitch" if self._video_item.kind == "twitch" else "youtube"
+        return "youtube"
+
     def _sync_watchparty_bar(self) -> None:
+        my_code = str(self.cfg.watchparty_code or "").upper()
         vp = self.watchparty_svc.active_party_for("video")
         mp = self.watchparty_svc.active_party_for("music")
 
@@ -5606,33 +5863,307 @@ class MainWindow(QMainWindow):
         mh = str(mp.get("host_code") or "").upper() if mp else ""
         if hasattr(self, "watchparty_panel"):
             self.watchparty_panel.set_joined_hosts(
-                video_host="" if vh == self.cfg.watchparty_code else vh,
-                music_host="" if mh == self.cfg.watchparty_code else mh,
+                video_host="" if vh == my_code else vh,
+                music_host="" if mh == my_code else mh,
             )
 
         parts: list[str] = []
+        mini_parts: list[str] = []
         show_leave_v = False
         show_leave_m = False
-        if vp and (vh != self.cfg.watchparty_code or len(vp.get("members") or []) > 1):
-            m_cnt = len(vp.get("members") or [])
-            h_name = str(vp.get("host_name") or vh)
-            ctrl_txt = "control cruzado" if vp.get("allow_guest_control", True) else "solo anfitrión"
-            parts.append(f"Video con {h_name} ({m_cnt} · {ctrl_txt})")
-            show_leave_v = vh != self.cfg.watchparty_code
-        if mp and (mh != self.cfg.watchparty_code or len(mp.get("members") or []) > 1):
-            m_cnt = len(mp.get("members") or [])
-            h_name = str(mp.get("host_name") or mh)
-            ctrl_txt = "control cruzado" if mp.get("allow_guest_control", True) else "solo anfitrión"
-            parts.append(f"Música con {h_name} ({m_cnt} · {ctrl_txt})")
-            show_leave_m = mh != self.cfg.watchparty_code
+        spectator_names_by_code: dict[str, str] = {}
+        overlay_specs_by_code: dict[str, dict[str, Any]] = {}
+
+        def _register_spec(
+            sc: str,
+            name: str,
+            avatar_url: str,
+            kind_icon: str,
+        ) -> None:
+            entry = overlay_specs_by_code.get(sc)
+            if entry is None:
+                entry = {
+                    "code": sc,
+                    "name": name,
+                    "avatar_url": avatar_url,
+                    "kinds": [],
+                }
+                overlay_specs_by_code[sc] = entry
+            elif not entry.get("avatar_url") and avatar_url:
+                entry["avatar_url"] = avatar_url
+            if kind_icon not in entry["kinds"]:
+                entry["kinds"].append(kind_icon)
+
+        def _collect_room(
+            party: dict[str, Any] | None,
+            host_code: str,
+            deck_label: str,
+            kind_icon: str,
+        ) -> bool:
+            if not party or not host_code:
+                return False
+            members = [m for m in (party.get("members") or []) if isinstance(m, dict)]
+            if host_code == my_code and len(members) <= 1:
+                return False
+
+            host_name = self._resolve_wp_display_name(
+                host_code,
+                str(party.get("host_name") or ""),
+                members,
+            )
+            others_in_room: list[str] = []
+            for m in members:
+                mc = str(m.get("code") or "").upper()
+                if not mc or mc == my_code:
+                    continue
+                mn = self._resolve_wp_display_name(mc, str(m.get("name") or ""), members)
+                mav = self._resolve_wp_avatar_url(mc, str(m.get("avatar_url") or ""), members)
+                spectator_names_by_code.setdefault(mc, mn)
+                _register_spec(mc, mn, mav, kind_icon)
+                if mn not in others_in_room:
+                    others_in_room.append(mn)
+
+            if host_code != my_code and host_code not in spectator_names_by_code:
+                hav = self._resolve_wp_avatar_url(host_code, "", members)
+                spectator_names_by_code[host_code] = host_name
+                _register_spec(host_code, host_name, hav, kind_icon)
+                if host_name not in others_in_room:
+                    others_in_room.insert(0, host_name)
+
+            ctrl_txt = (
+                "control cruzado"
+                if party.get("allow_guest_control", True)
+                else "solo anfitrión"
+            )
+            if host_code == my_code:
+                guests_txt = ", ".join(others_in_room[:2])
+                if len(others_in_room) > 2:
+                    guests_txt += f" +{len(others_in_room) - 2}"
+                parts.append(f"{deck_label} (tu sala · con {guests_txt})")
+                mini_parts.append(f"{deck_label}: {guests_txt}")
+            else:
+                parts.append(f"{deck_label} · Sala de {host_name} ({ctrl_txt})")
+                mini_parts.append(f"{deck_label}: Sala de {host_name}")
+            return True
+
+        if _collect_room(vp, vh, "Video", self._resolve_wp_video_kind(vh) if vh else "youtube"):
+            show_leave_v = vh != my_code
+        if _collect_room(mp, mh, "Música", "music"):
+            show_leave_m = mh != my_code
+
+        spectator_count = len(spectator_names_by_code)
+        spectator_names = list(spectator_names_by_code.values())
+        names_preview = ", ".join(spectator_names[:2])
+        if len(spectator_names) > 2:
+            names_preview += f" +{len(spectator_names) - 2}"
+
+        if hasattr(self, "wp_nav_eye_badge"):
+            self.wp_nav_eye_cnt.setText(str(spectator_count))
+            self.wp_nav_eye_badge.setVisible(spectator_count > 0)
+            if spectator_count > 0:
+                self.nav_watchparty.setToolTip(
+                    f"WatchParty activo ({spectator_count}): {names_preview}"
+                )
+            else:
+                self.nav_watchparty.setToolTip(
+                    "WatchParty de SwiftPlay (YouTube, Twitch y Música con amigos)"
+                )
+
+        if hasattr(self, "wp_mini_card"):
+            if spectator_count > 0:
+                unit = "espectador" if spectator_count == 1 else "espectadores"
+                self.wp_mini_title.setText(f"{spectator_count} {unit}")
+                self.wp_mini_sub.setText(" · ".join(mini_parts) or names_preview)
+                self.wp_mini_card.setToolTip(f"WatchParty en vivo: {' | '.join(parts)}")
+                self.wp_mini_card.setVisible(True)
+            else:
+                self.wp_mini_card.setVisible(False)
 
         if hasattr(self, "wp_active_bar"):
+            self.wp_bar_eye_cnt.setText(str(spectator_count))
+            self.wp_bar_eye_ico.setVisible(spectator_count > 0)
+            self.wp_bar_eye_cnt.setVisible(spectator_count > 0)
             self.wp_bar_lbl.setText("WatchParty: " + "  |  ".join(parts) if parts else "")
             self.wp_leave_video_btn.setVisible(show_leave_v)
             self.wp_leave_music_btn.setVisible(show_leave_m)
             self.wp_active_bar.setVisible(
                 bool(parts) and not self._is_fullscreen and not self._is_discord_screen_fs
             )
+        self._refresh_wp_restore_bar()
+
+        self._wp_overlay_spectators = list(overlay_specs_by_code.values())
+        self._sync_discord_overlay()
+
+    def _is_wp_guest_on_deck(self, deck: Literal["video", "music"]) -> bool:
+        if deck in self._wp_guest_decks:
+            return True
+        if hasattr(self, "watchparty_svc"):
+            ap = self.watchparty_svc.active_party_for(deck)
+            hc = str(ap.get("host_code") or "").upper() if ap else ""
+            if hc and hc != str(self.cfg.watchparty_code or "").upper():
+                return True
+        return False
+
+    def _capture_wp_personal_snapshot(self, deck: Literal["video", "music"]) -> None:
+        self._wp_restore_pending.pop(deck, None)
+        if deck in self._wp_guest_decks:
+            self._refresh_wp_restore_bar()
+            return
+        if deck == "video":
+            if self._video_item is not None:
+                self._wp_personal_snapshots["video"] = {
+                    "item": self._video_item,
+                    "pos": float(self._video_pos),
+                    "dur": float(self._video_dur),
+                    "speed": float(self.cfg.video_speed or 1.0),
+                    "presence": self._build_wp_deck_state("video", paused_override=True),
+                }
+            else:
+                self._wp_personal_snapshots["video"] = {"item": None, "presence": None}
+        else:
+            if self._music_item is not None:
+                self._wp_personal_snapshots["music"] = {
+                    "item": self._music_item,
+                    "pos": float(self._music_pos),
+                    "dur": float(self._music_dur),
+                    "queue": list(self._music_queue),
+                    "queue_index": int(self._queue_index),
+                    "presence": self._build_wp_deck_state("music", paused_override=True),
+                }
+            else:
+                self._wp_personal_snapshots["music"] = {"item": None, "presence": None}
+        self._wp_guest_decks.add(deck)
+        self._refresh_wp_restore_bar()
+
+    def _presence_state_for_deck(
+        self,
+        deck: Literal["video", "music"],
+        live_state: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if self._is_wp_guest_on_deck(deck):
+            snap = self._wp_personal_snapshots.get(deck)
+            if isinstance(snap, dict):
+                pres = snap.get("presence")
+                return dict(pres) if isinstance(pres, dict) else None
+            return None
+        return live_state
+
+    def _finish_wp_guest_deck(
+        self,
+        deck: Literal["video", "music"],
+        *,
+        offer_restore: bool = True,
+    ) -> None:
+        self._wp_guest_decks.discard(deck)
+        saved = self._wp_personal_snapshots.get(deck)
+        self._wp_personal_snapshots[deck] = None
+
+        cur_item = self._video_item if deck == "video" else self._music_item
+        if offer_restore:
+            saved_item = saved.get("item") if isinstance(saved, dict) else None
+            if saved_item is not None and (
+                cur_item is None
+                or cur_item.video_id != saved_item.video_id
+                or cur_item.kind != saved_item.kind
+            ):
+                self._wp_restore_pending[deck] = {
+                    "mode": "restore_mine",
+                    "saved": saved,
+                }
+            elif cur_item is not None and saved_item is None:
+                self._wp_restore_pending[deck] = {
+                    "mode": "keep_or_close",
+                    "saved": saved,
+                }
+        self._refresh_wp_restore_bar()
+        self._on_watchparty_presence_tick(force=True)
+
+    def _refresh_wp_restore_bar(self) -> None:
+        if not hasattr(self, "wp_restore_bar"):
+            return
+        if not self._wp_restore_pending or self._is_fullscreen or self._is_discord_screen_fs:
+            self._wp_restore_active_deck = None if not self._wp_restore_pending else self._wp_restore_active_deck
+            self.wp_restore_bar.setVisible(False)
+            return
+
+        deck: Literal["video", "music"] = (
+            "video" if "video" in self._wp_restore_pending else "music"
+        )
+        self._wp_restore_active_deck = deck
+        entry = self._wp_restore_pending[deck]
+        mode = str(entry.get("mode") or "restore_mine")
+        deck_lbl = "Video" if deck == "video" else "Música"
+        if mode == "restore_mine":
+            saved_item = (entry.get("saved") or {}).get("item")
+            title = str(getattr(saved_item, "title", "") or "lo que veías")[:36]
+            self.wp_restore_lbl.setText(
+                f"Saliste del WatchParty ({deck_lbl}) · ¿Volver a «{title}»?"
+            )
+            self.wp_restore_primary_btn.setText("Volver a lo mío")
+            self.wp_restore_secondary_btn.setText("Seguir con esto")
+        else:
+            cur_item = self._video_item if deck == "video" else self._music_item
+            title = str(getattr(cur_item, "title", "") or "esta reproducción")[:36]
+            self.wp_restore_lbl.setText(
+                f"Saliste del WatchParty ({deck_lbl}) · ¿Seguir con «{title}»?"
+            )
+            self.wp_restore_primary_btn.setText("Seguir con esto")
+            self.wp_restore_secondary_btn.setText("Cerrar reproductor")
+        self.wp_restore_bar.setVisible(True)
+
+    def _on_wp_restore_primary_clicked(self) -> None:
+        deck = self._wp_restore_active_deck
+        if deck is None or deck not in self._wp_restore_pending:
+            self._refresh_wp_restore_bar()
+            return
+        entry = self._wp_restore_pending.pop(deck)
+        mode = str(entry.get("mode") or "restore_mine")
+        saved = entry.get("saved") if isinstance(entry.get("saved"), dict) else None
+        self._refresh_wp_restore_bar()
+        if mode == "restore_mine" and saved and saved.get("item") is not None:
+            saved_item: MediaItem = saved["item"]
+            saved_pos = max(0.0, float(saved.get("pos") or 0.0))
+            if deck == "video":
+                if saved_item.kind == "twitch":
+                    self.play_twitch_stream(saved_item)
+                else:
+                    saved_speed = clamp_speed(float(saved.get("speed") or self.cfg.video_speed or 1.0))
+                    self.cfg.video_speed = saved_speed
+                    self.video_player.set_speed(saved_speed)
+                    self.video_panel.set_speed_silent(saved_speed)
+                    self.fs_overlay.set_speed_silent(saved_speed)
+                    self.play_video(saved_item, start_pos=saved_pos)
+            else:
+                self._music_queue = list(saved.get("queue") or [saved_item])
+                self._queue_index = int(saved.get("queue_index", 0))
+                self._reset_radio_session()
+                self._refresh_badges()
+                self._render_queue()
+                self._play_music_item(saved_item, start_pos=saved_pos)
+        else:
+            self._on_watchparty_presence_tick(force=True)
+
+    def _on_wp_restore_secondary_clicked(self) -> None:
+        deck = self._wp_restore_active_deck
+        if deck is None or deck not in self._wp_restore_pending:
+            self._refresh_wp_restore_bar()
+            return
+        entry = self._wp_restore_pending.pop(deck)
+        mode = str(entry.get("mode") or "restore_mine")
+        self._refresh_wp_restore_bar()
+        if mode == "keep_or_close":
+            self._close_active_media(target=deck)
+        else:
+            self._on_watchparty_presence_tick(force=True)
+
+    def _dismiss_wp_restore_prompt(self) -> None:
+        deck = self._wp_restore_active_deck
+        if deck is not None:
+            self._wp_restore_pending.pop(deck, None)
+        else:
+            self._wp_restore_pending.clear()
+        self._refresh_wp_restore_bar()
+        self._on_watchparty_presence_tick(force=True)
 
     def _serialize_wp_music_queue(
         self, current_item: MediaItem
@@ -5769,6 +6300,7 @@ class MainWindow(QMainWindow):
         paused_override: bool | None = None,
         pos_override: float | None = None,
         force_presence: bool = False,
+        broadcast_sync: bool = True,
     ) -> None:
         if self._cleaned_up:
             return
@@ -5797,19 +6329,21 @@ class MainWindow(QMainWindow):
         )
         self._wp_presence_status = status
         name, av = self._watchparty_identity()
+        pres_vid = self._presence_state_for_deck("video", vid_state)
+        pres_mus = self._presence_state_for_deck("music", mus_state)
         if self.watchparty_svc.is_connected:
             self.watchparty_svc.update_local_presence(
                 status=status,
                 share_enabled=self.cfg.watchparty_share_activity,
                 allow_guest_control=self.cfg.watchparty_allow_guest_control,
-                video_state=vid_state,
-                music_state=mus_state,
+                video_state=pres_vid,
+                music_state=pres_mus,
                 display_name=name,
                 avatar_url=av,
                 force=force_presence,
             )
 
-        if time.monotonic() < float(self._wp_suppress_until.get(deck, 0.0)):
+        if not broadcast_sync or time.monotonic() < float(self._wp_suppress_until.get(deck, 0.0)):
             return
 
         active_party = self.watchparty_svc.active_party_for(deck)
@@ -5834,6 +6368,8 @@ class MainWindow(QMainWindow):
             (time.monotonic() - self._last_discord_speak_ts) < 90.0,
             afk_minutes=int(self.cfg.watchparty_afk_minutes or 8),
         )
+        pres_vid = self._presence_state_for_deck("video", vid_state)
+        pres_mus = self._presence_state_for_deck("music", mus_state)
         if force or status != self._wp_presence_status:
             self._wp_presence_status = status
             name, av = self._watchparty_identity()
@@ -5841,8 +6377,8 @@ class MainWindow(QMainWindow):
                 status=status,
                 share_enabled=self.cfg.watchparty_share_activity,
                 allow_guest_control=self.cfg.watchparty_allow_guest_control,
-                video_state=vid_state,
-                music_state=mus_state,
+                video_state=pres_vid,
+                music_state=pres_mus,
                 display_name=name,
                 avatar_url=av,
                 force=force,
@@ -5917,6 +6453,8 @@ class MainWindow(QMainWindow):
             and cur_item.video_id == vid_id
             and cur_item.kind == item_kind
         )
+        if not same_item and cur_item is not None and reason != "join" and action != "play_item":
+            return
         new_item = MediaItem(
             video_id=vid_id,
             title=str(state.get("title") or vid_id),
@@ -6389,8 +6927,10 @@ class MainWindow(QMainWindow):
         if deck in ("video", "music"):
             ap = self.watchparty_svc.active_party_for(deck)
             if ap and ap.get("host_code") and ap.get("host_code") != self.cfg.watchparty_code:
-                self._leave_watchparty_deck(deck)
+                self._leave_watchparty_deck(deck, offer_restore=False)
             else:
+                self._wp_restore_pending.pop(deck, None)
+                self._refresh_wp_restore_bar()
                 self._notify_wp_local_event(deck, "clear")
         trim_process_memory()
 
@@ -6636,6 +7176,8 @@ class MainWindow(QMainWindow):
             self.top_bar.setVisible(False)
             if hasattr(self, "wp_active_bar"):
                 self.wp_active_bar.setVisible(False)
+            if hasattr(self, "wp_restore_bar"):
+                self.wp_restore_bar.setVisible(False)
             self.video_panel.set_fullscreen_state(True)
             self._update_bottom_bar_visibility()
             self.showFullScreen()
@@ -6858,7 +7400,12 @@ class MainWindow(QMainWindow):
         bring_window_to_front(int(self.winId()))
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if not self._force_quit and self.cfg.minimize_to_tray and self.tray_icon.isVisible():
+        if (
+            not IS_ISOLATED_PROFILE
+            and not self._force_quit
+            and self.cfg.minimize_to_tray
+            and self.tray_icon.isVisible()
+        ):
             event.ignore()
             self._save_current_video_progress(force=True)
             self.persist_session_state(force=True)

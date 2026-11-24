@@ -20,8 +20,32 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+def _resolve_profile_app_id() -> str:
+    import re
+
+    raw = ""
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        s = str(arg or "").strip()
+        if s.startswith("--profile="):
+            raw = s.split("=", 1)[1]
+            break
+        if s == "--profile" and i + 1 < len(args):
+            raw = str(args[i + 1] or "")
+            break
+    if not raw:
+        raw = str(os.environ.get("SWIFTPLAY_PROFILE") or "")
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", raw).strip("_-")[:32]
+    if not cleaned or cleaned.lower() in ("default", "main"):
+        return "SwiftPlay"
+    return f"SwiftPlay_{cleaned}"
+
+
 def _show_crash_dialog(err_text: str) -> None:
-    log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SwiftPlay"
+    log_dir = (
+        Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+        / _resolve_profile_app_id()
+    )
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "crash.log"

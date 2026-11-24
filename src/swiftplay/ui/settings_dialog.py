@@ -1039,7 +1039,7 @@ class SettingsDialog(QDialog):
         ui_lay.setContentsMargins(14, 10, 14, 10)
         ui_lay.setSpacing(8)
 
-        ui_title = QLabel("Interfaz y Overlay de Discord")
+        ui_title = QLabel("Interfaz y Overlay (Discord + WatchParty)")
         ui_title.setStyleSheet("font-size: 13px; font-weight: 700;")
         ui_lay.addWidget(ui_title)
 
@@ -1054,8 +1054,8 @@ class SettingsDialog(QDialog):
         ov_row.addWidget(ov_lbl)
         self.discord_overlay_mode_combo = QComboBox()
         self.discord_overlay_mode_combo.addItem("Sin overlay", "off")
-        self.discord_overlay_mode_combo.addItem("Overlay de estado (mute / ensordecido)", "status")
-        self.discord_overlay_mode_combo.addItem("Overlay total (personas + estado)", "full")
+        self.discord_overlay_mode_combo.addItem("Simple (estado / ojito WatchParty)", "status")
+        self.discord_overlay_mode_combo.addItem("Extendido (personas + íconos)", "full")
         ov_idx = self.discord_overlay_mode_combo.findData(self.cfg.discord_overlay_mode)
         self.discord_overlay_mode_combo.setCurrentIndex(max(0, ov_idx))
         self.discord_overlay_mode_combo.currentIndexChanged.connect(

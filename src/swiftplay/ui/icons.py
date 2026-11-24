@@ -441,5 +441,19 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
         arc2.cubicTo(s * 0.58, s * 0.60, s * 0.86, s * 0.60, s * 0.86, s * 0.78)
         p.drawPath(arc2)
 
+    elif name == "eye":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        eye_path = QPainterPath()
+        eye_path.moveTo(s * 0.08, s * 0.50)
+        eye_path.cubicTo(s * 0.28, s * 0.17, s * 0.72, s * 0.17, s * 0.92, s * 0.50)
+        eye_path.cubicTo(s * 0.72, s * 0.83, s * 0.28, s * 0.83, s * 0.08, s * 0.50)
+        p.drawPath(eye_path)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawEllipse(QPointF(s * 0.50, s * 0.50), s * 0.19, s * 0.19)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        p.drawEllipse(QPointF(s * 0.57, s * 0.43), s * 0.06, s * 0.06)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
     p.end()
     return QIcon(pm)

@@ -5,6 +5,8 @@
 
 const VALID_CODE_RE = /^[A-Z0-9_-]{4,24}$/;
 const VALID_DECKS = new Set(["video", "music"]);
+const STALE_SOCKET_MS = 75_000;
+const ALARM_INTERVAL_MS = 60_000;
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -103,6 +105,41 @@ export class WatchPartyHub {
         }
       }
     }
+  }
+
+  async _scheduleAlarmIfNeeded() {
+    if (this._socketsByCode.size === 0) return;
+    const existing = await this.ctx.storage.getAlarm();
+    if (!existing || existing <= Date.now()) {
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    }
+  }
+
+  async _pruneStaleSockets() {
+    const now = Date.now();
+    const stale = [];
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = this._getAttachment(ws);
+      const lastSeen = Number(att?.last_seen_ms || 0);
+      const closed = ws.readyState !== undefined && ws.readyState !== 1;
+      if (!att || !att.code || closed || (lastSeen > 0 && now - lastSeen > STALE_SOCKET_MS)) {
+        stale.push(ws);
+      }
+    }
+    for (const ws of stale) {
+      try {
+        ws.close(4002, "Heartbeat timeout");
+      } catch {
+        // Ignore
+      }
+      await this._cleanupSocket(ws, { notifyOffline: true });
+    }
+  }
+
+  async alarm() {
+    this._ensureHydrated();
+    await this._pruneStaleSockets();
+    await this._scheduleAlarmIfNeeded();
   }
 
   _roomKey(hostCode, deck) {
@@ -318,6 +355,7 @@ export class WatchPartyHub {
 
   async fetch(request) {
     this._ensureHydrated();
+    await this._pruneStaleSockets();
     const url = new URL(request.url);
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return jsonResponse({
@@ -345,7 +383,7 @@ export class WatchPartyHub {
       } catch {
         // Ignore
       }
-      this._cleanupSocket(oldWs, { notifyOffline: false });
+      await this._cleanupSocket(oldWs, { notifyOffline: false });
     }
 
     const pair = new WebSocketPair();
@@ -363,6 +401,7 @@ export class WatchPartyHub {
       video: null,
       music: null,
       joined: { video: null, music: null },
+      last_seen_ms: Date.now(),
     };
 
     this.ctx.acceptWebSocket(server);
@@ -377,6 +416,7 @@ export class WatchPartyHub {
         last_seen: Date.now() / 1000,
       });
     }
+    await this._scheduleAlarmIfNeeded();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -385,6 +425,8 @@ export class WatchPartyHub {
     this._ensureHydrated();
     const att = this._getAttachment(ws);
     if (!att || !att.code) return;
+    att.last_seen_ms = Date.now();
+    this._setAttachment(ws, att);
 
     let msg;
     try {
@@ -402,6 +444,7 @@ export class WatchPartyHub {
     }
 
     if (type === "hello") {
+      await this._pruneStaleSockets();
       const name = String(msg.name || att.name || att.code).trim().slice(0, 64) || att.code;
       const avatar = String(msg.avatar_url || "").trim().slice(0, 512);
       const friends = Array.isArray(msg.friends)
@@ -415,7 +458,9 @@ export class WatchPartyHub {
       att.allow_guest_control = msg.allow_guest_control !== false;
       att.video = sanitizeDeckState(msg.video, "video");
       att.music = sanitizeDeckState(msg.music, "music");
+      att.last_seen_ms = Date.now();
       this._setAttachment(ws, att);
+      await this._scheduleAlarmIfNeeded();
 
       await this._saveProfile(att.code, {
         code: att.code,
@@ -435,11 +480,21 @@ export class WatchPartyHub {
     }
 
     if (type === "set_friends") {
+      await this._pruneStaleSockets();
       const friends = Array.isArray(msg.friends)
         ? [...new Set(msg.friends.map(normalizeCode).filter((c) => VALID_CODE_RE.test(c) && c !== att.code))].slice(0, 100)
         : [];
       att.friends = friends;
       this._setAttachment(ws, att);
+      this._send(ws, {
+        type: "friends_snapshot",
+        friends: await this._buildFriendsSnapshot(att.friends),
+      });
+      return;
+    }
+
+    if (type === "refresh_friends") {
+      await this._pruneStaleSockets();
       this._send(ws, {
         type: "friends_snapshot",
         friends: await this._buildFriendsSnapshot(att.friends),

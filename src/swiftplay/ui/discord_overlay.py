@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from swiftplay.paths import IS_ISOLATED_PROFILE
 from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
@@ -162,6 +163,8 @@ class DiscordStatusOverlay(QWidget):
         self._live_pulse: float = 0.0
         self._participants: list[dict[str, Any]] = []
         self._speaking: dict[str, bool] = {}
+        self._wp_spectators: list[dict[str, Any]] = []
+        self._wp_count: int = 0
         self._opacity_pct: int = 25
         self._previewing: bool = False
         self._custom_pos: tuple[int, int] | None = None
@@ -261,7 +264,8 @@ class DiscordStatusOverlay(QWidget):
         if self._custom_pos is None:
             scr = QApplication.primaryScreen()
             geo = scr.geometry() if scr is not None else None
-            tx, ty = (geo.left() + 14, geo.top() + 14) if geo is not None else (14, 14)
+            offset_y = 68 if IS_ISOLATED_PROFILE else 14
+            tx, ty = (geo.left() + 14, geo.top() + offset_y) if geo is not None else (14, offset_y)
         else:
             tx, ty = self._clamp_pos_to_screens(*self._custom_pos)
         if self.pos() != QPoint(tx, ty):
@@ -455,10 +459,56 @@ class DiscordStatusOverlay(QWidget):
     def _visible_participants(self) -> tuple[list[dict[str, Any]], int]:
         if self._effective_overlay_mode() != "full":
             return [], 0
+        merged: list[dict[str, Any]] = []
+        wp_by_norm: dict[str, list[dict[str, Any]]] = {}
+        for sp in self._wp_spectators:
+            if not isinstance(sp, dict):
+                continue
+            sp_name = str(sp.get("name") or sp.get("code") or "").strip().lower()
+            wp_by_norm.setdefault(sp_name, []).append(sp)
+
+        used_wp_codes: set[str] = set()
         if self._in_voice and self._participants:
-            visible = self._participants[:_MAX_VISIBLE_PARTICIPANTS]
-            extra = max(0, len(self._participants) - _MAX_VISIBLE_PARTICIPANTS)
+            for part in self._participants:
+                row = dict(part)
+                p_name = str(row.get("name") or "").strip().lower()
+                matched = next(
+                    (
+                        sp
+                        for sp in wp_by_norm.get(p_name, ())
+                        if str(sp.get("code") or "").upper() not in used_wp_codes
+                    ),
+                    None,
+                )
+                if matched is not None:
+                    used_wp_codes.add(str(matched.get("code") or "").upper())
+                    row["wp_kinds"] = list(matched.get("kinds") or [])
+                merged.append(row)
+
+        for sp in self._wp_spectators:
+            if not isinstance(sp, dict):
+                continue
+            sc = str(sp.get("code") or "").upper()
+            if sc in used_wp_codes:
+                continue
+            merged.append(
+                {
+                    "id": f"wp:{sc or sp.get('name') or 'guest'}",
+                    "name": str(sp.get("name") or sc or "Socio"),
+                    "avatar_url": str(sp.get("avatar_url") or ""),
+                    "is_self": False,
+                    "muted": False,
+                    "deafened": False,
+                    "wp_kinds": list(sp.get("kinds") or []),
+                    "is_wp_only": True,
+                }
+            )
+
+        if merged:
+            visible = merged[:_MAX_VISIBLE_PARTICIPANTS]
+            extra = max(0, len(merged) - _MAX_VISIBLE_PARTICIPANTS)
             return visible, extra
+
         if self._previewing or self._edit_mode:
             return [
                 {
@@ -483,8 +533,8 @@ class DiscordStatusOverlay(QWidget):
         return [], 0
 
     def _is_part_streaming(self, part: dict[str, Any]) -> bool:
-        if str(part.get("id") or "").startswith("__prev_"):
-            return bool(part.get("_preview_streaming", False))
+        if str(part.get("id") or "").startswith("__prev_") or bool(part.get("is_wp_only")):
+            return False if bool(part.get("is_wp_only")) else bool(part.get("_preview_streaming", False))
         if bool(part.get("is_self", False)):
             return self._streaming
         return bool(part.get("screen_share") or part.get("is_streaming"))
@@ -496,6 +546,7 @@ class DiscordStatusOverlay(QWidget):
         fm = QFontMetrics(font)
         max_row_w = 108
         any_streaming = False
+        any_wp_icons = False
         for part in participants:
             is_self = bool(part.get("is_self", False))
             is_prev = str(part.get("id") or "").startswith("__prev_")
@@ -512,15 +563,26 @@ class DiscordStatusOverlay(QWidget):
             p_streaming = self._is_part_streaming(part)
             if p_streaming:
                 any_streaming = True
+            wp_kinds = list(part.get("wp_kinds") or [])
+            if wp_kinds:
+                any_wp_icons = True
             disp = format_overlay_name(str(part.get("name") or "Usuario"), _MAX_NAME_CHARS)
             text_w = min(96, fm.horizontalAdvance(disp))
             icons_w = (15 if p_muted else 0) + (15 if p_deaf else 0) + (4 if (p_muted or p_deaf) else 0)
             stream_w = 40 if p_streaming else 0
-            row_w = 31 + 7 + text_w + icons_w + stream_w + 9
+            wp_w = (len(wp_kinds) * 15) + (4 if wp_kinds and not (p_muted or p_deaf or p_streaming) else 0)
+            row_w = 31 + 7 + text_w + icons_w + stream_w + wp_w + 9
             if row_w > max_row_w:
                 max_row_w = row_w
-        cap_w = (_OVERLAY_MAX_W + 40) if any_streaming else _OVERLAY_MAX_W
+        cap_w = _OVERLAY_MAX_W + (40 if any_streaming else 0) + (36 if any_wp_icons else 0)
         return max(108, min(cap_w, max_row_w))
+
+    def _wp_status_segment_width(self, *, combined: bool) -> int:
+        if self._wp_count <= 0:
+            return 0
+        if combined:
+            return 58 if self._wp_count < 10 else 66
+        return 64 if self._wp_count < 10 else 72
 
     def _apply_size_for_state(
         self,
@@ -529,22 +591,27 @@ class DiscordStatusOverlay(QWidget):
         extra_count: int,
     ) -> None:
         if not participants:
-            if status_mode == "streaming":
-                target_w = 104
+            if not status_mode:
+                base_w = 0
+            elif status_mode == "streaming":
+                base_w = 104
             elif status_mode in ("muted_streaming", "deafened_streaming"):
-                target_w = 142
+                base_w = 142
             elif status_mode == "both_streaming":
-                target_w = 182
+                base_w = 182
             elif status_mode == "both":
-                target_w = 86
+                base_w = 86
             else:
-                target_w = 46
+                base_w = 46
+            wp_seg_w = self._wp_status_segment_width(combined=bool(base_w))
+            target_w = max(46, base_w + wp_seg_w)
             target_h = 46
         else:
             target_w = self._compute_full_width(participants)
+            header_h = 24 if self._wp_count > 0 else 0
             rows_h = len(participants) * _ROW_H + max(0, len(participants) - 1) * (_ROW_STEP - _ROW_H)
             extra_h = 18 if extra_count > 0 else 0
-            target_h = max(36, rows_h + extra_h + 4)
+            target_h = max(36, header_h + rows_h + extra_h + 4)
         if self.width() != target_w or self.height() != target_h:
             self.setFixedSize(target_w, target_h)
 
@@ -553,12 +620,14 @@ class DiscordStatusOverlay(QWidget):
         parts, extra = self._visible_participants()
         # En "Overlay total" el estado se muestra inline en cada fila; solo mostrar badge si no hay filas activas y estás transmitiendo.
         if eff_ov == "full" and parts:
-            status_mode = ""
+            raw_status = ""
         else:
-            status_mode = self._resolve_mode(self._muted, self._deafened, self._streaming)
+            raw_status = self._resolve_mode(self._muted, self._deafened, self._streaming)
 
+        has_wp = self._wp_count > 0
         if self._previewing or self._edit_mode:
-            if eff_ov != "full" and not status_mode:
+            status_mode = raw_status
+            if eff_ov != "full" and not status_mode and not has_wp:
                 status_mode = "both_streaming" if self._streaming else "both"
             self._mode = status_mode
             self._apply_size_for_state(status_mode, parts, extra)
@@ -572,8 +641,10 @@ class DiscordStatusOverlay(QWidget):
             self._sync_live_timer()
             return
 
-        has_content = bool(parts) or bool(status_mode)
-        if eff_ov != "off" and self._enabled and (self._active or self._streaming) and has_content:
+        has_discord_status = bool(raw_status) and (self._active or self._streaming)
+        status_mode = raw_status if has_discord_status else ""
+        has_content = bool(parts) or has_discord_status or has_wp
+        if eff_ov != "off" and self._enabled and has_content:
             self._mode = status_mode
             self._apply_size_for_state(status_mode, parts, extra)
             self.set_opacity_percent(self._opacity_pct)
@@ -590,6 +661,15 @@ class DiscordStatusOverlay(QWidget):
                 self.hide()
             self._sync_live_timer()
 
+    def update_watchparty_state(
+        self,
+        *,
+        spectators: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self._wp_spectators = list(spectators or [])
+        self._wp_count = len(self._wp_spectators)
+        self._sync_visibility()
+
     def update_state(
         self,
         *,
@@ -603,6 +683,7 @@ class DiscordStatusOverlay(QWidget):
         participants: list[dict[str, Any]] | None = None,
         speaking: dict[str, bool] | None = None,
         streaming: bool | None = None,
+        wp_spectators: list[dict[str, Any]] | None = None,
     ) -> None:
         if overlay_mode is not None:
             ov = str(overlay_mode).strip().lower()
@@ -625,6 +706,9 @@ class DiscordStatusOverlay(QWidget):
             self._participants = list(participants)
         if speaking is not None:
             self._speaking = dict(speaking)
+        if wp_spectators is not None:
+            self._wp_spectators = list(wp_spectators)
+            self._wp_count = len(self._wp_spectators)
         self._opacity_pct = max(10, min(100, int(opacity_pct)))
         if (not self._enabled or self._overlay_mode == "off") and self._previewing:
             self._previewing = False
@@ -702,6 +786,40 @@ class DiscordStatusOverlay(QWidget):
             text,
         )
 
+    def _paint_eye_counter(
+        self,
+        painter: QPainter,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        *,
+        ico_sz: int,
+        pt_size: float,
+        icon_color: str | None = None,
+    ) -> None:
+        cnt_txt = str(max(0, self._wp_count))
+        f_cnt = QFont(painter.font())
+        f_cnt.setPointSizeF(pt_size)
+        f_cnt.setBold(True)
+        fm = QFontMetrics(f_cnt)
+        gap = 5
+        txt_w = fm.horizontalAdvance(cnt_txt)
+        total_w = ico_sz + gap + txt_w
+        start_x = x + max(0, (w - total_w) // 2)
+
+        eye_pm = render_icon("eye", icon_color or self._palette.text, ico_sz).pixmap(
+            QSize(ico_sz, ico_sz)
+        )
+        eye_y = y + (h - ico_sz) // 2
+        painter.drawPixmap(start_x, eye_y, eye_pm)
+
+        painter.setFont(f_cnt)
+        painter.setPen(QColor(self._palette.text))
+        tb = fm.tightBoundingRect(cnt_txt)
+        baseline_y = int(round(y + (h / 2.0) - ((tb.top() + tb.bottom()) / 2.0)))
+        painter.drawText(start_x + ico_sz + gap, baseline_y, cnt_txt)
+
     def _paint_status_badge(self, painter: QPainter, badge_w: int, badge_h: int, mode: str) -> None:
         has_stream = "streaming" in mode
         base_mode = mode.replace("_streaming", "") if has_stream else mode
@@ -716,11 +834,27 @@ class DiscordStatusOverlay(QWidget):
         painter.setPen(QPen(border, 1.8))
         painter.drawRoundedRect(rect, 10.0, 10.0)
 
-        if has_stream and not base_mode:
-            self._paint_live_pill(painter, 10.0, (badge_h - 24.0) / 2.0, float(badge_w - 20), 24.0, "EN VIVO")
+        wp_seg_w = self._wp_status_segment_width(combined=bool(mode))
+        disc_w = badge_w - wp_seg_w
+
+        if wp_seg_w > 0 and not mode:
+            self._paint_eye_counter(
+                painter,
+                0,
+                0,
+                badge_w,
+                badge_h,
+                ico_sz=19,
+                pt_size=11.0,
+                icon_color=self._palette.text,
+            )
             return
 
-        if has_stream and base_mode:
+        if has_stream and not base_mode:
+            self._paint_live_pill(
+                painter, 10.0, (badge_h - 24.0) / 2.0, float(disc_w - 20), 24.0, "EN VIVO"
+            )
+        elif has_stream and base_mode:
             status_w = 84 if base_mode == "both" else 44
             if base_mode == "both":
                 pm_mic = render_icon("mic_off", self._palette.text, 20).pixmap(QSize(20, 20))
@@ -741,13 +875,11 @@ class DiscordStatusOverlay(QWidget):
                 painter,
                 float(status_w + 8),
                 (badge_h - 24.0) / 2.0,
-                float(badge_w - status_w - 16),
+                float(disc_w - status_w - 16),
                 24.0,
                 "EN VIVO",
             )
-            return
-
-        if base_mode == "both":
+        elif base_mode == "both":
             pm_mic = render_icon("mic_off", self._palette.text, 21).pixmap(QSize(21, 21))
             pm_deaf = render_icon("headphones_off", self._palette.text, 21).pixmap(
                 QSize(21, 21)
@@ -755,14 +887,28 @@ class DiscordStatusOverlay(QWidget):
             py = (badge_h - pm_mic.height()) // 2
             painter.drawPixmap(14, py, pm_mic)
             painter.setPen(QPen(QColor(self._palette.border_bright), 1.0))
-            painter.drawLine(badge_w // 2, 11, badge_w // 2, badge_h - 11)
-            painter.drawPixmap(badge_w - 14 - pm_deaf.width(), py, pm_deaf)
+            painter.drawLine(disc_w // 2, 11, disc_w // 2, badge_h - 11)
+            painter.drawPixmap(disc_w - 14 - pm_deaf.width(), py, pm_deaf)
         else:
             ico_name = "headphones_off" if base_mode == "deafened" else "mic_off"
             pm = render_icon(ico_name, self._palette.text, 22).pixmap(QSize(22, 22))
-            px = (badge_w - pm.width()) // 2
+            px = (disc_w - pm.width()) // 2
             py = (badge_h - pm.height()) // 2
             painter.drawPixmap(px, py, pm)
+
+        if wp_seg_w > 0:
+            painter.setPen(QPen(QColor(self._palette.border_bright), 1.0))
+            painter.drawLine(disc_w, 11, disc_w, badge_h - 11)
+            self._paint_eye_counter(
+                painter,
+                disc_w,
+                0,
+                wp_seg_w,
+                badge_h,
+                ico_sz=18,
+                pt_size=10.5,
+                icon_color=self._palette.accent,
+            )
 
     def paintEvent(self, _event) -> None:  # noqa: ANN001
         painter = QPainter(self)
@@ -788,24 +934,59 @@ class DiscordStatusOverlay(QWidget):
         name_font = QFont(base_font)
         name_font.setPointSizeF(9.5)
 
+        rows_top = 2
+        if self._wp_count > 0:
+            pill_hdr_w = 46 if self._wp_count < 10 else 52
+            hdr_rect = QRectF(2.0, 2.0, float(pill_hdr_w), 20.0)
+            hdr_bg = QColor(self._palette.surface2)
+            hdr_bg.setAlpha(215)
+            painter.setBrush(hdr_bg)
+            painter.setPen(QPen(QColor(self._palette.accent), 1.1))
+            painter.drawRoundedRect(hdr_rect, 9.0, 9.0)
+            self._paint_eye_counter(
+                painter,
+                2,
+                2,
+                pill_hdr_w,
+                20,
+                ico_sz=13,
+                pt_size=9.0,
+                icon_color=self._palette.accent,
+            )
+            rows_top = 26
+
         for idx, part in enumerate(parts):
-            row_y = 2 + idx * _ROW_STEP
+            row_y = rows_top + idx * _ROW_STEP
             uid = str(part.get("id") or "")
             is_prev = uid.startswith("__prev_")
+            is_wp_only = bool(part.get("is_wp_only"))
             is_self = bool(part.get("is_self", False))
             key = "local" if is_self else uid
-            speaking = bool(part.get("_preview_speaking", False)) or bool(self._speaking.get(key, False))
+            speaking = (
+                False
+                if is_wp_only
+                else (bool(part.get("_preview_speaking", False)) or bool(self._speaking.get(key, False)))
+            )
             p_muted = (
-                bool(part.get("muted", False))
-                if is_prev
-                else (self._muted if is_self else bool(part.get("muted", False)))
+                False
+                if is_wp_only
+                else (
+                    bool(part.get("muted", False))
+                    if is_prev
+                    else (self._muted if is_self else bool(part.get("muted", False)))
+                )
             )
             p_deaf = (
-                bool(part.get("deafened", False))
-                if is_prev
-                else (self._deafened if is_self else bool(part.get("deafened", False)))
+                False
+                if is_wp_only
+                else (
+                    bool(part.get("deafened", False))
+                    if is_prev
+                    else (self._deafened if is_self else bool(part.get("deafened", False)))
+                )
             )
             p_streaming = self._is_part_streaming(part)
+            wp_kinds = list(part.get("wp_kinds") or [])
             disp_name = format_overlay_name(str(part.get("name") or "Usuario"), _MAX_NAME_CHARS)
             av_url = str(part.get("avatar_url") or "")
 
@@ -852,11 +1033,12 @@ class DiscordStatusOverlay(QWidget):
             text_w = min(96, fm.horizontalAdvance(disp_name))
             icons_w = (15 if p_muted else 0) + (15 if p_deaf else 0) + (4 if (p_muted or p_deaf) else 0)
             stream_w = 40 if p_streaming else 0
+            wp_w = (len(wp_kinds) * 15) + (4 if wp_kinds and not (p_muted or p_deaf or p_streaming) else 0)
 
             pill_x = 31
             pill_y = row_y + 3
             pill_h = 22
-            pill_w = min(self.width() - pill_x - 2, 7 + text_w + icons_w + stream_w + 7)
+            pill_w = min(self.width() - pill_x - 2, 7 + text_w + icons_w + stream_w + wp_w + 7)
             pill_rect = QRectF(float(pill_x), float(pill_y), float(pill_w), float(pill_h))
             pill_bg = QColor(self._palette.surface1)
             pill_bg.setAlpha(155)
@@ -896,9 +1078,19 @@ class DiscordStatusOverlay(QWidget):
             if p_streaming:
                 badge_x = float(icon_x + (2 if (p_muted or p_deaf) else 0))
                 self._paint_live_pill(painter, badge_x, float(pill_y + 3), 36.0, 16.0, "LIVE")
+                icon_x = int(badge_x + 39)
+            for wk in wp_kinds:
+                if wk == "youtube":
+                    wp_pm = render_icon("video", "#F87171", 13).pixmap(QSize(13, 13))
+                elif wk == "twitch":
+                    wp_pm = render_icon("live", "#C084FC", 13).pixmap(QSize(13, 13))
+                else:
+                    wp_pm = render_icon("music", self._palette.accent, 13).pixmap(QSize(13, 13))
+                painter.drawPixmap(icon_x, icon_y, wp_pm)
+                icon_x += 15
 
         if extra > 0:
-            extra_y = 2 + len(parts) * _ROW_STEP
+            extra_y = rows_top + len(parts) * _ROW_STEP
             cap_font = QFont(base_font)
             cap_font.setPointSizeF(8.5)
             painter.setFont(cap_font)

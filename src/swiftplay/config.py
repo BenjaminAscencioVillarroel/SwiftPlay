@@ -8,7 +8,12 @@ import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from swiftplay.paths import CONFIG_PATH
+from swiftplay.paths import (
+    BASE_USER_DATA_DIR,
+    CONFIG_PATH,
+    IS_ISOLATED_PROFILE,
+    PROFILE_NAME,
+)
 from swiftplay.sound_effects import (
     DEFAULT_SOUND_VOLUMES,
     SOUND_EVENTS,
@@ -350,9 +355,48 @@ class AppConfig:
         self.watchparty_friends = clean_wp_friends
 
 
+def bootstrap_isolated_profile_config(
+    cfg: AppConfig,
+    profile_name: str,
+    primary_config_path: Path | None = None,
+) -> AppConfig:
+    """Inicializa un perfil aislado con credenciales WatchParty propias y enlace al perfil principal."""
+    cfg.minimize_to_tray = False
+    cfg.start_with_windows = False
+    cfg.watchparty_display_name = f"Prueba ({profile_name})"[:64]
+    cfg.watchparty_code = generate_watchparty_code(profile_name)
+    cfg.watchparty_secret = generate_watchparty_secret()
+
+    src_path = primary_config_path or (BASE_USER_DATA_DIR / "config.json")
+    try:
+        if src_path.is_file():
+            raw = json.loads(src_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                relay_url = normalize_watchparty_relay_url(
+                    str(raw.get("watchparty_relay_url") or "")
+                )
+                if relay_url:
+                    cfg.watchparty_relay_url = relay_url
+                main_code = re.sub(
+                    r"[^A-Za-z0-9_-]", "", str(raw.get("watchparty_code") or "")
+                ).upper()[:24]
+                main_name = str(raw.get("watchparty_display_name") or "").strip()[:64] or main_code
+                if len(main_code) >= 4 and main_code != cfg.watchparty_code:
+                    cfg.watchparty_friends = [
+                        {"code": main_code, "name": main_name, "avatar_url": ""}
+                    ]
+    except Exception:
+        pass
+
+    cfg.__post_init__()
+    return cfg
+
+
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     if not path.exists():
         cfg = AppConfig()
+        if IS_ISOLATED_PROFILE and path == CONFIG_PATH:
+            bootstrap_isolated_profile_config(cfg, PROFILE_NAME)
         save_config(cfg, path)
         return cfg
     try:

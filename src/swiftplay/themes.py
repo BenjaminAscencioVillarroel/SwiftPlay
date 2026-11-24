@@ -1347,6 +1347,18 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
         border-radius: 10px;
     }}
 
+    QFrame#WatchPartyEyeBadge {{
+        background-color: {p.surface2};
+        border: 1px solid {p.accent};
+        border-radius: 10px;
+    }}
+
+    QFrame#WatchPartySidebarMiniCard {{
+        background-color: {p.surface2};
+        border: 1px solid {p.accent};
+        border-radius: 10px;
+    }}
+
     QLabel#WatchPartyCodePill {{
         background-color: {p.surface2};
         color: {p.accent};

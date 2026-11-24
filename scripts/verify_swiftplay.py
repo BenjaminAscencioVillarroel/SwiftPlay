@@ -20,7 +20,14 @@ from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPointF, QProperty
 from PySide6.QtGui import QImage, QMouseEvent, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton  # noqa: E402
 
-from swiftplay.config import AppConfig, VALID_SPEEDS, load_config, save_config  # noqa: E402
+from swiftplay.config import (  # noqa: E402
+    AppConfig,
+    VALID_SPEEDS,
+    bootstrap_isolated_profile_config,
+    load_config,
+    save_config,
+)
+from swiftplay.paths import parse_profile_name  # noqa: E402
 from swiftplay.discord_service import DiscordService  # noqa: E402
 from swiftplay.discord_worker import PCM_FRAME_BYTES, SILENCE_PCM, VoiceAudioMixer  # noqa: E402
 from swiftplay.models import AccountProfile, ChannelInfo, MediaItem, ResolvedStream, upgrade_thumb_url  # noqa: E402
@@ -313,8 +320,13 @@ def test_storage_config_themes() -> None:
         "QFrame#DiscordSidebarMiniCard",
         "QFrame#WatchPartyFriendCard",
         "QFrame#WatchPartySubCard",
+        "QFrame#WatchPartyActiveBar",
+        "QFrame#WatchPartyEyeBadge",
+        "QFrame#WatchPartySidebarMiniCard",
     ):
         assert sel in qss, f"Falta selector {sel} en QSS"
+
+    assert not render_icon("eye", "#FFFFFF", 16).pixmap(16, 16).isNull()
 
     # Config WatchParty, URLs relay, estado 8 min AFK + cálculo de posición en vivo
     from swiftplay.config import AppConfig, normalize_watchparty_relay_url
@@ -1895,6 +1907,7 @@ def test_gui_and_libmpv_smoke(
                 win._switch_page(win.PAGE_DISCORD)
 
             # Verificar WatchParty GUI: card persona expandible -> 3 subcards (YT / Twitch / Music) y anti-eco
+            win.watchparty_svc.stop()
             win._switch_page(win.PAGE_WATCHPARTY)
             app.processEvents()
             wp_pnl = win.watchparty_panel
@@ -1909,6 +1922,7 @@ def test_gui_and_libmpv_smoke(
                         "video_id": "illo_live",
                         "title": "Directo Demo Twitch",
                         "author": "IlloJuan",
+                        "thumb_url": "https://static-cdn.jtvnw.net/previews-ttv/live_user_illojuan-440x248.jpg",
                         "kind": "twitch",
                         "is_live": True,
                         "paused": False,
@@ -1941,6 +1955,18 @@ def test_gui_and_libmpv_smoke(
             assert finz_card.status_lbl.text() == "Activo"
             assert wp_pnl._cards["SOCIO-2222"].status_lbl.text() == "Inactivo"
             assert wp_pnl._cards["OFF-3333"].status_lbl.text() == "Desconectado"
+            # Miniatura asíncrona (ThumbnailCache.ready emite url limpia) debe pintarse en la sub-card
+            demo_img = QImage(64, 36, QImage.Format.Format_ARGB32)
+            demo_img.fill(0xFF3B82F6)
+            win.thumb_cache._on_loaded(
+                "https://static-cdn.jtvnw.net/previews-ttv/live_user_illojuan-440x248.jpg|76x46|r7",
+                demo_img,
+            )
+            app.processEvents()
+            tw_pix = finz_card.tw_sub.thumb_lbl.pixmap()
+            assert tw_pix is not None and not tw_pix.isNull(), (
+                "La sub-card debe renderizar la miniatura recibida por ThumbnailCache.ready"
+            )
             prev_wp_url = win.cfg.watchparty_relay_url
             try:
                 win.cfg.watchparty_relay_url = "wss://demo.workers.dev"
@@ -1955,6 +1981,8 @@ def test_gui_and_libmpv_smoke(
 
             # Verificar desactivación automática de "Audio inteligente" dentro de WatchParty y sincronización de cola (A CONTINUACIÓN)
             prev_auto_pause = win.cfg.auto_pause_other_player
+            prev_ov_mode = win.cfg.discord_overlay_mode
+            prev_ov_en = win.cfg.discord_overlay_enabled
             prev_vid_wp = win._video_item
             prev_mus_wp = win._music_item
             prev_vid_paused = win._video_paused
@@ -2058,9 +2086,175 @@ def test_gui_and_libmpv_smoke(
                     win.music_player.__class__.has_active_stream = orig_has_stream  # type: ignore[assignment]
                 assert [it.video_id for it in win._music_queue] == ["m_wp_1", "m_wp_4"]
                 assert not started_mus, "queue_update sobre la misma canción no debe reiniciar ni cortar el stream actual"
+
+                # Indicadores de espectadores (ojito + solo espectadores + nombres reales + overlay unificado Discord+WP)
+                assert wp_pnl.overlay_mode_combo.count() == 3
+                win.cfg.discord_overlay_mode = "status"
+                win.cfg.discord_overlay_enabled = True
+                win.watchparty_svc._friends_by_code["FINZ-1111"] = {"code": "FINZ-1111", "name": "Finz"}
+                win.watchparty_svc._handle_incoming_message(
+                    {
+                        "type": "party_members",
+                        "host_code": win.cfg.watchparty_code,
+                        "deck": "music",
+                        "allow_guest_control": True,
+                        "members": [
+                            {"code": win.cfg.watchparty_code, "name": "Benja", "is_host": True},
+                            {"code": "FINZ-1111", "name": "Finz", "is_host": False},
+                        ],
+                    }
+                )
+                app.processEvents()
+                assert win.wp_nav_eye_badge.isVisible() and win.wp_nav_eye_cnt.text() == "1", (
+                    f"El ojito debe contar solo espectadores (1), no total: {win.wp_nav_eye_cnt.text()!r}"
+                )
+                assert win.wp_mini_card.isVisible() and "1 espectador" in win.wp_mini_title.text()
+                assert "Finz" in win.wp_mini_sub.text() and "FINZ-1111" not in win.wp_mini_sub.text()
+                assert "Finz" in win.wp_bar_lbl.text() and "FINZ-1111" not in win.wp_bar_lbl.text()
+                assert win.wp_bar_eye_cnt.text() == "1"
+                assert win.discord_overlay.isVisible() and win.discord_overlay.width() == 64 and win.discord_overlay.height() == 46
+                assert bool(win.discord_overlay.windowFlags() & Qt.WindowType.WindowTransparentForInput)
+                assert bool(win.discord_overlay.windowFlags() & Qt.WindowType.WindowDoesNotAcceptFocus)
+
+                # Modo Simple combinado: Discord muteado + WatchParty 1 espectador en el mismo cuadrito
+                prev_d_act, prev_d_m = win._discord_voice_active, win._discord_muted
+                win._discord_voice_active = True
+                win._discord_muted = True
+                win._sync_discord_overlay()
+                app.processEvents()
+                assert win.discord_overlay.width() == 104 and win.discord_overlay.height() == 46
+
+                # Modo Extendido: fusiona por nombre si también está en voz de Discord y muestra íconos WP
+                win.cfg.discord_overlay_mode = "full"
+                win._discord_in_voice = True
+                win._discord_participants = [
+                    {"id": "10", "name": "Finz", "is_self": False, "muted": False, "deafened": False, "avatar_url": ""},
+                ]
+                win._sync_discord_overlay()
+                app.processEvents()
+                merged_parts, _ = win.discord_overlay._visible_participants()
+                assert len(merged_parts) == 1 and merged_parts[0]["wp_kinds"] == ["music"], merged_parts
+                assert win.discord_overlay.height() >= 54
+
+                win._discord_voice_active = prev_d_act
+                win._discord_muted = prev_d_m
+                win._discord_in_voice = False
+                win._discord_participants = []
+
+                # Desactivar overlay oculta solo el flotante manteniendo los indicadores internos
+                win.cfg.discord_overlay_mode = "off"
+                win.cfg.discord_overlay_enabled = False
+                win._sync_watchparty_bar()
+                app.processEvents()
+                assert not win.discord_overlay.isVisible()
+                assert win.wp_nav_eye_badge.isVisible() and win.wp_mini_card.isVisible()
+
+                # Salir de salas oculta todos los indicadores limpiamente
+                win.watchparty_svc._active_parties.clear()
+                win._sync_watchparty_bar()
+                app.processEvents()
+                assert not win.wp_nav_eye_badge.isVisible()
+                assert not win.wp_mini_card.isVisible()
+                assert not win.wp_active_bar.isVisible()
+                assert not win.discord_overlay.isVisible()
+
+                # Fix de EOF retrasado: _on_video_ended nunca debe enviar party_sync y un pause/sync de video viejo no debe pisar video nuevo
+                sync_sent: list[tuple[str, str, str]] = []
+                orig_send_sync = win.watchparty_svc.send_party_sync
+                win.watchparty_svc.send_party_sync = (  # type: ignore[method-assign]
+                    lambda hc, dk, act, st: sync_sent.append((hc, dk, act))
+                )
+                try:
+                    win.watchparty_svc._active_parties["video"] = {
+                        "host_code": "FINZ-1111",
+                        "host_name": "Finz",
+                        "members": [{"code": "FINZ-1111", "name": "Finz"}, {"code": win.cfg.watchparty_code, "name": "Benja"}],
+                    }
+                    win._wp_suppress_until["video"] = 0.0
+                    win._video_item = MediaItem(video_id="v_new", title="Video 2", kind="video")
+                    win._on_video_ended()
+                    assert not sync_sent, f"_on_video_ended no debe mandar party_sync: {sync_sent}"
+
+                    played_reverts: list[str] = []
+                    orig_play_vid = win.play_video
+                    win.play_video = lambda it, start_pos=None, force_fresh=False: played_reverts.append(it.video_id)  # type: ignore[method-assign]
+                    try:
+                        win._on_watchparty_state_received(
+                            {
+                                "host_code": "FINZ-1111",
+                                "host_name": "Finz",
+                                "deck": "video",
+                                "reason": "sync",
+                                "action": "pause",
+                                "updated_by": "FINZ-1111",
+                                "updated_by_name": "Finz",
+                                "state": {"video_id": "v_old", "title": "Video 1", "kind": "video", "paused": True, "pos": 50.0},
+                            }
+                        )
+                        assert not played_reverts and win._video_item.video_id == "v_new"
+                    finally:
+                        win.play_video = orig_play_vid  # type: ignore[method-assign]
+                finally:
+                    win.watchparty_svc.send_party_sync = orig_send_sync  # type: ignore[method-assign]
+                    win.watchparty_svc._active_parties.clear()
+
+                # Instancias separadas + snapshot personal + opción de volver o seguir al salir
+                win._wp_guest_decks.clear()
+                win._wp_personal_snapshots = {"video": None, "music": None}
+                win._wp_restore_pending.clear()
+                v_mine = MediaItem(video_id="v_mine", title="Mi Video Personal", kind="video", duration_sec=300)
+                v_host = MediaItem(video_id="v_host", title="Video Del Socio", kind="video", duration_sec=400)
+                win._video_item = v_mine
+                win._video_pos = 75.0
+                win._video_dur = 300.0
+                win._capture_wp_personal_snapshot("video")
+                win._video_item = v_host
+                win._video_pos = 12.0
+                pres_v = win._presence_state_for_deck("video", win._build_wp_deck_state("video"))
+                assert pres_v is not None and pres_v["video_id"] == "v_mine" and pres_v["paused"] is True, (
+                    f"La tarjeta WP personal debe conservar Mi Video y no duplicar al host: {pres_v}"
+                )
+
+                restored_calls: list[tuple[str, float]] = []
+                orig_play_vid2 = win.play_video
+                win.play_video = lambda it, start_pos=None, force_fresh=False: restored_calls.append((it.video_id, float(start_pos or 0.0)))  # type: ignore[method-assign]
+                try:
+                    win._leave_watchparty_deck("video")
+                    app.processEvents()
+                    assert win.wp_restore_bar.isVisible()
+                    assert win.wp_restore_primary_btn.text() == "Volver a lo mío"
+                    assert win.wp_restore_secondary_btn.text() == "Seguir con esto"
+                    win._on_wp_restore_primary_clicked()
+                    app.processEvents()
+                    assert restored_calls == [("v_mine", 75.0)], restored_calls
+                    assert not win.wp_restore_bar.isVisible()
+                finally:
+                    win.play_video = orig_play_vid2  # type: ignore[method-assign]
+
+                # Si no había video antes de entrar al WatchParty, ofrece seguir o cerrar reproductor
+                win._video_item = None
+                win._capture_wp_personal_snapshot("video")
+                win._video_item = v_host
+                win._leave_watchparty_deck("video")
+                app.processEvents()
+                assert win.wp_restore_bar.isVisible()
+                assert win.wp_restore_primary_btn.text() == "Seguir con esto"
+                assert win.wp_restore_secondary_btn.text() == "Cerrar reproductor"
+                win._on_wp_restore_secondary_clicked()
+                app.processEvents()
+                assert win._video_item is None and not win.wp_restore_bar.isVisible()
             finally:
                 win._play_music_item = orig_play_music  # type: ignore[method-assign]
                 win.cfg.auto_pause_other_player = prev_auto_pause
+                win.cfg.discord_overlay_mode = prev_ov_mode
+                win.cfg.discord_overlay_enabled = prev_ov_en
+                win._wp_overlay_spectators = []
+                win._wp_guest_decks.clear()
+                win._wp_personal_snapshots = {"video": None, "music": None}
+                win._wp_restore_pending.clear()
+                win._refresh_wp_restore_bar()
+                win.discord_overlay.update_watchparty_state(spectators=[])
+                win.discord_overlay.hide()
                 win._video_item = prev_vid_wp
                 win._music_item = prev_mus_wp
                 win._video_paused = prev_vid_paused
@@ -4451,8 +4645,9 @@ print("SCREEN_SHARE_RELAY_OK")
                     for oc, (ows, oi) in list(_wp_clients.items()):
                         if oc != code and code in oi["friends"]:
                             await ows.send(json.dumps({"type": "friend_state", "friend": _snap(code)}))
-                elif t == "set_friends":
-                    info["friends"] = list(msg.get("friends") or [])
+                elif t in ("set_friends", "refresh_friends"):
+                    if t == "set_friends":
+                        info["friends"] = list(msg.get("friends") or [])
                     await ws.send(json.dumps({"type": "friends_snapshot", "friends": [_snap(f) for f in info["friends"]]}))
                 elif t == "presence":
                     for k in ("status", "share_enabled", "allow_guest_control", "video", "music"):
@@ -4637,6 +4832,17 @@ print("SCREEN_SHARE_RELAY_OK")
                 app.processEvents()
             _wp_time.sleep(0.05)
         assert b_notices, "Debe notificar cuando el anfitrión bloquea el control cruzado"
+
+        # Solicitud de snapshot fresco vía request_refresh()
+        b_snaps: list[list] = []
+        wp_b.friends_updated.connect(b_snaps.append)
+        wp_b.request_refresh()
+        deadline = _wp_time.monotonic() + 3.0
+        while _wp_time.monotonic() < deadline and not b_snaps:
+            if app is not None:
+                app.processEvents()
+            _wp_time.sleep(0.05)
+        assert b_snaps, "request_refresh() debe obtener un friends_snapshot actualizado"
     finally:
         wp_b.stop()
         wp_a.stop()
@@ -4645,6 +4851,75 @@ print("SCREEN_SHARE_RELAY_OK")
         srv_th.join(timeout=2.0)
 
     print("   WatchParty WS E2E OK (presencias, sub-decks YT/Twitch vs Music, control cruzado).")
+
+    # 6. Prueba de perfil aislado WatchParty (--profile / SWIFTPLAY_PROFILE)
+    assert parse_profile_name(["--profile", "test"], {}) == "test"
+    assert parse_profile_name(["--profile=Test_01!"], {}) == "Test_01"
+    assert parse_profile_name(["--profile", "default"], {}) == ""
+    assert parse_profile_name([], {"SWIFTPLAY_PROFILE": "MiPerfil"}) == "MiPerfil"
+
+    with tempfile.TemporaryDirectory() as iso_tmp:
+        iso_base = Path(iso_tmp)
+        primary_cfg = iso_base / "SwiftPlay" / "config.json"
+        primary_cfg.parent.mkdir(parents=True, exist_ok=True)
+        primary_cfg.write_text(
+            json.dumps(
+                {
+                    "watchparty_relay_url": "https://demo-relay.example.workers.dev",
+                    "watchparty_code": "MAIN-1234",
+                    "watchparty_secret": "super_secret_should_never_copy_9999",
+                    "watchparty_display_name": "NuBa",
+                }
+            ),
+            encoding="utf-8",
+        )
+        boot_cfg = bootstrap_isolated_profile_config(
+            AppConfig(), "test_iso", primary_config_path=primary_cfg
+        )
+        assert boot_cfg.minimize_to_tray is False and boot_cfg.start_with_windows is False
+        assert boot_cfg.watchparty_display_name == "Prueba (test_iso)"
+        assert boot_cfg.watchparty_code != "MAIN-1234"
+        assert boot_cfg.watchparty_secret != "super_secret_should_never_copy_9999"
+        assert boot_cfg.watchparty_relay_url == "wss://demo-relay.example.workers.dev"
+        assert [f["code"] for f in boot_cfg.watchparty_friends] == ["MAIN-1234"]
+        assert boot_cfg.watchparty_friends[0]["name"] == "NuBa"
+
+        iso_env = dict(os.environ)
+        iso_env["LOCALAPPDATA"] = str(iso_base)
+        iso_env["SWIFTPLAY_PROFILE"] = "test_iso"
+        iso_probe = (
+            "import json; "
+            "from swiftplay import paths, main, windows_os, config; "
+            "cfg = config.load_config(); "
+            "print(json.dumps({"
+            "'isolated': paths.IS_ISOLATED_PROFILE, "
+            "'profile': paths.PROFILE_NAME, "
+            "'user_dir': str(paths.USER_DATA_DIR), "
+            "'ipc': main.IPC_SERVER_NAME, "
+            "'aumid': windows_os.APP_USER_MODEL_ID, "
+            "'code': cfg.watchparty_code, "
+            "'friends': [f['code'] for f in cfg.watchparty_friends], "
+            "'relay': cfg.watchparty_relay_url"
+            "}))"
+        )
+        iso_res = subprocess.run(
+            [sys.executable, "-c", iso_probe],
+            env=iso_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        iso_data = json.loads(iso_res.stdout.strip())
+        assert iso_data["isolated"] is True and iso_data["profile"] == "test_iso"
+        assert Path(iso_data["user_dir"]).name == "SwiftPlay_test_iso"
+        assert iso_data["ipc"] == "SwiftPlaySingleInstanceIPC_test_iso"
+        assert iso_data["aumid"] == "SwiftPlay.App.Desktop.test_iso"
+        assert iso_data["code"] != "MAIN-1234"
+        assert iso_data["friends"] == ["MAIN-1234"]
+        assert iso_data["relay"] == "wss://demo-relay.example.workers.dev"
+
+    print("   Perfil aislado WatchParty OK (paths, IPC, AUMID y bootstrap seguro verificados).")
     print("   OK: DPAPI Bot, mezclador PCM, descifrado AEAD+DAVE, ScreenShare y workers 0 MB verificados.")
 
 

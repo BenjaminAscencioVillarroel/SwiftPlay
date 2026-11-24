@@ -15,6 +15,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -184,9 +186,9 @@ class _WatchPartySubCard(QFrame):
 
         self.update_theme(palette)
 
-    def handle_thumb_ready(self, key: str, pix: QPixmap) -> None:
-        if key and key == self._thumb_key and not pix.isNull():
-            self.thumb_lbl.setPixmap(pix)
+    def handle_thumb_ready(self, url: str, pix: QPixmap) -> None:
+        if url and url == self._thumb_url and not pix.isNull():
+            self.thumb_lbl.setPixmap(_rounded_pixmap(pix, 76, 46, 7))
 
     def set_data(
         self,
@@ -319,6 +321,7 @@ class _WatchPartyFriendCard(QFrame):
         self._friend = dict(friend)
         self._palette = palette
         self._thumb_cache = thumb_cache
+        self._avatar_url = ""
         self._avatar_key = ""
         self._expanded = bool(expanded)
 
@@ -514,6 +517,7 @@ class _WatchPartyFriendCard(QFrame):
 
         # Avatar con inicial (no requiere imagen externa si no hay avatar_url)
         av_url = str(friend.get("avatar_url") or "").strip()
+        self._avatar_url = av_url
         av_sz = QSize(40, 40)
         self._avatar_key = (
             self._thumb_cache._make_key(av_url, av_sz, True)
@@ -526,7 +530,7 @@ class _WatchPartyFriendCard(QFrame):
             else None
         )
         if av_pix is not None and not av_pix.isNull():
-            self.avatar_lbl.setPixmap(av_pix)
+            self.avatar_lbl.setPixmap(_rounded_pixmap(av_pix, 40, 40, 20))
         else:
             initial = (name[:1] or "?").upper()
             self.avatar_lbl.setText(initial)
@@ -585,12 +589,12 @@ class _WatchPartyFriendCard(QFrame):
         )
         self.remove_btn.setIcon(render_icon("close", self._palette.text2, 13))
 
-    def handle_thumb_ready(self, key: str, pix: QPixmap) -> None:
-        if key and key == self._avatar_key and not pix.isNull():
-            self.avatar_lbl.setPixmap(pix)
-        self.yt_sub.handle_thumb_ready(key, pix)
-        self.tw_sub.handle_thumb_ready(key, pix)
-        self.mus_sub.handle_thumb_ready(key, pix)
+    def handle_thumb_ready(self, url: str, pix: QPixmap) -> None:
+        if url and url == self._avatar_url and not pix.isNull():
+            self.avatar_lbl.setPixmap(_rounded_pixmap(pix, 40, 40, 20))
+        self.yt_sub.handle_thumb_ready(url, pix)
+        self.tw_sub.handle_thumb_ready(url, pix)
+        self.mus_sub.handle_thumb_ready(url, pix)
 
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
@@ -612,7 +616,11 @@ class WatchPartyPanel(QWidget):
     leave_party_requested = Signal(str)  # deck
     add_friend_requested = Signal(str)  # code
     remove_friend_requested = Signal(str)  # code
+    refresh_requested = Signal()
     config_changed = Signal()
+    overlay_settings_changed = Signal()
+    overlay_preview_requested = Signal(int)
+    overlay_edit_requested = Signal()
     toast_requested = Signal(str)
 
     def __init__(
@@ -672,6 +680,14 @@ class WatchPartyPanel(QWidget):
         self.server_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.server_toggle_btn.clicked.connect(self._toggle_setup_box)
         hdr.addWidget(self.server_toggle_btn)
+
+        self.refresh_btn = QPushButton()
+        self.refresh_btn.setObjectName("IconBtn")
+        self.refresh_btn.setFixedSize(28, 28)
+        self.refresh_btn.setToolTip("Actualizar estado de amigos y reconectar si hace falta")
+        self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_btn.clicked.connect(self.refresh_requested.emit)
+        hdr.addWidget(self.refresh_btn)
         root.addLayout(hdr)
 
         # Switches rápidos de privacidad y control cruzado
@@ -690,6 +706,51 @@ class WatchPartyPanel(QWidget):
 
         toggles_row.addStretch(1)
         root.addLayout(toggles_row)
+
+        # Controles del overlay flotante unificado (Sin overlay / Simple / Extendido + opacidad + mover)
+        overlay_row = QHBoxLayout()
+        overlay_row.setSpacing(10)
+        ov_lbl = QLabel("Overlay flotante:")
+        ov_lbl.setObjectName("MutedLabel")
+        overlay_row.addWidget(ov_lbl)
+
+        self.overlay_mode_combo = QComboBox()
+        self.overlay_mode_combo.addItem("Sin overlay", "off")
+        self.overlay_mode_combo.addItem("Simple (ojito / estado)", "status")
+        self.overlay_mode_combo.addItem("Extendido (personas + íconos)", "full")
+        ov_idx = self.overlay_mode_combo.findData(self.cfg.discord_overlay_mode)
+        self.overlay_mode_combo.setCurrentIndex(max(0, ov_idx))
+        self.overlay_mode_combo.currentIndexChanged.connect(self._on_overlay_mode_changed)
+        overlay_row.addWidget(self.overlay_mode_combo)
+
+        op_lbl = QLabel("Opacidad:")
+        op_lbl.setObjectName("MutedLabel")
+        overlay_row.addWidget(op_lbl)
+
+        self.overlay_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.overlay_opacity_slider.setRange(10, 100)
+        self.overlay_opacity_slider.setSingleStep(5)
+        self.overlay_opacity_slider.setPageStep(10)
+        self.overlay_opacity_slider.setFixedWidth(104)
+        self.overlay_opacity_slider.setValue(int(self.cfg.discord_overlay_opacity))
+        self.overlay_opacity_slider.setEnabled(self.cfg.discord_overlay_mode != "off")
+        self.overlay_opacity_slider.valueChanged.connect(self._on_overlay_opacity_changed)
+        overlay_row.addWidget(self.overlay_opacity_slider)
+
+        self.overlay_opacity_lbl = QLabel(f"{int(self.cfg.discord_overlay_opacity)}%")
+        self.overlay_opacity_lbl.setFixedWidth(36)
+        self.overlay_opacity_lbl.setObjectName("MutedLabel")
+        overlay_row.addWidget(self.overlay_opacity_lbl)
+
+        self.overlay_move_btn = QPushButton("Mover")
+        self.overlay_move_btn.setObjectName("PillBtn")
+        self.overlay_move_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.overlay_move_btn.setEnabled(self.cfg.discord_overlay_mode != "off")
+        self.overlay_move_btn.setToolTip("Arrastra el overlay unificado donde quieras en tu pantalla")
+        self.overlay_move_btn.clicked.connect(self.overlay_edit_requested.emit)
+        overlay_row.addWidget(self.overlay_move_btn)
+        overlay_row.addStretch(1)
+        root.addLayout(overlay_row)
 
         # Panel desplegable de configuración del relay Cloudflare + Nombre + AFK
         self.setup_card = QFrame()
@@ -834,6 +895,43 @@ class WatchPartyPanel(QWidget):
         save_config(self.cfg)
         self.config_changed.emit()
 
+    def _on_overlay_mode_changed(self, _idx: int) -> None:
+        mode = str(self.overlay_mode_combo.currentData() or "status")
+        if mode not in ("off", "status", "full"):
+            mode = "status"
+        self.cfg.discord_overlay_mode = mode
+        self.cfg.discord_overlay_enabled = mode != "off"
+        enabled = mode != "off"
+        self.overlay_opacity_slider.setEnabled(enabled)
+        self.overlay_move_btn.setEnabled(enabled)
+        save_config(self.cfg)
+        self.overlay_settings_changed.emit()
+        if enabled:
+            self.overlay_preview_requested.emit(int(self.cfg.discord_overlay_opacity))
+
+    def _on_overlay_opacity_changed(self, value: int) -> None:
+        val = max(10, min(100, int(value)))
+        self.cfg.discord_overlay_opacity = val
+        self.overlay_opacity_lbl.setText(f"{val}%")
+        save_config(self.cfg)
+        self.overlay_settings_changed.emit()
+        if self.cfg.discord_overlay_mode != "off":
+            self.overlay_preview_requested.emit(val)
+
+    def sync_overlay_controls(self) -> None:
+        self.overlay_mode_combo.blockSignals(True)
+        idx = self.overlay_mode_combo.findData(self.cfg.discord_overlay_mode)
+        self.overlay_mode_combo.setCurrentIndex(max(0, idx))
+        self.overlay_mode_combo.blockSignals(False)
+
+        self.overlay_opacity_slider.blockSignals(True)
+        self.overlay_opacity_slider.setValue(int(self.cfg.discord_overlay_opacity))
+        self.overlay_opacity_slider.blockSignals(False)
+        self.overlay_opacity_lbl.setText(f"{int(self.cfg.discord_overlay_opacity)}%")
+        enabled = self.cfg.discord_overlay_mode != "off"
+        self.overlay_opacity_slider.setEnabled(enabled)
+        self.overlay_move_btn.setEnabled(enabled)
+
     def _save_setup(self) -> None:
         self.cfg.watchparty_relay_url = normalize_watchparty_relay_url(self.relay_input.text())
         self.cfg.watchparty_display_name = str(self.name_input.text() or "").strip()[:64]
@@ -977,6 +1075,7 @@ class WatchPartyPanel(QWidget):
         self.guest_ctrl_chk.blockSignals(True)
         self.guest_ctrl_chk.setChecked(bool(self.cfg.watchparty_allow_guest_control))
         self.guest_ctrl_chk.blockSignals(False)
+        self.sync_overlay_controls()
         if conn_state is not None:
             self.set_connection_state(conn_state[0], conn_state[1])
         elif not self.cfg.watchparty_relay_url:
@@ -989,6 +1088,7 @@ class WatchPartyPanel(QWidget):
     def update_theme(self, palette: ThemePalette) -> None:
         self.palette = palette
         self.add_friend_btn.setIcon(render_icon("plus", palette.text, 14))
+        self.refresh_btn.setIcon(render_icon("refresh", palette.text, 14))
         for card in self._cards.values():
             card.update_theme(palette)
         self.set_connection_state(self._conn_state, self._conn_detail)

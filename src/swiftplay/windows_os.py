@@ -13,11 +13,20 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
-from swiftplay.paths import APP_NAME, APP_ROOT, ICON_ICO_PATH, LAUNCH_SCRIPT_PATH
+from swiftplay.paths import (
+    APP_NAME,
+    APP_ROOT,
+    ICON_ICO_PATH,
+    IS_ISOLATED_PROFILE,
+    LAUNCH_SCRIPT_PATH,
+    PROFILE_NAME,
+)
 
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "SwiftPlay"
-APP_USER_MODEL_ID = "SwiftPlay.App.Desktop"
+APP_USER_MODEL_ID = (
+    f"SwiftPlay.App.Desktop.{PROFILE_NAME}" if IS_ISOLATED_PROFILE else "SwiftPlay.App.Desktop"
+)
 
 _VT_EMPTY = 0
 _VT_LPWSTR = 31
@@ -143,12 +152,13 @@ def apply_window_taskbar_properties(hwnd: int) -> bool:
         )
         if hr < 0 or not store_ptr:
             return False
+        display_name = f"{APP_NAME} [{PROFILE_NAME}]" if IS_ISOLATED_PROFILE else APP_NAME
         return _write_property_store(
             store_ptr,
             [
                 (_PID_APP_USER_MODEL_ID, APP_USER_MODEL_ID),
                 (_PID_RELAUNCH_COMMAND, build_launch_command()),
-                (_PID_RELAUNCH_DISPLAY_NAME, APP_NAME),
+                (_PID_RELAUNCH_DISPLAY_NAME, display_name),
                 (_PID_RELAUNCH_ICON, f"{ICON_ICO_PATH},0"),
             ],
         )
@@ -273,6 +283,8 @@ def get_pythonw_executable() -> Path:
 
 def build_launch_command() -> str:
     pyw = get_pythonw_executable()
+    if IS_ISOLATED_PROFILE:
+        return f'"{pyw}" "{LAUNCH_SCRIPT_PATH}" --profile "{PROFILE_NAME}"'
     return f'"{pyw}" "{LAUNCH_SCRIPT_PATH}"'
 
 
@@ -292,7 +304,7 @@ def is_startup_enabled() -> bool:
 
 
 def set_startup_enabled(enabled: bool) -> None:
-    if sys.platform != "win32":
+    if sys.platform != "win32" or IS_ISOLATED_PROFILE:
         return
     import winreg
 

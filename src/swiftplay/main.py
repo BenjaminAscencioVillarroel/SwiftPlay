@@ -9,14 +9,33 @@ from PySide6.QtGui import QIcon, QPixmapCache
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
-from swiftplay.paths import APP_NAME, ICON_ICO_PATH
+from swiftplay.paths import APP_NAME, ICON_ICO_PATH, IS_ISOLATED_PROFILE, PROFILE_NAME
 from swiftplay.ui.main_window import MainWindow
 from swiftplay.windows_os import (
     allow_set_foreground_window,
     set_process_app_user_model_id,
 )
 
-IPC_SERVER_NAME = "SwiftPlaySingleInstanceIPC"
+IPC_SERVER_NAME = (
+    f"SwiftPlaySingleInstanceIPC_{PROFILE_NAME}"
+    if IS_ISOLATED_PROFILE
+    else "SwiftPlaySingleInstanceIPC"
+)
+
+
+def _parse_initial_page(argv: list[str]) -> int | None:
+    raw = ""
+    for i, arg in enumerate(argv):
+        s = str(arg or "").strip()
+        if s.startswith("--page="):
+            raw = s.split("=", 1)[1].strip().lower()
+            break
+        if s == "--page" and i + 1 < len(argv):
+            raw = str(argv[i + 1] or "").strip().lower()
+            break
+    if raw == "watchparty":
+        return MainWindow.PAGE_WATCHPARTY
+    return None
 
 
 def _send_ipc_command(cmd: bytes = b"SHOW") -> bool:
@@ -45,7 +64,7 @@ def main() -> int:
     )
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    app.setQuitOnLastWindowClosed(False)
+    app.setQuitOnLastWindowClosed(bool(IS_ISOLATED_PROFILE))
     QPixmapCache.setCacheLimit(4096)
     if ICON_ICO_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_ICO_PATH)))
@@ -57,7 +76,7 @@ def main() -> int:
     ipc_server = QLocalServer()
     ipc_server.listen(IPC_SERVER_NAME)
 
-    win = MainWindow()
+    win = MainWindow(initial_page=_parse_initial_page(sys.argv[1:]))
     app.commitDataRequest.connect(lambda _mgr: win.persist_session_state(force=True))
     app.aboutToQuit.connect(lambda: win.persist_session_state(force=True))
 

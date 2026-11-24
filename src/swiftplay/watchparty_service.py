@@ -354,6 +354,37 @@ class WatchPartyService(QObject):
             }
         )
 
+    def request_refresh(self) -> None:
+        """Pide snapshot fresco de amigos o fuerza reconexión si el socket estaba caído/dormido."""
+        with self._lock:
+            enabled = self._enabled
+            relay_url = self._relay_url
+            code = self._code
+            secret = self._secret
+            running = self._thread is not None and self._thread.is_alive()
+            connected = self._conn_state == "connected"
+        if not enabled or not relay_url or not code or len(secret) < 16:
+            return
+        if not running:
+            self._stop_evt.clear()
+            self._thread = threading.Thread(
+                target=self._run_thread,
+                name="SwiftPlayWatchParty",
+                daemon=True,
+            )
+            self._thread.start()
+            return
+        if connected:
+            self._enqueue({"type": "refresh_friends"})
+        else:
+            self._trigger_reconnect()
+
+    def force_reconnect(self) -> None:
+        with self._lock:
+            running = self._thread is not None and self._thread.is_alive()
+        if running:
+            self._trigger_reconnect()
+
     def _trigger_reconnect(self) -> None:
         with self._lock:
             loop = self._loop
@@ -495,10 +526,15 @@ class WatchPartyService(QObject):
         queue: asyncio.Queue[dict[str, Any]],
         reconnect_evt: asyncio.Event,
     ) -> None:
+        last_activity_mono = [time.monotonic()]
+        last_wall = [time.time()]
+        last_mono = [time.monotonic()]
+
         async def _reader() -> None:
             async for raw in ws:
                 if self._stop_evt.is_set():
                     break
+                last_activity_mono[0] = time.monotonic()
                 try:
                     msg = json.loads(raw)
                 except Exception:
@@ -516,9 +552,18 @@ class WatchPartyService(QObject):
 
         async def _heartbeat() -> None:
             while not self._stop_evt.is_set() and not reconnect_evt.is_set():
-                await asyncio.sleep(25)
+                await asyncio.sleep(20)
                 if self._stop_evt.is_set() or reconnect_evt.is_set():
                     return
+                now_wall = time.time()
+                now_mono = time.monotonic()
+                sleep_drift = (now_wall - last_wall[0]) - (now_mono - last_mono[0])
+                last_wall[0] = now_wall
+                last_mono[0] = now_mono
+                if abs(sleep_drift) > 20.0:
+                    raise ConnectionError("wake_from_sleep")
+                if (now_mono - last_activity_mono[0]) > 45.0:
+                    raise TimeoutError("heartbeat_timeout")
                 await ws.send(json.dumps({"type": "ping"}))
 
         async def _reconnect_waiter() -> None:
@@ -544,6 +589,35 @@ class WatchPartyService(QObject):
             for t in tasks:
                 if not t.done():
                     t.cancel()
+
+    def _resolve_host_name_locked(
+        self,
+        host_code: str,
+        members: list[dict[str, Any]],
+        deck: str,
+        hint: str = "",
+    ) -> str:
+        for m in members:
+            if isinstance(m, dict) and str(m.get("code") or "").upper() == host_code:
+                nm = str(m.get("name") or "").strip()
+                if nm and nm.upper() != host_code:
+                    return nm
+        clean_hint = str(hint or "").strip()
+        if clean_hint and clean_hint.upper() != host_code:
+            return clean_hint
+        prev_entry = self._active_parties.get(deck) or {}
+        if str(prev_entry.get("host_code") or "").upper() == host_code:
+            prev_hn = str(prev_entry.get("host_name") or "").strip()
+            if prev_hn and prev_hn.upper() != host_code:
+                return prev_hn
+        friend = self._friends_by_code.get(host_code)
+        if friend:
+            fn = str(friend.get("name") or "").strip()
+            if fn and fn.upper() != host_code:
+                return fn
+        if host_code and host_code == self._code and self._display_name:
+            return self._display_name
+        return clean_hint or host_code
 
     def _handle_incoming_message(self, msg: dict[str, Any]) -> None:
         mtype = str(msg.get("type") or "").strip()
@@ -577,9 +651,11 @@ class WatchPartyService(QObject):
             members = list(msg.get("members") or [])
             allow_guest = bool(msg.get("allow_guest_control", True))
             with self._lock:
+                host_name = self._resolve_host_name_locked(hc, members, dk)
                 if members:
                     self._active_parties[dk] = {
                         "host_code": hc,
+                        "host_name": host_name,
                         "members": members,
                         "allow_guest_control": allow_guest,
                     }
@@ -592,10 +668,12 @@ class WatchPartyService(QObject):
             dk = "music" if msg.get("deck") == "music" else "video"
             members = list(msg.get("members") or [])
             allow_guest = bool(msg.get("allow_guest_control", True))
+            raw_hn = str(msg.get("host_name") or "").strip()
             with self._lock:
+                host_name = self._resolve_host_name_locked(hc, members, dk, raw_hn)
                 self._active_parties[dk] = {
                     "host_code": hc,
-                    "host_name": str(msg.get("host_name") or hc),
+                    "host_name": host_name,
                     "members": members,
                     "allow_guest_control": allow_guest,
                 }
