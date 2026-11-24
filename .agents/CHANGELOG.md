@@ -14,6 +14,14 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-23 — Sonido/Overlay de Transmisión en Vivo, 12 Temas Multitono en Sistema y Animaciones UI
+- **Files:** `src/swiftplay/sound_effects.py`, `src/swiftplay/themes.py`, `src/swiftplay/config.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/discord_overlay.py`, `src/swiftplay/ui/discord_notification.py`, `src/swiftplay/ui/settings_dialog.py`, `src/swiftplay/ui/main_window.py`, `src/swiftplay/ui/widgets.py`, `src/swiftplay/ui/music_player_panel.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Sonidos y Overlay de Transmisión Discord:** Añadidos eventos `stream_start` y `stream_stop` en `sound_effects.py` (packs `soft` y `minimal`, configurables en Ajustes); `DiscordVoicePanel` emite `sound_event_requested` y `screen_share_active_changed(bool)` + badge `● EN VIVO` en tu tarjeta de voz; `DiscordStatusOverlay` muestra una píldora roja animada `EN VIVO` / `LIVE` (en modos `status` y `full`, sola o combinada con mute/deafen) y la mini-tarjeta lateral refleja el estado en vivo.
+  - **12 Paletas Multitono del Sistema (`themes.py`, `settings_dialog.py`):** `ThemePalette` incorpora tonos oscuros, medios, activos, gradientes y acentos propios por familia cromática (`matte_silver`, `rose_sakura`, `amethyst_velvet`, `sapphire_ocean`, `emerald_forest`, `crimson_ruby`, `amber_gold`, `arctic_cyan`, `sunset_coral`, `indigo_nebula`, `matcha_sage`, `magenta_orchid`) con selector visual `_ThemeSwatchButton` en **Ajustes → Sistema** y actualización en vivo en toda la app (incluyendo `DiscordMessageToast` y `DiscordStatusOverlay`).
+  - **Animaciones Estéticas:** Indicador vertical deslizante `_SidebarActiveIndicator` en la barra lateral, transición de páginas más fluida y entrada escalonada de tarjetas (`_stagger_card_entrances`), brillo especular + borde acentuado + fondo suave en `RoundedThumbWidget`/`VideoGridCard`/`MusicTileWidget`, halo radial pulsante en `_MusicStageArea`, anillo animado de voz en `_AvatarCircleWidget`, y fade entre pestañas + acordeón suave en `SettingsDialog`.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
 ## 2026-11-23 — Visor Discord Teatro (`T`)/Fullscreen (`F`), `T` por Espacio, Última Config de Share y Auto-Destinos Multiples
 - **Files:** `src/swiftplay/config.py`, `src/swiftplay/ui/video_overlays.py`, `src/swiftplay/ui/shortcuts_dialog.py`, `src/swiftplay/ui/settings_dialog.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

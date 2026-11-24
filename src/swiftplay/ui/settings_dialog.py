@@ -8,14 +8,38 @@ import threading
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QFocusEvent, QKeyEvent, QPixmap
+from PySide6.QtCore import (
+    QEasingCurve,
+    QObject,
+    QPropertyAnimation,
+    QRectF,
+    QRunnable,
+    QSize,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QFocusEvent,
+    QFont,
+    QKeyEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -46,6 +70,8 @@ from swiftplay.security import (
 )
 from swiftplay.themes import (
     NOTIFICATION_COLORS,
+    THEMES,
+    ThemePalette,
     apply_windows_dark_titlebar,
     get_notification_color,
     get_theme,
@@ -231,11 +257,122 @@ class _HotkeyCaptureEdit(QLineEdit):
         event.accept()
 
 
+class _ThemeSwatchButton(QPushButton):
+    """Botón visual multitono para seleccionar la paleta de color de todo SwiftPlay."""
+
+    def __init__(self, spec: ThemePalette, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.spec = spec
+        self._selected = False
+        self._hover_t = 0.0
+        self._hover_anim: QVariantAnimation | None = None
+        self.setFixedSize(134, 54)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"Paleta {spec.name}")
+
+    def set_selected(self, selected: bool) -> None:
+        val = bool(selected)
+        if self._selected != val:
+            self._selected = val
+            self.update()
+
+    def _on_hover_val(self, val: object) -> None:
+        self._hover_t = float(val)
+        self.update()
+
+    def _animate_hover(self, target: float) -> None:
+        if self._hover_anim is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(140)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.valueChanged.connect(self._on_hover_val)
+            self._hover_anim = anim
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover_t)
+        self._hover_anim.setEndValue(float(target))
+        self._hover_anim.start()
+
+    def enterEvent(self, event) -> None:  # noqa: ANN001
+        self._animate_hover(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: ANN001
+        self._animate_hover(0.0)
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:  # noqa: ANN001
+        w = float(self.width())
+        h = float(self.height())
+        if w <= 0 or h <= 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = QRectF(1.5, 1.5, w - 3.0, h - 3.0)
+        bg = QColor(self.spec.surface2 if self._selected else self.spec.surface1)
+        if self._hover_t > 0.01 and not self._selected:
+            hov = QColor(self.spec.surface2)
+            bg = QColor(
+                int(bg.red() + (hov.red() - bg.red()) * self._hover_t),
+                int(bg.green() + (hov.green() - bg.green()) * self._hover_t),
+                int(bg.blue() + (hov.blue() - bg.blue()) * self._hover_t),
+            )
+        border_col = QColor(self.spec.accent if self._selected else self.spec.border_bright)
+        if not self._selected:
+            border_col.setAlpha(int(150 + 95 * self._hover_t))
+        p.setBrush(bg)
+        p.setPen(QPen(border_col, 2.0 if self._selected else 1.2))
+        p.drawRoundedRect(rect, 10.0, 10.0)
+
+        # Barra de 4 tonos (base oscuro -> medio -> acento)
+        bar_x = 9.0
+        bar_y = 9.0
+        bar_w = w - (34.0 if self._selected else 18.0)
+        bar_h = 13.0
+        shades = (self.spec.base, self.spec.surface2, self.spec.active_bg, self.spec.accent)
+        seg_w = bar_w / float(len(shades))
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 4.5, 4.5)
+        p.save()
+        p.setClipPath(clip)
+        p.setPen(Qt.PenStyle.NoPen)
+        for idx, sh in enumerate(shades):
+            p.setBrush(QColor(sh))
+            p.drawRect(QRectF(bar_x + idx * seg_w, bar_y, seg_w + 0.8, bar_h))
+        p.restore()
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 36), 0.8))
+        p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 4.5, 4.5)
+
+        if self._selected:
+            cx = w - 15.0
+            cy = 15.5
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self.spec.accent))
+            p.drawEllipse(QRectF(cx - 6.5, cy - 6.5, 13.0, 13.0))
+            p.setPen(QPen(QColor(self.spec.accent_text), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawLine(int(cx - 3), int(cy), int(cx - 1), int(cy + 2))
+            p.drawLine(int(cx - 1), int(cy + 2), int(cx + 3), int(cy - 2))
+
+        font = QFont(self.font())
+        font.setPointSizeF(9.0)
+        font.setBold(self._selected)
+        p.setFont(font)
+        p.setPen(QColor(self.spec.text if (self._selected or self._hover_t > 0.3) else self.spec.text2))
+        p.drawText(
+            QRectF(9.0, 27.0, w - 18.0, 20.0),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            self.spec.name,
+        )
+        p.end()
+
+
 class SettingsDialog(QDialog):
     """Ventana de configuración de SwiftPlay."""
 
     normalization_changed = Signal(bool)
     config_updated = Signal()
+    theme_changed = Signal(str)
     account_changed = Signal()
     discord_token_changed = Signal()
     discord_hotkeys_changed = Signal()
@@ -262,6 +399,7 @@ class SettingsDialog(QDialog):
         self.cfg = config
         self.yt = yt_service
         self._thumb_cache = thumb_cache
+        self._avatar_connected = False
         self._discord_channels: list[tuple[str, str]] = list(discord_channels or [])
         self._discord_share_targets: list[tuple[str, str]] = list(discord_share_targets or [])
         self._pool = QThreadPool(self)
@@ -278,11 +416,22 @@ class SettingsDialog(QDialog):
         root.setSpacing(12)
 
         self.tabs = QTabWidget()
+        self._tab_fade_target: QWidget | None = None
+        self._tab_fade_anim = QVariantAnimation(self)
+        self._tab_fade_anim.setDuration(150)
+        self._tab_fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._tab_fade_anim.setStartValue(0.65)
+        self._tab_fade_anim.setEndValue(1.0)
+        self._tab_fade_anim.valueChanged.connect(self._on_tab_fade_step)
+        self._tab_fade_anim.finished.connect(self._on_tab_fade_finished)
+        self._sounds_accordion_anim: QPropertyAnimation | None = None
+
         self.tabs.addTab(self._build_playback_downloads_tab(), "Reproducción y Descargas")
         self.tabs.addTab(self._build_account_tab(), "Cuenta (DPAPI)")
         self.tabs.addTab(self._build_system_tab(), "Sistema")
         self.tabs.addTab(self._build_discord_tab(), "Discord (DPAPI)")
         self.tabs.addTab(self._build_discord_shortcuts_tab(), "Atajos Discord")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
         bottom = QHBoxLayout()
@@ -295,6 +444,7 @@ class SettingsDialog(QDialog):
 
         if self._thumb_cache is not None:
             self._thumb_cache.ready.connect(self._on_avatar_ready)
+            self._avatar_connected = True
 
         self._ram_timer = QTimer(self)
         self._ram_timer.setInterval(2000)
@@ -653,10 +803,51 @@ class SettingsDialog(QDialog):
     # --- Tab 3: Sistema ---
 
     def _build_system_tab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(12)
+
+        theme_card = QFrame()
+        theme_card.setObjectName("MediaCard")
+        tc_lay = QVBoxLayout(theme_card)
+        tc_lay.setContentsMargins(14, 10, 14, 12)
+        tc_lay.setSpacing(8)
+
+        tc_hdr = QHBoxLayout()
+        tc_title = QLabel("Apariencia del sistema (12 paletas multitono)")
+        tc_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        tc_hdr.addWidget(tc_title, 1)
+        self.theme_active_lbl = QLabel(get_theme(self.cfg.theme).name)
+        self.theme_active_lbl.setObjectName("DeckTag")
+        tc_hdr.addWidget(self.theme_active_lbl)
+        tc_lay.addLayout(tc_hdr)
+
+        tc_hint = QLabel(
+            "Cada paleta combina tonos profundos, medios y claros de su familia cromática en toda la aplicación."
+        )
+        tc_hint.setObjectName("MutedLabel")
+        tc_hint.setWordWrap(True)
+        tc_lay.addWidget(tc_hint)
+
+        sw_grid = QGridLayout()
+        sw_grid.setContentsMargins(0, 2, 0, 0)
+        sw_grid.setSpacing(8)
+        self.theme_color_btns: dict[str, _ThemeSwatchButton] = {}
+        for idx, (tkey, tspec) in enumerate(THEMES.items()):
+            btn = _ThemeSwatchButton(tspec)
+            btn.clicked.connect(lambda _c=False, k=tkey: self._on_theme_selected(k))
+            self.theme_color_btns[tkey] = btn
+            r, c = divmod(idx, 4)
+            sw_grid.addWidget(btn, r, c)
+        tc_lay.addLayout(sw_grid)
+        self._refresh_theme_swatches()
+        lay.addWidget(theme_card)
 
         self.startup_check = QCheckBox("Abrir SwiftPlay al iniciar Windows (en YouTube)")
         self.startup_check.setChecked(is_startup_enabled() or self.cfg.start_with_windows)
@@ -715,7 +906,71 @@ class SettingsDialog(QDialog):
         lay.addWidget(self.motor_log_lbl)
 
         lay.addStretch()
-        return w
+        scroll.setWidget(w)
+        return scroll
+
+    def _refresh_theme_swatches(self) -> None:
+        cur = get_theme(self.cfg.theme)
+        if hasattr(self, "theme_active_lbl"):
+            self.theme_active_lbl.setText(cur.name)
+        for tkey, btn in getattr(self, "theme_color_btns", {}).items():
+            btn.set_selected(tkey == cur.key)
+
+    def _on_theme_selected(self, theme_key: str) -> None:
+        spec = get_theme(theme_key)
+        self.cfg.theme = spec.key
+        save_config(self.cfg)
+        self._refresh_theme_swatches()
+        apply_windows_dark_titlebar(int(self.winId()), spec.base)
+        self.theme_changed.emit(spec.key)
+
+    def on_theme_applied(self, theme_key: str) -> None:
+        spec = get_theme(theme_key)
+        self._refresh_theme_swatches()
+        apply_windows_dark_titlebar(int(self.winId()), spec.base)
+        self._refresh_session_status()
+        for test_btn in getattr(self, "discord_sound_test_btns", {}).values():
+            test_btn.setIcon(render_icon("play", spec.text, 11))
+
+    def _on_tab_fade_step(self, val: object) -> None:
+        w = self._tab_fade_target
+        if w is None:
+            return
+        eff = w.graphicsEffect()
+        if isinstance(eff, QGraphicsOpacityEffect):
+            eff.setOpacity(max(0.0, min(1.0, float(val))))
+
+    def _on_tab_fade_finished(self) -> None:
+        w = self._tab_fade_target
+        self._tab_fade_target = None
+        if w is not None:
+            try:
+                w.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+
+    def _stop_tab_fade(self) -> None:
+        try:
+            self._tab_fade_anim.stop()
+        except RuntimeError:
+            pass
+        if self._tab_fade_target is not None:
+            try:
+                self._tab_fade_target.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+            self._tab_fade_target = None
+
+    def _on_tab_changed(self, _index: int) -> None:
+        w = self.tabs.currentWidget()
+        if w is None or not self.isVisible():
+            return
+        self._stop_tab_fade()
+        eff = QGraphicsOpacityEffect(w)
+        eff.setOpacity(0.65)
+        w.setGraphicsEffect(eff)
+        self._tab_fade_target = w
+        self._tab_fade_anim.start()
 
     # --- Tab 4: Discord (DPAPI) ---
 
@@ -1368,8 +1623,39 @@ class SettingsDialog(QDialog):
 
     def _toggle_discord_sounds_section(self) -> None:
         self._discord_sounds_expanded = not self._discord_sounds_expanded
-        self.discord_sounds_body.setVisible(self._discord_sounds_expanded)
         self._refresh_sounds_toggle_header()
+        body = self.discord_sounds_body
+        if self._sounds_accordion_anim is None:
+            anim = QPropertyAnimation(body, b"maximumHeight", self)
+            anim.setDuration(160)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.finished.connect(self._on_sounds_accordion_finished)
+            self._sounds_accordion_anim = anim
+        self._sounds_accordion_anim.stop()
+        if self._discord_sounds_expanded:
+            body.setVisible(True)
+            body.setMaximumHeight(16777215)
+            target_h = max(120, body.sizeHint().height())
+            body.setMaximumHeight(0)
+            self._sounds_accordion_anim.setStartValue(0)
+            self._sounds_accordion_anim.setEndValue(target_h)
+            self._sounds_accordion_anim.start()
+        else:
+            cur_h = max(0, body.height())
+            if cur_h <= 0:
+                body.setVisible(False)
+                body.setMaximumHeight(16777215)
+            else:
+                self._sounds_accordion_anim.setStartValue(cur_h)
+                self._sounds_accordion_anim.setEndValue(0)
+                self._sounds_accordion_anim.start()
+
+    def _on_sounds_accordion_finished(self) -> None:
+        if self._discord_sounds_expanded:
+            self.discord_sounds_body.setMaximumHeight(16777215)
+        else:
+            self.discord_sounds_body.setVisible(False)
+            self.discord_sounds_body.setMaximumHeight(16777215)
 
     def _on_discord_sounds_enabled_toggled(self, checked: bool) -> None:
         on = bool(checked)
@@ -1674,6 +1960,12 @@ class SettingsDialog(QDialog):
             )
 
     def _cleanup_dialog(self) -> None:
+        self._stop_tab_fade()
+        if self._sounds_accordion_anim is not None:
+            try:
+                self._sounds_accordion_anim.stop()
+            except RuntimeError:
+                pass
         if hasattr(self, "_outside_filter"):
             self._outside_filter.uninstall()
         self.hotkey_recording_changed.emit(False)
@@ -1681,7 +1973,8 @@ class SettingsDialog(QDialog):
         if self._login_cancel is not None:
             self._login_cancel.set()
         self._pool.clear()
-        if self._thumb_cache is not None:
+        if self._thumb_cache is not None and self._avatar_connected:
+            self._avatar_connected = False
             try:
                 self._thumb_cache.ready.disconnect(self._on_avatar_ready)
             except Exception:

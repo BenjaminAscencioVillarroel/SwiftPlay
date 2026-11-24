@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QMouseEvent, QPixmap, QWheelEvent
+from PySide6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPixmap, QRadialGradient, QWheelEvent
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -24,10 +25,75 @@ from swiftplay.ui.widgets import ElidedLabel, MusicRowWidget, RoundedThumbWidget
 
 
 class _MusicStageArea(QWidget):
-    """Área izquierda (portada y alrededores): clic para pausar/reanudar y rueda para volumen."""
+    """Área izquierda (portada y alrededores): clic para pausar/reanudar, rueda para volumen y brillo ambiental."""
 
     clicked = Signal()
     wheel_scrolled = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._accent_color = QColor("#CFD5DF")
+        self._active_bg = QColor("#2D3647")
+        self._is_playing = False
+        self._pulse_phase = 0.0
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(40)
+        self._pulse_timer.timeout.connect(self._on_pulse_tick)
+
+    def set_theme_colors(self, accent: str, active_bg: str) -> None:
+        self._accent_color = QColor(accent)
+        self._active_bg = QColor(active_bg)
+        self.update()
+
+    def set_playing(self, playing: bool) -> None:
+        want = bool(playing)
+        if self._is_playing == want:
+            return
+        self._is_playing = want
+        if want and self.isVisible():
+            if not self._pulse_timer.isActive():
+                self._pulse_timer.start()
+        else:
+            self._pulse_timer.stop()
+        self.update()
+
+    def _on_pulse_tick(self) -> None:
+        self._pulse_phase = (self._pulse_phase + 0.08) % (2.0 * math.pi)
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._is_playing and not self._pulse_timer.isActive():
+            self._pulse_timer.start()
+
+    def hideEvent(self, event) -> None:
+        if self._pulse_timer.isActive():
+            self._pulse_timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        w = float(self.width())
+        h = float(self.height())
+        if w <= 0 or h <= 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pulse = (0.5 + 0.5 * math.sin(self._pulse_phase)) if self._is_playing else 0.0
+        radius = min(w, h) * (0.48 + 0.05 * pulse)
+        cx = w * 0.5
+        cy = h * 0.44
+        grad = QRadialGradient(QPointF(cx, cy), radius)
+        inner = QColor(self._accent_color)
+        inner.setAlpha(int(26 + 20 * pulse))
+        mid = QColor(self._active_bg)
+        mid.setAlpha(int(35 + 20 * pulse))
+        outer = QColor(self._active_bg)
+        outer.setAlpha(0)
+        grad.setColorAt(0.0, inner)
+        grad.setColorAt(0.5, mid)
+        grad.setColorAt(1.0, outer)
+        p.fillRect(self.rect(), grad)
+        p.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -305,6 +371,7 @@ class MusicNowPlayingPanel(QWidget):
 
     def set_playing_state(self, playing: bool) -> None:
         self._is_playing = bool(playing)
+        self.stage_area.set_playing(self._is_playing)
         for row in self._queue_rows:
             row.set_playing_indicator(self._is_playing)
 
@@ -408,10 +475,12 @@ class MusicNowPlayingPanel(QWidget):
 
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
+        self.stage_area.set_theme_colors(palette.accent, palette.active_bg)
         self.back_btn.setIcon(render_icon("back", palette.text, 15))
         self.clear_btn.setIcon(render_icon("trash", palette.text2, 15))
         self.dl_btn.setIcon(render_icon("download", palette.text, 15))
         self.cover_widget.set_bg_color(palette.surface1)
+        self.cover_widget.set_accent_color(palette.accent)
         self.set_my_music_state(self._in_my_music)
         for row in self._queue_rows:
             row.update_theme(palette)

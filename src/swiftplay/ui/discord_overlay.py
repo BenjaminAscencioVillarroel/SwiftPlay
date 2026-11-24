@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import sys
 from typing import Any
 
@@ -157,6 +158,8 @@ class DiscordStatusOverlay(QWidget):
         self._in_voice: bool = False
         self._muted: bool = False
         self._deafened: bool = False
+        self._streaming: bool = False
+        self._live_pulse: float = 0.0
         self._participants: list[dict[str, Any]] = []
         self._speaking: dict[str, bool] = {}
         self._opacity_pct: int = 25
@@ -187,8 +190,31 @@ class DiscordStatusOverlay(QWidget):
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._end_preview)
 
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(55)
+        self._live_timer.timeout.connect(self._on_live_pulse_tick)
+
         self.set_opacity_percent(self._opacity_pct)
         self._apply_position()
+
+    def _on_live_pulse_tick(self) -> None:
+        self._live_pulse = (self._live_pulse + 0.16) % (2.0 * math.pi)
+        if self.isVisible():
+            self.update()
+
+    def _sync_live_timer(self) -> None:
+        want = self.isVisible() and (
+            self._streaming
+            or any(
+                bool(p.get("screen_share") or p.get("is_streaming"))
+                for p in self._participants
+            )
+        )
+        if want:
+            if not self._live_timer.isActive():
+                self._live_timer.start()
+        elif self._live_timer.isActive():
+            self._live_timer.stop()
 
     def _on_avatar_ready(self, _url: str, _pix: QPixmap) -> None:
         if self.isVisible() and self._effective_overlay_mode() == "full":
@@ -294,6 +320,12 @@ class DiscordStatusOverlay(QWidget):
         super().showEvent(event)
         self._apply_position()
         self._apply_win32_flags(force_topmost=True)
+        self._sync_live_timer()
+
+    def hideEvent(self, event: Any) -> None:
+        if self._live_timer.isActive():
+            self._live_timer.stop()
+        super().hideEvent(event)
 
     def set_edit_mode(self, enabled: bool) -> None:
         want = bool(enabled)
@@ -401,14 +433,17 @@ class DiscordStatusOverlay(QWidget):
         self._opacity_pct = max(10, min(100, int(opacity_pct)))
         self.setWindowOpacity(self._opacity_pct / 100.0)
 
-    def _resolve_mode(self, muted: bool, deafened: bool) -> str:
+    def _resolve_mode(self, muted: bool, deafened: bool, streaming: bool = False) -> str:
+        base = ""
         if muted and deafened:
-            return "both"
-        if deafened:
-            return "deafened"
-        if muted:
-            return "muted"
-        return ""
+            base = "both"
+        elif deafened:
+            base = "deafened"
+        elif muted:
+            base = "muted"
+        if streaming:
+            return f"{base}_streaming" if base else "streaming"
+        return base
 
     def _effective_overlay_mode(self) -> str:
         if self._previewing and self._preview_mode_override in ("status", "full"):
@@ -447,12 +482,20 @@ class DiscordStatusOverlay(QWidget):
             ], 0
         return [], 0
 
+    def _is_part_streaming(self, part: dict[str, Any]) -> bool:
+        if str(part.get("id") or "").startswith("__prev_"):
+            return bool(part.get("_preview_streaming", False))
+        if bool(part.get("is_self", False)):
+            return self._streaming
+        return bool(part.get("screen_share") or part.get("is_streaming"))
+
     def _compute_full_width(self, participants: list[dict[str, Any]]) -> int:
         font = QFont(self.font())
         font.setPointSizeF(9.5)
         font.setBold(True)
         fm = QFontMetrics(font)
         max_row_w = 108
+        any_streaming = False
         for part in participants:
             is_self = bool(part.get("is_self", False))
             is_prev = str(part.get("id") or "").startswith("__prev_")
@@ -466,13 +509,18 @@ class DiscordStatusOverlay(QWidget):
                 if is_prev
                 else (self._deafened if is_self else bool(part.get("deafened", False)))
             )
+            p_streaming = self._is_part_streaming(part)
+            if p_streaming:
+                any_streaming = True
             disp = format_overlay_name(str(part.get("name") or "Usuario"), _MAX_NAME_CHARS)
             text_w = min(96, fm.horizontalAdvance(disp))
             icons_w = (15 if p_muted else 0) + (15 if p_deaf else 0) + (4 if (p_muted or p_deaf) else 0)
-            row_w = 31 + 7 + text_w + icons_w + 9
+            stream_w = 40 if p_streaming else 0
+            row_w = 31 + 7 + text_w + icons_w + stream_w + 9
             if row_w > max_row_w:
                 max_row_w = row_w
-        return max(108, min(_OVERLAY_MAX_W, max_row_w))
+        cap_w = (_OVERLAY_MAX_W + 40) if any_streaming else _OVERLAY_MAX_W
+        return max(108, min(cap_w, max_row_w))
 
     def _apply_size_for_state(
         self,
@@ -481,7 +529,16 @@ class DiscordStatusOverlay(QWidget):
         extra_count: int,
     ) -> None:
         if not participants:
-            target_w = 86 if status_mode == "both" else 46
+            if status_mode == "streaming":
+                target_w = 104
+            elif status_mode in ("muted_streaming", "deafened_streaming"):
+                target_w = 142
+            elif status_mode == "both_streaming":
+                target_w = 182
+            elif status_mode == "both":
+                target_w = 86
+            else:
+                target_w = 46
             target_h = 46
         else:
             target_w = self._compute_full_width(participants)
@@ -494,12 +551,15 @@ class DiscordStatusOverlay(QWidget):
     def _sync_visibility(self) -> None:
         eff_ov = self._effective_overlay_mode()
         parts, extra = self._visible_participants()
-        # En "Overlay total" el estado se muestra inline en cada fila; no duplicar el cuadro aparte.
-        status_mode = "" if eff_ov == "full" else self._resolve_mode(self._muted, self._deafened)
+        # En "Overlay total" el estado se muestra inline en cada fila; solo mostrar badge si no hay filas activas y estás transmitiendo.
+        if eff_ov == "full" and parts:
+            status_mode = ""
+        else:
+            status_mode = self._resolve_mode(self._muted, self._deafened, self._streaming)
 
         if self._previewing or self._edit_mode:
             if eff_ov != "full" and not status_mode:
-                status_mode = "both"
+                status_mode = "both_streaming" if self._streaming else "both"
             self._mode = status_mode
             self._apply_size_for_state(status_mode, parts, extra)
             self.set_opacity_percent(max(85, self._opacity_pct) if self._edit_mode else self._opacity_pct)
@@ -509,10 +569,11 @@ class DiscordStatusOverlay(QWidget):
                 self._apply_position()
                 self._apply_win32_flags(force_topmost=True)
                 self.update()
+            self._sync_live_timer()
             return
 
-        has_content = bool(parts) if eff_ov == "full" else bool(status_mode)
-        if eff_ov != "off" and self._enabled and self._active and has_content:
+        has_content = bool(parts) or bool(status_mode)
+        if eff_ov != "off" and self._enabled and (self._active or self._streaming) and has_content:
             self._mode = status_mode
             self._apply_size_for_state(status_mode, parts, extra)
             self.set_opacity_percent(self._opacity_pct)
@@ -522,10 +583,12 @@ class DiscordStatusOverlay(QWidget):
                 self._apply_position()
                 self._apply_win32_flags(force_topmost=True)
                 self.update()
+            self._sync_live_timer()
         else:
             self._mode = ""
             if self.isVisible():
                 self.hide()
+            self._sync_live_timer()
 
     def update_state(
         self,
@@ -539,6 +602,7 @@ class DiscordStatusOverlay(QWidget):
         opacity_pct: int,
         participants: list[dict[str, Any]] | None = None,
         speaking: dict[str, bool] | None = None,
+        streaming: bool | None = None,
     ) -> None:
         if overlay_mode is not None:
             ov = str(overlay_mode).strip().lower()
@@ -555,6 +619,8 @@ class DiscordStatusOverlay(QWidget):
             self._in_voice = bool(in_voice)
         self._muted = bool(muted)
         self._deafened = bool(deafened)
+        if streaming is not None:
+            self._streaming = bool(streaming)
         if participants is not None:
             self._participants = list(participants)
         if speaking is not None:
@@ -591,6 +657,7 @@ class DiscordStatusOverlay(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self._preview_timer.stop()
+        self._live_timer.stop()
         self._previewing = False
         self._preview_mode_override = None
         self._edit_mode = False
@@ -607,16 +674,80 @@ class DiscordStatusOverlay(QWidget):
                 pass
         super().closeEvent(event)
 
+    def _paint_live_pill(self, painter: QPainter, x: float, y: float, w: float, h: float, text: str = "EN VIVO") -> None:
+        pulse = 0.5 + 0.5 * math.sin(self._live_pulse)
+        pill_bg = QColor(220, 38, 38, 225)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(pill_bg)
+        painter.drawRoundedRect(QRectF(x, y, w, h), h / 2.0, h / 2.0)
+
+        dot_r = 3.0 if h >= 20.0 else 2.3
+        cx = x + (8.5 if h >= 20.0 else 6.5)
+        cy = y + h / 2.0
+        glow = QColor(255, 255, 255, int(90 + 130 * pulse))
+        painter.setBrush(glow)
+        painter.drawEllipse(QRectF(cx - dot_r - 1.3, cy - dot_r - 1.3, (dot_r + 1.3) * 2.0, (dot_r + 1.3) * 2.0))
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawEllipse(QRectF(cx - dot_r, cy - dot_r, dot_r * 2.0, dot_r * 2.0))
+
+        txt_font = QFont(painter.font())
+        txt_font.setPointSizeF(8.5 if h >= 20.0 else 7.2)
+        txt_font.setBold(True)
+        painter.setFont(txt_font)
+        painter.setPen(QColor("#FFFFFF"))
+        txt_x = int(round(cx + dot_r + 3.0))
+        painter.drawText(
+            QRect(txt_x, int(round(y)), max(10, int(round(x + w - txt_x - 3))), int(round(h))),
+            Qt.AlignmentFlag.AlignCenter,
+            text,
+        )
+
     def _paint_status_badge(self, painter: QPainter, badge_w: int, badge_h: int, mode: str) -> None:
+        has_stream = "streaming" in mode
+        base_mode = mode.replace("_streaming", "") if has_stream else mode
+        if base_mode == "streaming":
+            base_mode = ""
+
         rect = QRectF(1.5, 1.5, float(badge_w) - 3.0, float(badge_h) - 3.0)
         bg = QColor(self._palette.surface2)
-        border = QColor(self._palette.accent)
+        border = QColor("#EF4444" if has_stream else self._palette.accent)
 
         painter.setBrush(bg)
         painter.setPen(QPen(border, 1.8))
         painter.drawRoundedRect(rect, 10.0, 10.0)
 
-        if mode == "both":
+        if has_stream and not base_mode:
+            self._paint_live_pill(painter, 10.0, (badge_h - 24.0) / 2.0, float(badge_w - 20), 24.0, "EN VIVO")
+            return
+
+        if has_stream and base_mode:
+            status_w = 84 if base_mode == "both" else 44
+            if base_mode == "both":
+                pm_mic = render_icon("mic_off", self._palette.text, 20).pixmap(QSize(20, 20))
+                pm_deaf = render_icon("headphones_off", self._palette.text, 20).pixmap(QSize(20, 20))
+                py = (badge_h - pm_mic.height()) // 2
+                painter.drawPixmap(12, py, pm_mic)
+                painter.setPen(QPen(QColor(self._palette.border_bright), 1.0))
+                painter.drawLine(42, 12, 42, badge_h - 12)
+                painter.drawPixmap(50, py, pm_deaf)
+            else:
+                ico_name = "headphones_off" if base_mode == "deafened" else "mic_off"
+                pm = render_icon(ico_name, self._palette.text, 21).pixmap(QSize(21, 21))
+                painter.drawPixmap((status_w - pm.width()) // 2, (badge_h - pm.height()) // 2, pm)
+
+            painter.setPen(QPen(QColor(self._palette.border_bright), 1.0))
+            painter.drawLine(status_w, 11, status_w, badge_h - 11)
+            self._paint_live_pill(
+                painter,
+                float(status_w + 8),
+                (badge_h - 24.0) / 2.0,
+                float(badge_w - status_w - 16),
+                24.0,
+                "EN VIVO",
+            )
+            return
+
+        if base_mode == "both":
             pm_mic = render_icon("mic_off", self._palette.text, 21).pixmap(QSize(21, 21))
             pm_deaf = render_icon("headphones_off", self._palette.text, 21).pixmap(
                 QSize(21, 21)
@@ -627,7 +758,7 @@ class DiscordStatusOverlay(QWidget):
             painter.drawLine(badge_w // 2, 11, badge_w // 2, badge_h - 11)
             painter.drawPixmap(badge_w - 14 - pm_deaf.width(), py, pm_deaf)
         else:
-            ico_name = "headphones_off" if mode == "deafened" else "mic_off"
+            ico_name = "headphones_off" if base_mode == "deafened" else "mic_off"
             pm = render_icon(ico_name, self._palette.text, 22).pixmap(QSize(22, 22))
             px = (badge_w - pm.width()) // 2
             py = (badge_h - pm.height()) // 2
@@ -674,6 +805,7 @@ class DiscordStatusOverlay(QWidget):
                 if is_prev
                 else (self._deafened if is_self else bool(part.get("deafened", False)))
             )
+            p_streaming = self._is_part_streaming(part)
             disp_name = format_overlay_name(str(part.get("name") or "Usuario"), _MAX_NAME_CHARS)
             av_url = str(part.get("avatar_url") or "")
 
@@ -687,7 +819,7 @@ class DiscordStatusOverlay(QWidget):
             if av_pix is not None and not av_pix.isNull():
                 painter.drawPixmap(av_x, av_y, av_pix)
             else:
-                painter.setBrush(QColor("#28354A" if is_self else "#333C4D"))
+                painter.setBrush(QColor(self._palette.active_bg if is_self else self._palette.surface2))
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawEllipse(av_x, av_y, _AVATAR_SZ, _AVATAR_SZ)
                 init_ch = (disp_name.strip()[:1] or "?").upper()
@@ -695,7 +827,7 @@ class DiscordStatusOverlay(QWidget):
                 init_font.setPointSizeF(9.0)
                 init_font.setBold(True)
                 painter.setFont(init_font)
-                painter.setPen(QColor("#F1F3F6"))
+                painter.setPen(QColor(self._palette.text))
                 painter.drawText(
                     QRect(av_x, av_y, _AVATAR_SZ, _AVATAR_SZ),
                     Qt.AlignmentFlag.AlignCenter,
@@ -719,14 +851,19 @@ class DiscordStatusOverlay(QWidget):
             fm = QFontMetrics(name_font)
             text_w = min(96, fm.horizontalAdvance(disp_name))
             icons_w = (15 if p_muted else 0) + (15 if p_deaf else 0) + (4 if (p_muted or p_deaf) else 0)
+            stream_w = 40 if p_streaming else 0
 
             pill_x = 31
             pill_y = row_y + 3
             pill_h = 22
-            pill_w = min(self.width() - pill_x - 2, 7 + text_w + icons_w + 7)
+            pill_w = min(self.width() - pill_x - 2, 7 + text_w + icons_w + stream_w + 7)
             pill_rect = QRectF(float(pill_x), float(pill_y), float(pill_w), float(pill_h))
-            painter.setBrush(QColor(16, 30, 24, 115) if speaking else QColor(12, 15, 22, 95))
-            if speaking:
+            pill_bg = QColor(self._palette.surface1)
+            pill_bg.setAlpha(155)
+            painter.setBrush(QColor(16, 30, 24, 130) if speaking else pill_bg)
+            if p_streaming and not speaking:
+                painter.setPen(QPen(QColor(239, 68, 68, 135), 1.0))
+            elif speaking:
                 painter.setPen(QPen(QColor(74, 222, 128, 120), 1.0))
             else:
                 painter.setPen(Qt.PenStyle.NoPen)
@@ -739,7 +876,7 @@ class DiscordStatusOverlay(QWidget):
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 disp_name,
             )
-            painter.setPen(QColor("#FFFFFF" if speaking else "#E8EDF5"))
+            painter.setPen(QColor("#FFFFFF" if speaking else self._palette.text))
             painter.drawText(
                 text_rect,
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -755,6 +892,10 @@ class DiscordStatusOverlay(QWidget):
             if p_deaf:
                 pm_d = render_icon("headphones_off", "#F87171", 13).pixmap(QSize(13, 13))
                 painter.drawPixmap(icon_x, icon_y, pm_d)
+                icon_x += 15
+            if p_streaming:
+                badge_x = float(icon_x + (2 if (p_muted or p_deaf) else 0))
+                self._paint_live_pill(painter, badge_x, float(pill_y + 3), 36.0, 16.0, "LIVE")
 
         if extra > 0:
             extra_y = 2 + len(parts) * _ROW_STEP

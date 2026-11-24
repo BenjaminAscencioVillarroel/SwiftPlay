@@ -32,6 +32,8 @@ SOUND_EVENTS: tuple[tuple[str, str, int], ...] = (
     ("self_leave", "Salir del canal de voz", 60),
     ("user_join", "Alguien entra al canal", 55),
     ("user_leave", "Alguien sale del canal", 55),
+    ("stream_start", "Iniciar transmisión", 65),
+    ("stream_stop", "Finalizar transmisión", 60),
 )
 DEFAULT_SOUND_VOLUMES: dict[str, int] = {k: v for k, _, v in SOUND_EVENTS}
 
@@ -104,6 +106,27 @@ _SOUND_SPECS: dict[str, dict[str, _PackSpec]] = {
         "soft": (1900.0, ((440.0, 0.0, 0.055, 0.24, 0.10), (330.0, 0.042, 0.10, 0.24, 0.06))),
         "minimal": (1450.0, ((392.0, 0.0, 0.045, 0.18, 0.0), (294.0, 0.035, 0.08, 0.18, 0.0))),
     },
+    "stream_start": {
+        "soft": (
+            2500.0,
+            (
+                (440.0, 0.0, 0.075, 0.24, 0.14),
+                (587.0, 0.055, 0.09, 0.27, 0.14),
+                (784.0, 0.115, 0.19, 0.30, 0.12),
+            ),
+        ),
+        "minimal": (1750.0, ((494.0, 0.0, 0.06, 0.18, 0.0), (740.0, 0.048, 0.14, 0.22, 0.0))),
+    },
+    "stream_stop": {
+        "soft": (
+            2000.0,
+            (
+                (659.0, 0.0, 0.075, 0.24, 0.10),
+                (440.0, 0.055, 0.15, 0.24, 0.08),
+            ),
+        ),
+        "minimal": (1500.0, ((587.0, 0.0, 0.055, 0.18, 0.0), (392.0, 0.045, 0.12, 0.18, 0.0))),
+    },
 }
 
 _SAMPLE_RATE = 24000
@@ -126,7 +149,7 @@ def _get_winmm_playsound() -> Any:
     return _winmm_play_fn
 
 
-@functools.lru_cache(maxsize=24)
+@functools.lru_cache(maxsize=32)
 def synthesize_sound_wav(event_id: str, pack: str = "soft", volume_pct: int = 60) -> bytes:
     """Genera un clip WAV PCM mono 16-bit en memoria con envolvente suave y filtro pasa-bajos."""
     vol = max(0, min(100, int(volume_pct)))

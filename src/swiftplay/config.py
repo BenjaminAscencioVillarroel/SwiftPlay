@@ -12,10 +12,11 @@ from swiftplay.sound_effects import (
     SOUND_EVENTS,
     VALID_SOUND_PACKS,
 )
+from swiftplay.themes import THEMES
 
 VALID_SPEEDS: tuple[float, ...] = (1.0, 1.5, 2.0, 2.5)
 VALID_QUALITIES: tuple[str, ...] = ("360p", "480p", "720p", "1080p")
-VALID_THEMES: tuple[str, ...] = ("matte_silver",)
+VALID_THEMES: tuple[str, ...] = tuple(THEMES.keys())
 VALID_DISCORD_NS: tuple[str, ...] = ("off", "webrtc", "ai", "ai_max")
 VALID_DISCORD_OVERLAY_MODES: tuple[str, ...] = ("off", "status", "full")
 VALID_DISCORD_SOUND_PACKS: tuple[str, ...] = VALID_SOUND_PACKS
@@ -60,7 +61,8 @@ def validate_quality(value: str) -> str:
 
 
 def validate_theme(value: str) -> str:
-    return value if value in VALID_THEMES else "matte_silver"
+    key = str(value or "").strip().lower()
+    return key if key in VALID_THEMES else "matte_silver"
 
 
 @dataclass

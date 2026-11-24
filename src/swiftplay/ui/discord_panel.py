@@ -698,7 +698,7 @@ class _ChatMessageRow(QFrame):
             hdr_row = QHBoxLayout()
             hdr_row.setContentsMargins(0, 0, 0, 0)
             hdr_row.setSpacing(6)
-            name_color = "#CFD5DF" if is_self else "#F1F3F6"
+            name_color = palette.accent if is_self else palette.text
             name_lbl = QLabel(raw_author, self)
             name_lbl.setStyleSheet(
                 f"background: transparent; border: none; color: {name_color}; "
@@ -714,7 +714,7 @@ class _ChatMessageRow(QFrame):
             if ts_txt:
                 ts_lbl = QLabel(ts_txt, self)
                 ts_lbl.setStyleSheet(
-                    "background: transparent; border: none; color: #9299A8; font-size: 11px;"
+                    f"background: transparent; border: none; color: {palette.text2}; font-size: 11px;"
                 )
                 hdr_row.addWidget(ts_lbl)
 
@@ -818,14 +818,14 @@ class _ChatMessageRow(QFrame):
                 cap_row.setSpacing(6)
                 cap_lbl = QLabel(meta_txt, self)
                 cap_lbl.setStyleSheet(
-                    "background: transparent; border: none; color: #9299A8; font-size: 11px;"
+                    f"background: transparent; border: none; color: {palette.text2}; font-size: 11px;"
                 )
                 cap_row.addWidget(cap_lbl)
                 dl_btn = QPushButton("Guardar", self)
                 dl_btn.setFlat(True)
                 dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 dl_btn.setStyleSheet(
-                    "QPushButton { background: transparent; border: none; color: #CFD5DF; font-size: 11px; padding: 0 4px; }"
+                    f"QPushButton {{ background: transparent; border: none; color: {palette.accent}; font-size: 11px; padding: 0 4px; }}"
                     "QPushButton:hover { text-decoration: underline; }"
                 )
                 dl_btn.clicked.connect(lambda _c=False, ref=att_copy: self.save_attachment_requested.emit(ref))
@@ -835,14 +835,14 @@ class _ChatMessageRow(QFrame):
             else:
                 file_card = QFrame(self)
                 file_card.setStyleSheet(
-                    "QFrame { background-color: #14161A; border: 1px solid #272B33; border-radius: 8px; }"
+                    f"QFrame {{ background-color: {palette.surface2}; border: 1px solid {palette.border}; border-radius: 8px; }}"
                 )
                 fl = QHBoxLayout(file_card)
                 fl.setContentsMargins(10, 5, 10, 5)
                 fl.setSpacing(8)
                 fl_lbl = QLabel(f"📎 {meta_txt}", file_card)
                 fl_lbl.setStyleSheet(
-                    "background: transparent; border: none; color: #E5E9F0; font-size: 12px;"
+                    f"background: transparent; border: none; color: {palette.text}; font-size: 12px;"
                 )
                 fl.addWidget(fl_lbl)
                 if raw_url:
@@ -850,7 +850,7 @@ class _ChatMessageRow(QFrame):
                     dl_btn.setFlat(True)
                     dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                     dl_btn.setStyleSheet(
-                        "QPushButton { background: transparent; border: none; color: #CFD5DF; font-size: 11.5px; padding: 0 4px; }"
+                        f"QPushButton {{ background: transparent; border: none; color: {palette.accent}; font-size: 11.5px; padding: 0 4px; }}"
                         "QPushButton:hover { text-decoration: underline; }"
                     )
                     dl_btn.clicked.connect(
@@ -1557,7 +1557,7 @@ def exec_user_dm_menu(
 
 
 class _AvatarCircleWidget(QWidget):
-    """Avatar circular con foto de perfil real (o inicial fallback) y anillo de habla."""
+    """Avatar circular con foto de perfil real (o inicial fallback) y anillo animado de habla."""
 
     def __init__(
         self,
@@ -1572,14 +1572,58 @@ class _AvatarCircleWidget(QWidget):
         self._name = name or "?"
         self._palette = palette
         self._speaking = bool(speaking)
+        self._speak_t = 1.0 if self._speaking else 0.0
+        self._speak_anim: QVariantAnimation | None = None
+        self._pulse_phase = 0.0
+        self._pulse_timer: QTimer | None = None
         self._bg_hex = _avatar_tint_for(self._name)
         self._pixmap: QPixmap | None = None
         self.setFixedSize(size_px, size_px)
+
+    def _on_speak_val(self, val: object) -> None:
+        self._speak_t = float(val)
+        self.update()
+
+    def _on_pulse_tick(self) -> None:
+        self._pulse_phase = (self._pulse_phase + 0.16) % (2.0 * math.pi)
+        self.update()
+
+    def _sync_pulse_timer(self) -> None:
+        if self._speaking and self.isVisible():
+            if self._pulse_timer is None:
+                timer = QTimer(self)
+                timer.setInterval(50)
+                timer.timeout.connect(self._on_pulse_tick)
+                self._pulse_timer = timer
+            if not self._pulse_timer.isActive():
+                self._pulse_timer.start()
+        elif self._pulse_timer is not None and self._pulse_timer.isActive():
+            self._pulse_timer.stop()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._sync_pulse_timer()
+
+    def hideEvent(self, event: Any) -> None:
+        if self._pulse_timer is not None and self._pulse_timer.isActive():
+            self._pulse_timer.stop()
+        super().hideEvent(event)
 
     def set_speaking(self, speaking: bool) -> None:
         val = bool(speaking)
         if val != self._speaking:
             self._speaking = val
+            if self._speak_anim is None:
+                anim = QVariantAnimation(self)
+                anim.setDuration(180)
+                anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+                anim.valueChanged.connect(self._on_speak_val)
+                self._speak_anim = anim
+            self._speak_anim.stop()
+            self._speak_anim.setStartValue(self._speak_t)
+            self._speak_anim.setEndValue(1.0 if val else 0.0)
+            self._speak_anim.start()
+            self._sync_pulse_timer()
             self.update()
 
     def set_pixmap(self, pix: QPixmap | None) -> None:
@@ -1600,7 +1644,21 @@ class _AvatarCircleWidget(QWidget):
         ring_rect = QRectF(3.0, 3.0, w - 6.0, h - 6.0)
         inner_rect = QRectF(7.0, 7.0, w - 14.0, h - 14.0)
 
-        ring_color = QColor("#4ADE80") if self._speaking else QColor(self._palette.border_bright)
+        t = max(0.0, min(1.0, self._speak_t))
+        if t > 0.01:
+            pulse = 0.5 + 0.5 * math.sin(self._pulse_phase)
+            halo = QColor(74, 222, 128, int((48 + 46 * pulse) * t))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(halo, 4.5 + 1.5 * pulse))
+            painter.drawEllipse(QRectF(1.5, 1.5, w - 3.0, h - 3.0))
+
+        base_c = QColor(self._palette.border_bright)
+        speak_c = QColor("#4ADE80")
+        ring_color = QColor(
+            int(base_c.red() + (speak_c.red() - base_c.red()) * t),
+            int(base_c.green() + (speak_c.green() - base_c.green()) * t),
+            int(base_c.blue() + (speak_c.blue() - base_c.blue()) * t),
+        )
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(ring_color, 3.0))
         painter.drawEllipse(ring_rect)
@@ -1660,6 +1718,7 @@ class _ParticipantCard(QFrame):
         self._thumb_cache = thumb_cache
         self._avatar_url = str(part.get("avatar_url") or "")
         self._thumb_connected = False
+        self._is_self_streaming = bool(self._is_self and part.get("is_streaming", False))
         raw_ss = part.get("screen_share")
         self._screen_share: dict[str, Any] | None = (
             dict(raw_ss)
@@ -1674,8 +1733,8 @@ class _ParticipantCard(QFrame):
         self._card_bg_hex, self._card_border_hex = _default_card_tint(name)
 
         self.setObjectName("DiscordParticipantCard")
-        self.setMinimumWidth(204 if self._screen_share is not None else 164)
-        self.setMinimumHeight(202 if self._screen_share is not None else 142)
+        self.setMinimumWidth(204 if (self._screen_share is not None or self._is_self_streaming) else 164)
+        self.setMinimumHeight(202 if (self._screen_share is not None or self._is_self_streaming) else 142)
         if not self._is_self:
             self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.customContextMenuRequested.connect(self._on_context_menu)
@@ -1754,6 +1813,17 @@ class _ParticipantCard(QFrame):
                 lambda _c=False, p=dict(self._screen_share): self.watch_share_requested.emit(p)
             )
             ss_row.addWidget(watch_btn)
+            ss_row.addStretch(1)
+            lay.addLayout(ss_row)
+        elif self._is_self_streaming:
+            ss_row = QHBoxLayout()
+            ss_row.setSpacing(6)
+            ss_row.addStretch(1)
+            live_tag = QLabel("● EN VIVO")
+            live_tag.setObjectName("ScreenShareLiveBadge")
+            live_tag.setFixedHeight(22)
+            live_tag.setToolTip("Estás transmitiendo pantalla en vivo")
+            ss_row.addWidget(live_tag)
             ss_row.addStretch(1)
             lay.addLayout(ss_row)
 
@@ -2226,6 +2296,7 @@ class DiscordVoicePanel(QWidget):
     sound_event_requested = Signal(str)
     toast_requested = Signal(str)
     screen_share_announced = Signal(str, str, str)  # kind, target_id, message_id
+    screen_share_active_changed = Signal(bool)
     screen_share_ram_updated = Signal(float, float)  # ws_mb, priv_mb
     screen_viewer_fullscreen_changed = Signal(bool)
     screen_viewer_volume_hud_requested = Signal(int)
@@ -3793,6 +3864,12 @@ class DiscordVoicePanel(QWidget):
             self.remote_dismiss_btn,
         ):
             btn.setIcon(close_ico)
+        self.members_list.setStyleSheet(
+            f"QListWidget {{ background: transparent; border: none; outline: none; }}"
+            f"QListWidget::item {{ padding: 5px 6px; border-radius: 7px; border: 1px solid transparent; }}"
+            f"QListWidget::item:selected {{ background-color: {p.active_bg}; color: {p.text}; "
+            f"border: 1px solid {p.accent}; font-weight: 700; }}"
+        )
         self._sync_screen_share_icons()
         self._update_info_pill()
         self._refresh_mute_deaf_buttons()
@@ -6061,11 +6138,16 @@ class DiscordVoicePanel(QWidget):
         super().resizeEvent(event)
         self._relayout_participant_cards_if_needed()
 
+    @property
+    def is_screen_sharing(self) -> bool:
+        return self._screen_share_state == "sharing"
+
     def _participants_signature(self) -> Any:
         in_voice = bool(self._voice_state.get("in_voice", False))
         parts = self._voice_state.get("participants") or []
         return (
             in_voice,
+            self._screen_share_state == "sharing",
             tuple(
                 (
                     str(p.get("id") or ""),
@@ -6129,6 +6211,8 @@ class DiscordVoicePanel(QWidget):
             speaking = bool(self._speaking.get(key, False))
             vol = self._user_volumes.get(uid, 100)
             part_with_status = dict(part)
+            if is_self and self._screen_share_state == "sharing":
+                part_with_status["is_streaming"] = True
             if uid in self._user_statuses:
                 part_with_status["status"] = self._user_statuses[uid]
             if not is_self and not part_with_status.get("screen_share") and uid in self._remote_screen_shares:
@@ -6502,6 +6586,7 @@ class DiscordVoicePanel(QWidget):
         self.screen_share_ram_updated.emit(self._screen_share_ws_mb, self._screen_share_priv_mb)
 
     def _on_screen_share_state_changed(self, state: str, data: dict[str, Any]) -> None:
+        prev_state = self._screen_share_state
         self._screen_share_state = state
         self.screen_share_btn.setEnabled(True)
         self.share_settings_btn.setEnabled(True)
@@ -6525,6 +6610,10 @@ class DiscordVoicePanel(QWidget):
             self._refresh_share_live_strip()
             self.share_live_strip.setVisible(True)
             self._set_pane_visible("voice", True)
+            if not is_reconf and prev_state != "sharing":
+                self.sound_event_requested.emit("stream_start")
+            self.screen_share_active_changed.emit(True)
+            self._render_participants()
             if self.svc.is_connected and data.get("watch_url"):
                 self.svc.set_screen_share_presence(
                     {
@@ -6613,6 +6702,10 @@ class DiscordVoicePanel(QWidget):
         if self._screen_viewer_active and self._screen_viewer_is_local_preview:
             self._close_screen_share_viewer()
         self._mark_announced_share_ended()
+        if prev_state == "sharing":
+            self.sound_event_requested.emit("stream_stop")
+        self.screen_share_active_changed.emit(False)
+        self._render_participants()
         self.screen_share_ram_updated.emit(0.0, 0.0)
 
     def _on_screen_share_announced(

@@ -328,6 +328,22 @@ def test_storage_config_themes() -> None:
     for hx in expected_tokens:
         assert hx in qss, f"Falta color {hx} en tema matte_silver"
 
+    assert len(THEMES) >= 10, f"Se esperaban al menos 10 temas multitono, hay {len(THEMES)}"
+    for tkey, pal in THEMES.items():
+        distinct_shades = {pal.base, pal.surface1, pal.surface2, pal.active_bg, pal.accent}
+        assert len(distinct_shades) == 5, f"Tema {tkey} debe combinar tonos oscuros, medios y claros distintos"
+        tqss = build_stylesheet(tkey)
+        assert tqss.count("{") == tqss.count("}"), f"QSS desbalanceado en tema {tkey}"
+        for tok in (pal.base, pal.surface2, pal.active_bg, pal.accent):
+            assert tok in tqss, f"Falta tono {tok} en QSS de {tkey}"
+
+    with tempfile.TemporaryDirectory() as tmp_th:
+        th_cfg_p = Path(tmp_th) / "theme_cfg.json"
+        th_cfg = AppConfig(theme="rose_sakura")
+        save_config(th_cfg, th_cfg_p)
+        assert load_config(th_cfg_p).theme == "rose_sakura"
+        assert AppConfig(theme="tema_inexistente").theme == "matte_silver"
+
     mock_it_data = {
         "contents": [
             {
@@ -1161,6 +1177,7 @@ def test_gui_and_libmpv_smoke(
         orig_sound_vols = dict(win.cfg.discord_sound_volumes)
         orig_notify_en = win.cfg.discord_notify_chat_enabled
         orig_notify_color = win.cfg.discord_notify_color
+        orig_theme = win.cfg.theme
         orig_notify_chs = list(win.cfg.discord_notify_channels)
         orig_hidden_chs = list(win.cfg.discord_hidden_channels)
         orig_hidden_names = dict(win.cfg.discord_hidden_channel_names)
@@ -1940,6 +1957,57 @@ def test_gui_and_libmpv_smoke(
             app.processEvents()
             assert win.discord_overlay.isHidden()
 
+            # Overlay indicando transmisión en vivo (solo, muteado y en modo overlay total)
+            win.discord_overlay.update_state(
+                overlay_mode="status",
+                active=False,
+                in_voice=False,
+                muted=False,
+                deafened=False,
+                opacity_pct=50,
+                streaming=True,
+            )
+            app.processEvents()
+            assert not win.discord_overlay.isHidden() and win.discord_overlay._mode == "streaming"
+            assert win.discord_overlay.width() >= 96
+            win.discord_overlay.update_state(
+                overlay_mode="status",
+                active=True,
+                in_voice=True,
+                muted=True,
+                deafened=False,
+                opacity_pct=50,
+                streaming=True,
+            )
+            app.processEvents()
+            assert win.discord_overlay._mode == "muted_streaming" and win.discord_overlay.width() >= 130
+            win.discord_overlay.update_state(
+                overlay_mode="full",
+                active=True,
+                in_voice=True,
+                muted=False,
+                deafened=False,
+                opacity_pct=50,
+                participants=[
+                    {"id": "1", "name": "TuBot", "is_self": True, "muted": False, "deafened": False, "avatar_url": ""},
+                ],
+                streaming=True,
+            )
+            app.processEvents()
+            assert not win.discord_overlay.isHidden() and win.discord_overlay._mode == ""
+            assert win.discord_overlay.width() >= 120
+            win.discord_overlay.update_state(
+                overlay_mode="off",
+                active=False,
+                in_voice=False,
+                muted=False,
+                deafened=False,
+                opacity_pct=50,
+                streaming=False,
+            )
+            app.processEvents()
+            assert win.discord_overlay.isHidden()
+
             # Cambio rápido de chats sin desincronizar ni sobreescribir el placeholder de DM
             dp._active_chat_kind = "dm"
             dp._active_chat_id = "u_fast"
@@ -2030,8 +2098,36 @@ def test_gui_and_libmpv_smoke(
                 f"Historial de sonidos inesperado: {win.sound_fx._played_history!r}"
             )
 
-            # Verificar SettingsDialog (combo overlay 3 modos, paleta 7 colores y acordeón 9 sonidos)
+            # Sonidos al iniciar / reconfigurar / finalizar transmisión de pantalla
+            win.sound_fx._played_history.clear()
+            dp._screen_share_state = "idle"
+            dp._on_screen_share_state_changed(
+                "sharing",
+                {"watch_url": "https://example.com/watch", "quality": "720p", "fps": 30, "has_audio": True},
+            )
+            dp._on_screen_share_state_changed(
+                "sharing",
+                {"watch_url": "https://example.com/watch", "quality": "1080p", "fps": 60, "has_audio": True, "reconfigured": True},
+            )
+            dp._on_screen_share_state_changed("idle", {})
+            assert win.sound_fx._played_history == ["stream_start", "stream_stop"], (
+                f"Sonidos de transmisión inesperados: {win.sound_fx._played_history!r}"
+            )
+            assert win._discord_streaming is False
+
+            # Verificar SettingsDialog (12 temas multitono, combo overlay 3 modos, paleta 7 colores y acordeón 11 sonidos)
+            from swiftplay.sound_effects import SOUND_EVENTS
+
             sd_check = SettingsDialog(win.cfg, win.yt, parent=win)
+            sd_check.theme_changed.connect(
+                lambda key, d=sd_check: (win.apply_theme(key), d.on_theme_applied(key))
+            )
+            assert len(sd_check.theme_color_btns) >= 10
+            sd_check._on_theme_selected("rose_sakura")
+            assert win.cfg.theme == "rose_sakura" and win.palette.key == "rose_sakura"
+            sd_check._on_theme_selected(orig_theme)
+            assert win.cfg.theme == orig_theme and win.palette.key == orig_theme
+
             assert sd_check.discord_overlay_mode_combo.count() == 3
             assert len(sd_check.discord_notify_color_btns) == 7
             sd_check._on_notify_color_selected("pink")
@@ -2042,7 +2138,7 @@ def test_gui_and_libmpv_smoke(
             sd_check.discord_sounds_toggle_btn.click()
             app.processEvents()
             assert not sd_check.discord_sounds_body.isHidden()
-            assert len(sd_check.discord_sound_sliders) == 9
+            assert len(sd_check.discord_sound_sliders) == len(SOUND_EVENTS)
             sd_check.close()
             sd_check.deleteLater()
             app.processEvents()
@@ -2465,6 +2561,8 @@ def test_gui_and_libmpv_smoke(
             win.cfg.discord_sound_volumes = orig_sound_vols
             win.cfg.discord_notify_chat_enabled = orig_notify_en
             win.cfg.discord_notify_color = orig_notify_color
+            win._discord_streaming = False
+            win.apply_theme(orig_theme)
             win._discord_in_voice = False
             win._discord_participants = []
             win._discord_speaking = {}

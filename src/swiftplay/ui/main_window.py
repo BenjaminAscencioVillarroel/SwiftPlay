@@ -27,11 +27,13 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QColor,
     QCursor,
     QIcon,
     QKeyEvent,
     QKeySequence,
     QMouseEvent,
+    QPainter,
     QPixmap,
     QPixmapCache,
     QShortcut,
@@ -59,7 +61,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from swiftplay.config import AppConfig, load_config, save_config
+from swiftplay.config import AppConfig, load_config, save_config, validate_theme
 from swiftplay.discord_service import DiscordService
 from swiftplay.media_keys import GlobalMediaKeyFilter
 from swiftplay.models import ChannelInfo, FeedSection, MediaItem, ResolvedStream, format_duration
@@ -182,6 +184,35 @@ class _ClickableFrame(QFrame):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+
+class _SidebarActiveIndicator(QWidget):
+    """Indicador vertical deslizante que marca la vista activa en la barra lateral."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._accent = QColor("#CFD5DF")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFixedWidth(4)
+        self.hide()
+
+    def set_accent(self, hex_color: str) -> None:
+        self._accent = QColor(hex_color)
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: ANN001
+        if self.height() <= 0 or self.width() <= 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        glow = QColor(self._accent)
+        glow.setAlpha(70)
+        p.setBrush(glow)
+        p.drawRoundedRect(0, 0, self.width(), self.height(), 2.0, 2.0)
+        p.setBrush(self._accent)
+        p.drawRoundedRect(0, 1, max(2, self.width() - 1), max(4, self.height() - 2), 1.5, 1.5)
+        p.end()
 
 
 class MainWindow(QMainWindow):
@@ -382,9 +413,9 @@ class MainWindow(QMainWindow):
 
         self._page_fade_target: QWidget | None = None
         self._page_fade_anim = QVariantAnimation(self)
-        self._page_fade_anim.setDuration(140)
+        self._page_fade_anim.setDuration(190)
         self._page_fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._page_fade_anim.setStartValue(0.86)
+        self._page_fade_anim.setStartValue(0.58)
         self._page_fade_anim.setEndValue(1.0)
         self._page_fade_anim.valueChanged.connect(self._on_page_fade_step)
         self._page_fade_anim.finished.connect(self._on_page_fade_finished)
@@ -443,6 +474,7 @@ class MainWindow(QMainWindow):
         self._discord_in_voice = False
         self._discord_muted = False
         self._discord_deafened = False
+        self._discord_streaming = False
         self._discord_participants: list[dict] = []
         self._discord_speaking: dict[str, bool] = {}
 
@@ -658,6 +690,13 @@ class MainWindow(QMainWindow):
         nav_lay.addWidget(self.settings_btn)
 
         self.sidebar_scroll.setWidget(nav_container)
+        self._sidebar_indicator = _SidebarActiveIndicator(nav_container)
+        self._sidebar_ind_anim = QPropertyAnimation(
+            self._sidebar_indicator, b"geometry", self
+        )
+        self._sidebar_ind_anim.setDuration(210)
+        self._sidebar_ind_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._active_nav_btn: QPushButton | None = None
         sb_lay.addWidget(self.sidebar_scroll, 1)
 
         self.resource_card = QFrame()
@@ -1070,6 +1109,7 @@ class MainWindow(QMainWindow):
         self.discord_panel.unread_count_changed.connect(self._on_discord_unread_count_changed)
         self.discord_panel.sound_event_requested.connect(self.play_discord_sound)
         self.discord_panel.toast_requested.connect(self.show_toast)
+        self.discord_panel.screen_share_active_changed.connect(self._on_discord_streaming_changed)
         self.discord_panel.screen_share_ram_updated.connect(self._on_screen_share_ram_updated)
         self.discord_panel.screen_viewer_fullscreen_changed.connect(
             self._on_discord_screen_viewer_fullscreen_changed
@@ -1910,10 +1950,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def apply_theme(self, theme_key: str = "matte_silver") -> None:
-        self.cfg.theme = "matte_silver"
+        self.cfg.theme = validate_theme(theme_key)
         save_config(self.cfg)
         self.palette = get_theme(self.cfg.theme)
         p = self.palette
+        if hasattr(self, "_sidebar_indicator"):
+            self._sidebar_indicator.set_accent(p.accent)
 
         qss = build_stylesheet(
             self.cfg.theme, notify_color=self.cfg.discord_notify_color
@@ -1982,22 +2024,21 @@ class MainWindow(QMainWindow):
         self._refresh_account_badge()
         self._sync_bottom_bar()
         self._clear_hidden_browse_pages(clear_all=False)
-        for card in self._video_cards:
-            card.update_theme(p)
-        for card in self._channel_cards:
-            card.update_theme(p)
-        for card in self.wl_grid._widgets:
-            if hasattr(card, "update_theme"):
-                card.update_theme(p)
-        for card in self.history_grid._widgets:
-            if hasattr(card, "update_theme"):
-                card.update_theme(p)
-        for card in self._twitch_cards:
-            card.update_theme(p)
-        for row in self._music_rows:
-            row.update_theme(p)
-        for shelf in self._music_shelves:
-            shelf.update_theme(p)
+        for group in (
+            self.video_grid._widgets,
+            self.channel_grid._widgets,
+            self.wl_grid._widgets,
+            self.history_grid._widgets,
+            self.twitch_grid._widgets,
+            self._music_rows,
+            self._music_shelves,
+        ):
+            for card in list(group):
+                if hasattr(card, "update_theme"):
+                    try:
+                        card.update_theme(p)
+                    except RuntimeError:
+                        pass
 
     # ------------------------------------------------------------------
     # Persistencia de última sesión + liberación en reposo
@@ -2320,6 +2361,11 @@ class MainWindow(QMainWindow):
         self._sync_discord_overlay()
         self._sync_discord_sidebar_card()
 
+    def _on_discord_streaming_changed(self, streaming: bool) -> None:
+        self._discord_streaming = bool(streaming)
+        self._sync_discord_overlay()
+        self._sync_discord_sidebar_card()
+
     def _on_sidebar_discord_audio_clicked(self) -> None:
         if hasattr(self, "discord_panel"):
             self.discord_panel.toggle_audio_popover(self.discord_mini_card)
@@ -2375,7 +2421,12 @@ class MainWindow(QMainWindow):
         bot_name = self._discord_bot_name or self.discord_service.bot_name or "Discord"
         self.discord_mini_name.setText(bot_name)
         in_voice = bool(self._discord_in_voice or self.discord_service.is_in_voice)
-        if in_voice and self.discord_service.active_channel_name:
+        if self._discord_streaming:
+            ch_txt = self.discord_service.active_channel_name
+            lbl_txt = f"● EN VIVO · {ch_txt}" if (in_voice and ch_txt) else "● Transmitiendo pantalla"
+            self.discord_mini_sub.setText(lbl_txt)
+            self.discord_mini_sub.setStyleSheet("font-size: 9.5px; color: #F87171; font-weight: 700;")
+        elif in_voice and self.discord_service.active_channel_name:
             self.discord_mini_sub.setText(f"En voz · {self.discord_service.active_channel_name}")
             self.discord_mini_sub.setStyleSheet("font-size: 9.5px; color: #4ADE80; font-weight: 600;")
         else:
@@ -2396,7 +2447,7 @@ class MainWindow(QMainWindow):
             self.discord_mini_avatar.setPixmap(QPixmap())
             self.discord_mini_avatar.setText((bot_name.strip()[:1] or "D").upper())
             self.discord_mini_avatar.setStyleSheet(
-                f"background-color: #2D3647; color: {self.palette.text}; "
+                f"background-color: {self.palette.active_bg}; color: {self.palette.text}; "
                 f"border-radius: 11px; border: 1px solid {self.palette.border_bright}; "
                 "font-size: 10px; font-weight: 700;"
             )
@@ -2442,6 +2493,7 @@ class MainWindow(QMainWindow):
             opacity_pct=self.cfg.discord_overlay_opacity,
             participants=self._discord_participants,
             speaking=self._discord_speaking,
+            streaming=self._discord_streaming,
         )
 
     def _on_discord_overlay_position_changed(self, x: int, y: int) -> None:
@@ -2678,7 +2730,7 @@ class MainWindow(QMainWindow):
 
     def _clear_hidden_browse_pages(self, *, clear_all: bool = False) -> None:
         cur = -1 if clear_all else self.stack.currentIndex()
-        if cur != self.PAGE_VIDEO_SEARCH and self.video_grid._widgets:
+        if cur != self.PAGE_VIDEO_SEARCH and (self.video_grid._widgets or self._video_cards):
             self.video_grid.clear_widgets()
             self._video_cards.clear()
             self._video_page_dirty = True
@@ -2704,11 +2756,11 @@ class MainWindow(QMainWindow):
                 self.music_history_lay, keep_widget=self.music_history_empty_lbl
             )
             self._music_history_page_dirty = True
-        if cur != self.PAGE_TWITCH and self.twitch_grid._widgets:
+        if cur != self.PAGE_TWITCH and (self.twitch_grid._widgets or self._twitch_cards):
             self.twitch_grid.clear_widgets()
             self._twitch_cards.clear()
             self._twitch_page_dirty = True
-        if cur != self.PAGE_CHANNEL and self.channel_grid._widgets:
+        if cur != self.PAGE_CHANNEL and (self.channel_grid._widgets or self._channel_cards):
             self.channel_grid.clear_widgets()
             self._channel_cards.clear()
             self._channel_page_dirty = True
@@ -2781,10 +2833,57 @@ class MainWindow(QMainWindow):
             return
         self._stop_page_fade()
         eff = QGraphicsOpacityEffect(widget)
-        eff.setOpacity(0.86)
+        eff.setOpacity(0.58)
         widget.setGraphicsEffect(eff)
         self._page_fade_target = widget
         self._page_fade_anim.start()
+
+    def _update_sidebar_indicator(
+        self, active_btn: QPushButton | None, *, animate: bool = True
+    ) -> None:
+        if not hasattr(self, "_sidebar_indicator"):
+            return
+        self._active_nav_btn = active_btn
+        if active_btn is None or active_btn.isHidden():
+            self._sidebar_ind_anim.stop()
+            self._sidebar_indicator.hide()
+            return
+        geo = active_btn.geometry()
+        if geo.height() <= 0:
+            QTimer.singleShot(
+                0, lambda b=active_btn: self._update_sidebar_indicator(b, animate=False)
+            )
+            return
+        pad_y = max(5, geo.height() // 5)
+        target = QRect(geo.x() + 2, geo.y() + pad_y, 4, max(12, geo.height() - pad_y * 2))
+        self._sidebar_indicator.raise_()
+        if not self._sidebar_indicator.isVisible() or not animate or not self.isVisible():
+            self._sidebar_ind_anim.stop()
+            self._sidebar_indicator.setGeometry(target)
+            self._sidebar_indicator.show()
+            return
+        if self._sidebar_indicator.geometry() == target:
+            return
+        self._sidebar_ind_anim.stop()
+        self._sidebar_ind_anim.setStartValue(self._sidebar_indicator.geometry())
+        self._sidebar_ind_anim.setEndValue(target)
+        self._sidebar_ind_anim.start()
+
+    def _stagger_card_entrances(self, cards: list[QWidget], max_cards: int = 10) -> None:
+        if not cards or not self.isVisible() or self._cleaned_up:
+            return
+        for idx, card in enumerate(cards[:max_cards]):
+            def _play(c: QWidget = card) -> None:
+                if self._cleaned_up or not self.isVisible():
+                    return
+                try:
+                    tw = getattr(c, "thumb_widget", None)
+                    if tw is not None and c.isVisible():
+                        tw.play_entrance()
+                except RuntimeError:
+                    pass
+
+            QTimer.singleShot(idx * 18, _play)
 
     def _switch_page(self, page_idx: int) -> None:
         if self._is_fullscreen and page_idx != self.PAGE_VIDEO_PLAYER:
@@ -2875,6 +2974,7 @@ class MainWindow(QMainWindow):
                     btn.setProperty("active", want)
                     btn.style().unpolish(btn)
                     btn.style().polish(btn)
+            self._update_sidebar_indicator(active_btn, animate=(page_idx != prev_idx))
 
             is_twitch_player = (
                 page_idx == self.PAGE_VIDEO_PLAYER
@@ -3151,6 +3251,7 @@ class MainWindow(QMainWindow):
         hint_w = hint_width if hint_width > 0 else max(480, self.stack.width() - 52)
         self.video_grid.set_items_widgets(cards, hint_width=hint_w)
         self.video_grid.setProperty("_rendered_hint_w", int(hint_w))
+        self._stagger_card_entrances(cards)
         self._video_viewport_timer.start()
 
     def _load_more_video_feed(self) -> None:
@@ -3704,6 +3805,7 @@ class MainWindow(QMainWindow):
         hint_w = hint_width if hint_width > 0 else max(480, self.stack.width() - 52)
         self.channel_grid.set_items_widgets(cards, hint_width=hint_w)
         self.channel_grid.setProperty("_rendered_hint_w", int(hint_w))
+        self._stagger_card_entrances(cards)
         self._channel_viewport_timer.start()
 
     def _on_channel_scroll_changed(self, value: int) -> None:
@@ -3979,6 +4081,7 @@ class MainWindow(QMainWindow):
         hint_w = hint_width if hint_width > 0 else max(480, self.stack.width() - 52)
         self.twitch_grid.set_items_widgets(cards, hint_width=hint_w)
         self.twitch_grid.setProperty("_rendered_hint_w", int(hint_w))
+        self._stagger_card_entrances(cards)
 
     def _on_twitch_items_done(
         self, gen: int, items: list[MediaItem], tab: str | None = None
@@ -4180,11 +4283,10 @@ class MainWindow(QMainWindow):
         self._wl_page_dirty = False
         if items:
             hint_w = hint_width if hint_width > 0 else max(480, self.stack.width() - 52)
-            self.wl_grid.set_items_widgets(
-                [self._create_video_card(it, force_wl=True) for it in items],
-                hint_width=hint_w,
-            )
+            cards: list[QWidget] = [self._create_video_card(it, force_wl=True) for it in items]
+            self.wl_grid.set_items_widgets(cards, hint_width=hint_w)
             self.wl_grid.setProperty("_rendered_hint_w", int(hint_w))
+            self._stagger_card_entrances(cards)
 
     def _render_history(self, hint_width: int = 0) -> None:
         self.history_grid.clear_widgets()
@@ -4194,11 +4296,12 @@ class MainWindow(QMainWindow):
         if items:
             wl_ids = self.db.list_watch_later_ids()
             hint_w = hint_width if hint_width > 0 else max(480, self.stack.width() - 52)
-            self.history_grid.set_items_widgets(
-                [self._create_video_card(it, show_remove=True, wl_ids=wl_ids) for it in items],
-                hint_width=hint_w,
-            )
+            cards: list[QWidget] = [
+                self._create_video_card(it, show_remove=True, wl_ids=wl_ids) for it in items
+            ]
+            self.history_grid.set_items_widgets(cards, hint_width=hint_w)
             self.history_grid.setProperty("_rendered_hint_w", int(hint_w))
+            self._stagger_card_entrances(cards)
 
     def _remove_history_item(self, item: MediaItem) -> None:
         self.db.remove_from_history(item.video_id)
@@ -5922,6 +6025,9 @@ class MainWindow(QMainWindow):
         elif discord_tab:
             dlg.select_discord_tab()
         dlg.normalization_changed.connect(self._on_normalization_changed)
+        dlg.theme_changed.connect(
+            lambda key, d=dlg: (self.apply_theme(key), d.on_theme_applied(key))
+        )
         dlg.account_changed.connect(self._on_account_changed)
         dlg.discord_token_changed.connect(self._on_discord_token_changed)
         dlg.hotkey_recording_changed.connect(self._media_filter.set_suspended)

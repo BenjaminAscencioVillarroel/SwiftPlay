@@ -177,6 +177,15 @@ class DiscordMessageToast(QWidget):
 
     def _apply_colors(self) -> None:
         nc = self._notify_spec
+        self.header_lbl.setStyleSheet(
+            f"background-color: transparent; color: {self._palette.text}; font-size: 12px; font-weight: 600;"
+        )
+        self.author_lbl.setStyleSheet(
+            f"background-color: transparent; color: {self._palette.text}; font-size: 14px; font-weight: 700;"
+        )
+        self.preview_lbl.setStyleSheet(
+            f"background-color: transparent; color: {self._palette.text2}; font-size: 13px; font-weight: 400;"
+        )
         if ICON_PNG_PATH.exists():
             pm = QPixmap(str(ICON_PNG_PATH)).scaled(
                 18,
@@ -408,11 +417,11 @@ class DiscordMessageToast(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = QRectF(1.0, 1.0, float(w - 2), float(h - 2))
 
-        bg = QColor("#141821")
+        bg = QColor(self._palette.surface1)
         bg.setAlpha(246)
         painter.setBrush(bg)
 
-        border = QColor("#2E3748")
+        border = QColor(self._palette.border_bright)
         painter.setPen(QPen(border, 1.2))
         painter.drawRoundedRect(rect, 12.0, 12.0)
 

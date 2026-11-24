@@ -21,6 +21,21 @@ class ThemePalette:
     accent: str
     accent_hover: str
     accent_text: str
+    surface_hover: str = "#212630"
+    active_bg: str = "#2D3647"
+    active_hover: str = "#384358"
+    accent_grad_top: str = "#323B4D"
+    accent_grad_bot: str = "#252C3A"
+    accent_hover_top: str = "#3E4A60"
+    accent_hover_bot: str = "#2E3749"
+    accent_pressed: str = "#1F2531"
+    play_grad_top: str = "#EAEEF4"
+    play_grad_bot: str = "#C2C9D4"
+    play_hover_top: str = "#F6F8FB"
+    play_hover_bot: str = "#D3D9E3"
+    play_border: str = "#F2F4F8"
+    play_pressed: str = "#AEB7C4"
+    row_hover: str = "#24272F"
 
 
 @dataclass(frozen=True)
@@ -38,7 +53,7 @@ class NotifyColorSpec:
 THEMES: dict[str, ThemePalette] = {
     "matte_silver": ThemePalette(
         key="matte_silver",
-        name="Obsidian Graphite & Matte Silver",
+        name="Grafito Plata",
         base="#0B0C0E",
         surface1="#121418",
         surface2="#1A1E26",
@@ -49,6 +64,340 @@ THEMES: dict[str, ThemePalette] = {
         accent="#CFD5DF",
         accent_hover="#E4E8EE",
         accent_text="#0B0C0E",
+        surface_hover="#212630",
+        active_bg="#2D3647",
+        active_hover="#384358",
+        accent_grad_top="#323B4D",
+        accent_grad_bot="#252C3A",
+        accent_hover_top="#3E4A60",
+        accent_hover_bot="#2E3749",
+        accent_pressed="#1F2531",
+        play_grad_top="#EAEEF4",
+        play_grad_bot="#C2C9D4",
+        play_hover_top="#F6F8FB",
+        play_hover_bot="#D3D9E3",
+        play_border="#F2F4F8",
+        play_pressed="#AEB7C4",
+        row_hover="#24272F",
+    ),
+    "rose_sakura": ThemePalette(
+        key="rose_sakura",
+        name="Rosa Sakura",
+        base="#110A0E",
+        surface1="#1B1016",
+        surface2="#271720",
+        border="#3D2131",
+        border_bright="#64354F",
+        text="#FDF2F7",
+        text2="#C49BB0",
+        accent="#F472B6",
+        accent_hover="#F9A8D4",
+        accent_text="#1A0B13",
+        surface_hover="#331E2A",
+        active_bg="#4D223A",
+        active_hover="#632B4A",
+        accent_grad_top="#5E2947",
+        accent_grad_bot="#401B30",
+        accent_hover_top="#753459",
+        accent_hover_bot="#52233D",
+        accent_pressed="#331526",
+        play_grad_top="#FBCFE8",
+        play_grad_bot="#F472B6",
+        play_hover_top="#FCE7F3",
+        play_hover_bot="#F9A8D4",
+        play_border="#FDF2F7",
+        play_pressed="#DB2777",
+        row_hover="#361E2C",
+    ),
+    "amethyst_velvet": ThemePalette(
+        key="amethyst_velvet",
+        name="Amatista",
+        base="#0D0A14",
+        surface1="#151021",
+        surface2="#201831",
+        border="#33254F",
+        border_bright="#523B7D",
+        text="#F5F2FF",
+        text2="#A99BC7",
+        accent="#A78BFA",
+        accent_hover="#C4B5FD",
+        accent_text="#120B1F",
+        surface_hover="#2B2042",
+        active_bg="#3E2A66",
+        active_hover="#4E3580",
+        accent_grad_top="#4A327A",
+        accent_grad_bot="#322154",
+        accent_hover_top="#5B3E94",
+        accent_hover_bot="#3F2A69",
+        accent_pressed="#281A45",
+        play_grad_top="#DDD6FE",
+        play_grad_bot="#A78BFA",
+        play_hover_top="#EDE9FE",
+        play_hover_bot="#C4B5FD",
+        play_border="#F5F3FF",
+        play_pressed="#8B5CF6",
+        row_hover="#291E40",
+    ),
+    "sapphire_ocean": ThemePalette(
+        key="sapphire_ocean",
+        name="Zafiro Azul",
+        base="#080D15",
+        surface1="#0E1726",
+        surface2="#162338",
+        border="#213452",
+        border_bright="#355482",
+        text="#EFF6FF",
+        text2="#8FA8C9",
+        accent="#60A5FA",
+        accent_hover="#93C5FD",
+        accent_text="#081120",
+        surface_hover="#1E2F4A",
+        active_bg="#233F6B",
+        active_hover="#2D5087",
+        accent_grad_top="#294A7D",
+        accent_grad_bot="#1B3257",
+        accent_hover_top="#355E9E",
+        accent_hover_bot="#23406E",
+        accent_pressed="#162845",
+        play_grad_top="#BFDBFE",
+        play_grad_bot="#60A5FA",
+        play_hover_top="#DBEAFE",
+        play_hover_bot="#93C5FD",
+        play_border="#EFF6FF",
+        play_pressed="#3B82F6",
+        row_hover="#1C2C45",
+    ),
+    "emerald_forest": ThemePalette(
+        key="emerald_forest",
+        name="Esmeralda",
+        base="#07100D",
+        surface1="#0D1B16",
+        surface2="#142921",
+        border="#1E3D31",
+        border_bright="#2F6350",
+        text="#ECFDF5",
+        text2="#89B5A3",
+        accent="#34D399",
+        accent_hover="#6EE7B7",
+        accent_text="#061A13",
+        surface_hover="#1B372C",
+        active_bg="#1B4D3B",
+        active_hover="#23634C",
+        accent_grad_top="#205C46",
+        accent_grad_bot="#153E2F",
+        accent_hover_top="#2A7559",
+        accent_hover_bot="#1B4F3C",
+        accent_pressed="#103024",
+        play_grad_top="#A7F3D0",
+        play_grad_bot="#34D399",
+        play_hover_top="#D1FAE5",
+        play_hover_bot="#6EE7B7",
+        play_border="#ECFDF5",
+        play_pressed="#10B981",
+        row_hover="#183329",
+    ),
+    "crimson_ruby": ThemePalette(
+        key="crimson_ruby",
+        name="Rubí Carmesí",
+        base="#12090B",
+        surface1="#1D0F12",
+        surface2="#2B161B",
+        border="#422027",
+        border_bright="#6B313C",
+        text="#FFF1F2",
+        text2="#C7969E",
+        accent="#FB7185",
+        accent_hover="#FDA4AF",
+        accent_text="#1C080B",
+        surface_hover="#381D23",
+        active_bg="#57212B",
+        active_hover="#6E2936",
+        accent_grad_top="#692734",
+        accent_grad_bot="#471922",
+        accent_hover_top="#823141",
+        accent_hover_bot="#59202B",
+        accent_pressed="#38131A",
+        play_grad_top="#FECDD3",
+        play_grad_bot="#FB7185",
+        play_hover_top="#FFE4E6",
+        play_hover_bot="#FDA4AF",
+        play_border="#FFF1F2",
+        play_pressed="#F43F5E",
+        row_hover="#361B21",
+    ),
+    "amber_gold": ThemePalette(
+        key="amber_gold",
+        name="Ámbar Dorado",
+        base="#110D07",
+        surface1="#1B150B",
+        surface2="#281F11",
+        border="#403018",
+        border_bright="#664D26",
+        text="#FFFBEB",
+        text2="#C4B08A",
+        accent="#FBBF24",
+        accent_hover="#FDE68A",
+        accent_text="#1B1305",
+        surface_hover="#352916",
+        active_bg="#523B17",
+        active_hover="#694C1E",
+        accent_grad_top="#63471C",
+        accent_grad_bot="#422F11",
+        accent_hover_top="#7A5823",
+        accent_hover_bot="#543C16",
+        accent_pressed="#33240C",
+        play_grad_top="#FDE68A",
+        play_grad_bot="#F59E0B",
+        play_hover_top="#FEF3C7",
+        play_hover_bot="#FBBF24",
+        play_border="#FFFBEB",
+        play_pressed="#D97706",
+        row_hover="#332613",
+    ),
+    "arctic_cyan": ThemePalette(
+        key="arctic_cyan",
+        name="Cian Ártico",
+        base="#070F12",
+        surface1="#0C1A20",
+        surface2="#132730",
+        border="#1D3C4A",
+        border_bright="#2E5F73",
+        text="#ECFEFF",
+        text2="#8AB5C4",
+        accent="#22D3EE",
+        accent_hover="#67E8F9",
+        accent_text="#06181E",
+        surface_hover="#1A3541",
+        active_bg="#1A4A5C",
+        active_hover="#225E75",
+        accent_grad_top="#20596E",
+        accent_grad_bot="#143B4A",
+        accent_hover_top="#28708A",
+        accent_hover_bot="#1B4D61",
+        accent_pressed="#102E3A",
+        play_grad_top="#A5F3FC",
+        play_grad_bot="#22D3EE",
+        play_hover_top="#CFFAFE",
+        play_hover_bot="#67E8F9",
+        play_border="#ECFEFF",
+        play_pressed="#06B6D4",
+        row_hover="#18323D",
+    ),
+    "sunset_coral": ThemePalette(
+        key="sunset_coral",
+        name="Atardecer Coral",
+        base="#120B08",
+        surface1="#1D120D",
+        surface2="#2C1B13",
+        border="#452619",
+        border_bright="#6E3E29",
+        text="#FFF7ED",
+        text2="#C9A18D",
+        accent="#FB923C",
+        accent_hover="#FDBA74",
+        accent_text="#1C0E06",
+        surface_hover="#3A241A",
+        active_bg="#59301D",
+        active_hover="#703C24",
+        accent_grad_top="#693822",
+        accent_grad_bot="#472415",
+        accent_hover_top="#82462B",
+        accent_hover_bot="#592E1B",
+        accent_pressed="#381C10",
+        play_grad_top="#FED7AA",
+        play_grad_bot="#FB923C",
+        play_hover_top="#FFEDD5",
+        play_hover_bot="#FDBA74",
+        play_border="#FFF7ED",
+        play_pressed="#EA580C",
+        row_hover="#382218",
+    ),
+    "indigo_nebula": ThemePalette(
+        key="indigo_nebula",
+        name="Índigo Nébula",
+        base="#090B15",
+        surface1="#101324",
+        surface2="#191E38",
+        border="#252D52",
+        border_bright="#3E4B85",
+        text="#EEF2FF",
+        text2="#959EC9",
+        accent="#818CF8",
+        accent_hover="#A5B4FC",
+        accent_text="#0B0E21",
+        surface_hover="#22294A",
+        active_bg="#2C366B",
+        active_hover="#384587",
+        accent_grad_top="#34407D",
+        accent_grad_bot="#222A54",
+        accent_hover_top="#43529E",
+        accent_hover_bot="#2C376E",
+        accent_pressed="#1A2142",
+        play_grad_top="#C7D2FE",
+        play_grad_bot="#818CF8",
+        play_hover_top="#E0E7FF",
+        play_hover_bot="#A5B4FC",
+        play_border="#EEF2FF",
+        play_pressed="#6366F1",
+        row_hover="#202747",
+    ),
+    "matcha_sage": ThemePalette(
+        key="matcha_sage",
+        name="Matcha Salvia",
+        base="#0B0F09",
+        surface1="#131A10",
+        surface2="#1D2718",
+        border="#2C3B24",
+        border_bright="#465E39",
+        text="#F7FEE7",
+        text2="#A3B895",
+        accent="#A3E635",
+        accent_hover="#BEF264",
+        accent_text="#111A07",
+        surface_hover="#273420",
+        active_bg="#344D26",
+        active_hover="#426330",
+        accent_grad_top="#3D5C2D",
+        accent_grad_bot="#293E1D",
+        accent_hover_top="#4D7339",
+        accent_hover_bot="#344F25",
+        accent_pressed="#1F3016",
+        play_grad_top="#D9F99D",
+        play_grad_bot="#A3E635",
+        play_hover_top="#ECFCCB",
+        play_hover_bot="#BEF264",
+        play_border="#F7FEE7",
+        play_pressed="#84CC16",
+        row_hover="#25331E",
+    ),
+    "magenta_orchid": ThemePalette(
+        key="magenta_orchid",
+        name="Orquídea Fucsia",
+        base="#110913",
+        surface1="#1B0F1F",
+        surface2="#28162E",
+        border="#3E2047",
+        border_bright="#643573",
+        text="#FDF4FF",
+        text2="#BF9BC9",
+        accent="#E879F9",
+        accent_hover="#F0ABFC",
+        accent_text="#1B0721",
+        surface_hover="#351E3D",
+        active_bg="#4F225E",
+        active_hover="#652C78",
+        accent_grad_top="#5E2970",
+        accent_grad_bot="#3F1B4C",
+        accent_hover_top="#75348C",
+        accent_hover_bot="#512361",
+        accent_pressed="#30143A",
+        play_grad_top="#F5D0FE",
+        play_grad_bot="#E879F9",
+        play_hover_top="#FAE8FF",
+        play_hover_bot="#F0ABFC",
+        play_border="#FDF4FF",
+        play_pressed="#D946EF",
+        row_hover="#331C3B",
     ),
 }
 
@@ -133,19 +482,32 @@ def get_notification_color(color_key: str = "purple") -> NotifyColorSpec:
 
 
 def get_theme(theme_key: str = "matte_silver") -> ThemePalette:
-    return THEMES.get(theme_key, THEMES["matte_silver"])
+    return THEMES.get(str(theme_key or "").strip().lower(), THEMES["matte_silver"])
+
+
+def _hex_to_rgba(hex_color: str, alpha: int) -> str:
+    c = hex_color.lstrip("#")
+    r = int(c[0:2], 16)
+    g = int(c[2:4], 16)
+    b = int(c[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {max(0, min(255, int(alpha)))})"
 
 
 def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purple") -> str:
     p = get_theme(theme_key)
     nc = get_notification_color(notify_color)
+    fs_bg_rgba = _hex_to_rgba(p.surface1, 212)
+    hud_bg_rgba = _hex_to_rgba(p.surface1, 218)
+    fs_border_rgba = _hex_to_rgba(p.accent, 62)
+    hud_border_rgba = _hex_to_rgba(p.accent, 72)
+    menu_sel_border = _hex_to_rgba(p.accent, 120)
     return f"""
     QWidget {{
         background-color: {p.base};
         color: {p.text};
         font-family: "Segoe UI", "Inter", sans-serif;
         font-size: 13px;
-        selection-background-color: #2D3647;
+        selection-background-color: {p.active_bg};
         selection-color: {p.text};
     }}
 
@@ -154,7 +516,7 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QTextBrowser {{
-        selection-background-color: #3B4C6B;
+        selection-background-color: {p.active_hover};
         selection-color: #FFFFFF;
     }}
 
@@ -249,7 +611,7 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QPushButton#NavBtn[active="true"] {{
-        background-color: #2D3647;
+        background-color: {p.active_bg};
         color: {p.text};
         border: 1px solid {p.accent};
         border-radius: 10px;
@@ -257,7 +619,7 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QPushButton#NavBtn[active="true"]:hover {{
-        background-color: #384358;
+        background-color: {p.active_hover};
         border-color: {p.accent_hover};
     }}
 
@@ -338,7 +700,7 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
 
     QPushButton:hover {{
         border-color: {p.border_bright};
-        background-color: #212630;
+        background-color: {p.surface_hover};
     }}
 
     QPushButton:pressed {{
@@ -346,14 +708,14 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QPushButton:checked {{
-        background-color: #2D3647;
+        background-color: {p.active_bg};
         color: {p.text};
         border: 1px solid {p.accent};
         font-weight: 700;
     }}
 
     QPushButton:checked:hover {{
-        background-color: #384358;
+        background-color: {p.active_hover};
         border-color: {p.accent_hover};
     }}
 
@@ -363,7 +725,7 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QPushButton#AccentBtn {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #323B4D, stop:1 #252C3A);
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {p.accent_grad_top}, stop:1 {p.accent_grad_bot});
         color: {p.text};
         border: 1px solid {p.accent};
         border-radius: 10px;
@@ -372,31 +734,31 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QPushButton#AccentBtn:hover {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3E4A60, stop:1 #2E3749);
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {p.accent_hover_top}, stop:1 {p.accent_hover_bot});
         border-color: {p.accent_hover};
     }}
 
     QPushButton#AccentBtn:pressed {{
-        background-color: #1F2531;
+        background-color: {p.accent_pressed};
         border-color: {p.accent};
     }}
 
     QPushButton#PlayAccentBtn {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #EAEEF4, stop:1 #C2C9D4);
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {p.play_grad_top}, stop:1 {p.play_grad_bot});
         color: {p.accent_text};
-        border: 1px solid #F2F4F8;
+        border: 1px solid {p.play_border};
         border-radius: 16px;
         padding: 0px;
         font-weight: 700;
     }}
 
     QPushButton#PlayAccentBtn:hover {{
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #F6F8FB, stop:1 #D3D9E3);
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {p.play_hover_top}, stop:1 {p.play_hover_bot});
         border-color: #FFFFFF;
     }}
 
     QPushButton#PlayAccentBtn:pressed {{
-        background-color: #AEB7C4;
+        background-color: {p.play_pressed};
         border-color: {p.accent};
     }}
 
@@ -427,13 +789,13 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QPushButton#IconBtn[active="true"] {{
-        background-color: #2D3647;
+        background-color: {p.active_bg};
         border: 1px solid {p.accent};
         color: {p.text};
     }}
 
     QPushButton#IconBtn[active="true"]:hover {{
-        background-color: #384358;
+        background-color: {p.active_hover};
         border-color: {p.accent_hover};
     }}
 
@@ -455,14 +817,14 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QPushButton#PillBtn[active="true"] {{
-        background-color: #2D3647;
+        background-color: {p.active_bg};
         color: {p.text};
         border: 1px solid {p.accent};
         font-weight: 700;
     }}
 
     QPushButton#PillBtn[active="true"]:hover {{
-        background-color: #384358;
+        background-color: {p.active_hover};
         border-color: {p.accent_hover};
     }}
 
@@ -555,14 +917,14 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QFrame#FsOverlayFrame {{
-        background-color: rgba(14, 16, 20, 212);
-        border: 1px solid rgba(207, 213, 223, 62);
+        background-color: {fs_bg_rgba};
+        border: 1px solid {fs_border_rgba};
         border-radius: 14px;
     }}
 
     QFrame#VolumeHudFrame {{
-        background-color: rgba(14, 16, 20, 218);
-        border: 1px solid rgba(207, 213, 223, 72);
+        background-color: {hud_bg_rgba};
+        border: 1px solid {hud_border_rgba};
         border-radius: 12px;
     }}
 
@@ -589,15 +951,15 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QFrame#ShortcutDialogFrame {{
-        background-color: #1A1E26;
-        border: 1px solid #262B36;
+        background-color: {p.surface2};
+        border: 1px solid {p.border};
         border-radius: 12px;
     }}
 
     QLabel#ShortcutKey {{
-        background-color: #121418;
+        background-color: {p.surface1};
         color: {p.accent};
-        border: 1px solid #3B4252;
+        border: 1px solid {p.border_bright};
         border-radius: 6px;
         padding: 3px 9px;
         font-family: "Consolas", "Segoe UI", monospace;
@@ -635,7 +997,7 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
         border: 1px solid {p.border_bright};
         border-radius: 10px;
         padding: 4px;
-        selection-background-color: #2D3647;
+        selection-background-color: {p.active_bg};
         selection-color: {p.text};
         outline: none;
     }}
@@ -749,14 +1111,14 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QTabBar::tab:selected {{
-        background-color: #2D3647;
+        background-color: {p.active_bg};
         color: {p.text};
         border: 1px solid {p.accent};
         font-weight: 700;
     }}
 
     QListWidget::item:selected {{
-        background-color: #2D3647;
+        background-color: {p.active_bg};
         color: {p.text};
         border: 1px solid {p.accent};
         border-radius: 7px;
@@ -777,9 +1139,9 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QMenu::item:selected {{
-        background-color: #2D3647;
+        background-color: {p.active_bg};
         color: {p.text};
-        border: 1px solid rgba(207, 213, 223, 120);
+        border: 1px solid {menu_sel_border};
         font-weight: 600;
     }}
 
@@ -901,7 +1263,7 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QFrame#DiscordChannelRow[clickable="true"]:hover {{
-        background-color: #24272F;
+        background-color: {p.row_hover};
         border-color: {p.border_bright};
     }}
 

@@ -304,6 +304,7 @@ class RoundedThumbWidget(QWidget):
         enable_crossfade: bool = False,
         enable_fade_in: bool = True,
         ambient_shadow: bool = False,
+        accent_color: str = "#CFD5DF",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -313,6 +314,7 @@ class RoundedThumbWidget(QWidget):
         self._show_play_on_hover = show_play_on_hover
         self._force_play_overlay = force_play_overlay
         self._bg_color = bg_color
+        self._accent_color = accent_color
         self._enable_hover_zoom = bool(enable_hover_zoom)
         self._enable_crossfade = bool(enable_crossfade)
         self._enable_fade_in = bool(enable_fade_in)
@@ -413,7 +415,7 @@ class RoundedThumbWidget(QWidget):
     def _start_hover_anim(self, target: float) -> None:
         if self._hover_anim is None:
             anim = QVariantAnimation(self)
-            anim.setDuration(160)
+            anim.setDuration(180)
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
             anim.valueChanged.connect(self._on_hover_val)
             self._hover_anim = anim
@@ -518,6 +520,10 @@ class RoundedThumbWidget(QWidget):
         self._bg_color = bg_color
         self.update()
 
+    def set_accent_color(self, accent_color: str) -> None:
+        self._accent_color = accent_color
+        self.update()
+
     def enterEvent(self, event) -> None:
         if self._show_play_on_hover or self._enable_hover_zoom:
             self._hovered = True
@@ -569,7 +575,7 @@ class RoundedThumbWidget(QWidget):
         painter.fillRect(rect, QColor(self._bg_color))
 
         zoom = (
-            1.0 + 0.04 * self._hover_t
+            1.0 + 0.05 * self._hover_t
             if (self._enable_hover_zoom and self._hover_t > 0.001)
             else 1.0
         )
@@ -682,8 +688,16 @@ class RoundedThumbWidget(QWidget):
             painter.fillRect(QRectF(0.0, bar_y, float(w), bar_h), QColor(255, 255, 255, 58))
             painter.fillRect(
                 QRectF(0.0, bar_y, max(4.0, float(w) * self._progress_ratio), bar_h),
-                QColor("#E4E8EE"),
+                QColor(self._accent_color),
             )
+
+        if self._enable_hover_zoom and self._hover_t > 0.01:
+            sheen = QLinearGradient(0.0, 0.0, float(w) * 0.65, float(h) * 0.65)
+            s_col = QColor(255, 255, 255, int(26 * self._hover_t))
+            s_zero = QColor(255, 255, 255, 0)
+            sheen.setColorAt(0.0, s_col)
+            sheen.setColorAt(0.55, s_zero)
+            painter.fillRect(rect, sheen)
 
         if self._ambient_shadow:
             painter.setPen(QPen(QColor(255, 255, 255, 26), 1.0))
@@ -694,10 +708,12 @@ class RoundedThumbWidget(QWidget):
                 float(self._radius),
             )
         elif self._enable_hover_zoom and self._hover_t > 0.01:
-            painter.setPen(QPen(QColor(255, 255, 255, int(36 * self._hover_t)), 1.0))
+            glow_pen = QColor(self._accent_color)
+            glow_pen.setAlpha(int(175 * self._hover_t))
+            painter.setPen(QPen(glow_pen, 1.4))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(
-                rect.adjusted(0.5, 0.5, -0.5, -0.5),
+                rect.adjusted(0.7, 0.7, -0.7, -0.7),
                 float(self._radius),
                 float(self._radius),
             )
@@ -879,6 +895,8 @@ class VideoGridCard(QFrame):
         self._thumb_connected = False
         self._offscreen_unloaded = False
         self._card_hovered = False
+        self._card_hover_t = 0.0
+        self._card_hover_anim: QVariantAnimation | None = None
         self._has_resume = item.resume_pos >= 3.0
         self.setObjectName("YtVideoTile")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -991,6 +1009,8 @@ class VideoGridCard(QFrame):
 
     def release_resources(self) -> None:
         self._disconnect_thumb_cache()
+        if self._card_hover_anim is not None:
+            self._card_hover_anim.stop()
         self.thumb_widget.clear()
         self.avatar_label.clear()
 
@@ -1092,6 +1112,7 @@ class VideoGridCard(QFrame):
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self.thumb_widget.set_bg_color(palette.surface1)
+        self.thumb_widget.set_accent_color(palette.accent)
         if not self._has_avatar_pix:
             self.avatar_label.setStyleSheet(
                 f"background-color: {palette.surface2}; color: {palette.text2}; "
@@ -1101,12 +1122,30 @@ class VideoGridCard(QFrame):
         if self._has_resume:
             self.sub_meta_lbl.setStyleSheet(f"color: {palette.accent}; font-size: 11.5px; font-weight: 600;")
         else:
-            self.sub_meta_lbl.setStyleSheet("color: #7E8696; font-size: 11.5px;")
-        more_color = palette.text if self._card_hovered else "#687080"
+            self.sub_meta_lbl.setStyleSheet(f"color: {palette.text2}; font-size: 11.5px;")
+        more_color = palette.text if self._card_hovered else palette.text2
         self.more_btn.setIcon(render_icon("more", more_color, 16))
+        self.update()
+
+    def _on_card_hover_val(self, val: object) -> None:
+        self._card_hover_t = float(val)
+        self.update()
+
+    def _start_card_hover_anim(self, target: float) -> None:
+        if self._card_hover_anim is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(150)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.valueChanged.connect(self._on_card_hover_val)
+            self._card_hover_anim = anim
+        self._card_hover_anim.stop()
+        self._card_hover_anim.setStartValue(self._card_hover_t)
+        self._card_hover_anim.setEndValue(float(target))
+        self._card_hover_anim.start()
 
     def enterEvent(self, event) -> None:
         self._card_hovered = True
+        self._start_card_hover_anim(1.0)
         self.more_btn.setIcon(render_icon("more", self._palette.text, 16))
         if self.item.kind != "twitch":
             self.hover_entered.emit(self.item)
@@ -1114,10 +1153,23 @@ class VideoGridCard(QFrame):
 
     def leaveEvent(self, event) -> None:
         self._card_hovered = False
-        self.more_btn.setIcon(render_icon("more", "#687080", 16))
+        self._start_card_hover_anim(0.0)
+        self.more_btn.setIcon(render_icon("more", self._palette.text2, 16))
         if self.item.kind != "twitch":
             self.hover_left.emit(self.item)
         super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        if self._card_hover_t > 0.01:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            bg = QColor(self._palette.surface2)
+            bg.setAlpha(int(95 * self._card_hover_t))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(bg)
+            p.drawRoundedRect(QRectF(self.rect()), 12.0, 12.0)
+            p.end()
+        super().paintEvent(event)
 
     def eventFilter(self, obj, event) -> bool:
         try:
@@ -1170,6 +1222,8 @@ class MusicTileWidget(QFrame):
         self._palette = palette
         self._thumb_url = upgrade_thumb_url(item.normalized_thumb(), 360)
         self._thumb_connected = False
+        self._card_hover_t = 0.0
+        self._card_hover_anim: QVariantAnimation | None = None
         self.setObjectName("YtMusicTile")
         self.setFixedWidth(self.TILE_SIZE)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1236,6 +1290,8 @@ class MusicTileWidget(QFrame):
 
     def release_resources(self) -> None:
         self._disconnect_thumb_cache()
+        if self._card_hover_anim is not None:
+            self._card_hover_anim.stop()
         self.thumb_widget.clear()
 
     def _open_context_menu(self) -> None:
@@ -1274,7 +1330,45 @@ class MusicTileWidget(QFrame):
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self.thumb_widget.set_bg_color(palette.surface1)
+        self.thumb_widget.set_accent_color(palette.accent)
         self.more_btn.setIcon(render_icon("more", palette.text2, 15))
+        self.update()
+
+    def _on_card_hover_val(self, val: object) -> None:
+        self._card_hover_t = float(val)
+        self.update()
+
+    def _start_card_hover_anim(self, target: float) -> None:
+        if self._card_hover_anim is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(150)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.valueChanged.connect(self._on_card_hover_val)
+            self._card_hover_anim = anim
+        self._card_hover_anim.stop()
+        self._card_hover_anim.setStartValue(self._card_hover_t)
+        self._card_hover_anim.setEndValue(float(target))
+        self._card_hover_anim.start()
+
+    def enterEvent(self, event) -> None:
+        self._start_card_hover_anim(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._start_card_hover_anim(0.0)
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        if self._card_hover_t > 0.01:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            bg = QColor(self._palette.surface2)
+            bg.setAlpha(int(95 * self._card_hover_t))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(bg)
+            p.drawRoundedRect(QRectF(self.rect()), 10.0, 10.0)
+            p.end()
+        super().paintEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
