@@ -14,6 +14,15 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-23 — Visor Discord Teatro (`T`)/Fullscreen (`F`), `T` por Espacio, Última Config de Share y Auto-Destinos Multiples
+- **Files:** `src/swiftplay/config.py`, `src/swiftplay/ui/video_overlays.py`, `src/swiftplay/ui/shortcuts_dialog.py`, `src/swiftplay/ui/settings_dialog.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Visor Discord Teatro (`T`), Fullscreen Real (`F`/`Esc`/Doble clic) y Audio (`M`/Scroll):** `DiscordVoicePanel` añade botones **Teatro** y **Pantalla completa**, barra de controles ubicada debajo de `screen_video_surface` (consistente con YouTube/Twitch en normal y Teatro), `ClickableSlider` con scroll y señales de volumen/HUD; en Teatro ocupa 100% del panel de Discord conservando la barra lateral izquierda de SwiftPlay; en Fullscreen oculta toda la ventana y muestra `ScreenShareFullscreenOverlay` simplificado (título, Mute `[M]`, volumen, Teatro `[T]`, Salir `[F/Esc]`, auto-ocultado en `500 ms`). Además, `_relayout_participant_cards()` y `_compute_participant_card_size()` escalan todas las tarjetas de voz de manera uniforme según `max(minimum, sizeHint)` cuando alguien comparte pantalla, evitando solapamiento entre avatar, nombre y `EN VIVO` / `Ver pantalla`.
+  - **Atajo `T` Limitado al Espacio Activo (`MainWindow._shortcut_theater`):** Abre/minimiza el reproductor de YouTube solo en páginas YT, Twitch solo en Twitch, Música solo en Música y alterna Teatro de Discord solo con visor activo (sin entrar nunca a pantalla completa y bajando de fullscreen si estaba activo).
+  - **Persistencia de Última Configuración de Transmisión:** `AppConfig` guarda `discord_share_last_source_id`, `discord_share_last_quality`, `discord_share_last_fps` y `discord_share_last_audio` al iniciar o editar en vivo; tanto `_ScreenShareSetupDialog` como el atajo global usan esa última config (cayendo a `monitor:0` si la ventana guardada cerró).
+  - **Destinos Automáticos Persistentes Múltiples:** Nuevo bloque en **Ajustes → Discord** para fijar varios canales `#canal` y `@DM` en `discord_share_auto_targets` que reciben automáticamente el enlace al iniciar una transmisión (incluso con el check del diálogo desactivado) hasta quitarlos desde Ajustes.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
 ## 2026-11-23 — Atajos Globales Separados para Iniciar y Cortar Compartida de Pantalla
 - **Files:** `src/swiftplay/config.py`, `src/swiftplay/media_keys.py`, `src/swiftplay/ui/discord_panel.py`, `src/swiftplay/ui/main_window.py`, `src/swiftplay/ui/settings_dialog.py`, `src/swiftplay/ui/shortcuts_dialog.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

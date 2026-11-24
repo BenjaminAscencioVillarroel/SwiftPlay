@@ -26,7 +26,7 @@ _SHORTCUT_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         "NAVEGACIÓN Y MODOS",
         (
             ("Tab", "Rotar al instante entre YouTube, YT Music, Twitch y Discord"),
-            ("T", "Ocultar / mostrar barra lateral (Modo teatro)"),
+            ("T", "Abrir / minimizar reproductor activo o Teatro en Discord"),
             ("Ctrl + L", "Enfocar la barra de búsqueda"),
             ("?", "Mostrar / cerrar esta guía de atajos"),
         ),
@@ -36,14 +36,14 @@ _SHORTCUT_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         (
             ("Espacio  o  Clic en video", "Reproducir / Pausar el reproductor activo"),
             ("←  /  →", "Retroceder / Adelantar 5 segundos"),
-            ("M", "Silenciar / Activar sonido"),
+            ("M", "Silenciar / Activar sonido (video o pantalla Discord)"),
             ("Rueda del mouse", "Subir / Bajar volumen sobre el video (±5%)"),
         ),
     ),
     (
         "PANTALLA COMPLETA Y TECLAS GLOBALES",
         (
-            ("F  o  Doble clic", "Activar / Salir de pantalla completa 100%"),
+            ("F  o  Doble clic", "Activar / Salir de pantalla completa (Video o Discord)"),
             ("Esc", "Salir de pantalla completa"),
             ("Play / Sig. / Ant.", "Teclas multimedia globales (incluso en bandeja)"),
         ),
@@ -212,7 +212,7 @@ class ShortcutsDialog(QDialog):
                     (hang_key or "Desactivado", "Colgar / Salir del canal de voz"),
                     (
                         share_start_key or "Desactivado",
-                        "Compartir pantalla (Monitor 1 · 720p 30fps)",
+                        "Compartir pantalla (última config)",
                     ),
                     (share_stop_key or "Desactivado", "Cortar transmisión de pantalla"),
                 ),

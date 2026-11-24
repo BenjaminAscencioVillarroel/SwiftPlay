@@ -713,3 +713,237 @@ class FullscreenOverlayBar(QWidget):
         self.set_watch_later(self._in_watch_later)
         self._refresh_vol_icon()
         self.set_audio_only_silent(self.audio_only_btn.isChecked())
+
+
+class ScreenShareFullscreenOverlay(QWidget):
+    """Barra flotante simplificada para pantalla compartida en pantalla completa."""
+
+    volume_changed = Signal(int)
+    mute_toggled = Signal()
+    theater_requested = Signal()
+    exit_fullscreen_requested = Signal()
+    wheel_scrolled = Signal(int)
+
+    def __init__(
+        self,
+        palette: ThemePalette,
+        initial_volume: int = 80,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._palette = palette
+        self._muted = False
+
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setMouseTracking(True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.frame = QFrame()
+        self.frame.setObjectName("FsOverlayFrame")
+        self.frame.setMouseTracking(True)
+        outer.addWidget(self.frame)
+
+        row = QHBoxLayout(self.frame)
+        row.setContentsMargins(14, 10, 14, 10)
+        row.setSpacing(10)
+
+        self.live_badge = QLabel("● EN VIVO")
+        self.live_badge.setObjectName("LiveBadge")
+        row.addWidget(self.live_badge)
+
+        self.title_lbl = QLabel("Pantalla compartida")
+        self.title_lbl.setStyleSheet("font-size: 13px; font-weight: 600;")
+        row.addWidget(self.title_lbl, 1)
+
+        self.mute_btn = QPushButton()
+        self.mute_btn.setObjectName("IconBtn")
+        self.mute_btn.setFixedSize(30, 30)
+        self.mute_btn.setToolTip("Silenciar / Activar audio [M]")
+        self.mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mute_btn.clicked.connect(self.mute_toggled.emit)
+        row.addWidget(self.mute_btn)
+
+        self.vol_slider = ClickableSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(max(0, min(100, int(initial_volume))))
+        self.vol_slider.setFixedWidth(110)
+        self.vol_slider.setToolTip("Volumen del stream (rueda del mouse)")
+        self.vol_slider.valueChanged.connect(self._on_vol_changed)
+        row.addWidget(self.vol_slider)
+
+        self.theater_btn = QPushButton("Teatro")
+        self.theater_btn.setObjectName("PillBtn")
+        self.theater_btn.setToolTip("Modo teatro [T]")
+        self.theater_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.theater_btn.clicked.connect(self.theater_requested.emit)
+        row.addWidget(self.theater_btn)
+
+        self.exit_fs_btn = QPushButton()
+        self.exit_fs_btn.setObjectName("IconBtn")
+        self.exit_fs_btn.setFixedSize(30, 30)
+        self.exit_fs_btn.setToolTip("Salir de pantalla completa [F / Esc]")
+        self.exit_fs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.exit_fs_btn.clicked.connect(self.exit_fullscreen_requested.emit)
+        row.addWidget(self.exit_fs_btn)
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._on_hide_timeout)
+
+        self._is_fading_out = False
+        self._target_pos = QPoint(0, 0)
+        self._opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self._opacity_anim.finished.connect(self._on_anim_finished)
+        self._pos_anim = QPropertyAnimation(self, b"pos", self)
+        self.setWindowOpacity(0.0)
+        self.update_theme(palette)
+
+    def reveal(self, screen_rect: QRect) -> None:
+        w = min(max(460, screen_rect.width() - 120), 760)
+        h = 56
+        self.setFixedSize(w, h)
+        x = screen_rect.center().x() - w // 2
+        y = screen_rect.bottom() - h - 22
+        self._target_pos = QPoint(x, y)
+        if not self.isVisible():
+            self._opacity_anim.stop()
+            self._pos_anim.stop()
+            self._is_fading_out = False
+            self.setWindowOpacity(0.0)
+            self.move(x, y + 12)
+            self.show()
+            self.raise_()
+            self._start_fade_in()
+        elif self._is_fading_out or self.windowOpacity() < 0.99:
+            self.raise_()
+            self._start_fade_in()
+        else:
+            self.move(self._target_pos)
+            self.raise_()
+        self._hide_timer.start(500)
+
+    def _start_fade_in(self) -> None:
+        cur = float(self.windowOpacity())
+        self._opacity_anim.stop()
+        self._pos_anim.stop()
+        self._is_fading_out = False
+        dur = max(70, int(180 * (1.0 - cur)))
+        self._opacity_anim.setDuration(dur)
+        self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._opacity_anim.setStartValue(cur)
+        self._opacity_anim.setEndValue(1.0)
+        self._opacity_anim.start()
+
+        self._pos_anim.setDuration(dur)
+        self._pos_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._pos_anim.setStartValue(self.pos())
+        self._pos_anim.setEndValue(self._target_pos)
+        self._pos_anim.start()
+
+    def fade_out(self) -> None:
+        if not self.isVisible() or self._is_fading_out:
+            return
+        cur = float(self.windowOpacity())
+        self._opacity_anim.stop()
+        self._pos_anim.stop()
+        self._is_fading_out = True
+        dur = max(80, int(200 * cur))
+        self._opacity_anim.setDuration(dur)
+        self._opacity_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._opacity_anim.setStartValue(cur)
+        self._opacity_anim.setEndValue(0.0)
+        self._opacity_anim.start()
+
+        self._pos_anim.setDuration(dur)
+        self._pos_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._pos_anim.setStartValue(self.pos())
+        self._pos_anim.setEndValue(QPoint(self._target_pos.x(), self._target_pos.y() + 10))
+        self._pos_anim.start()
+
+    def _on_anim_finished(self) -> None:
+        if self._is_fading_out:
+            self._is_fading_out = False
+            self.hide()
+
+    def hide_immediately(self) -> None:
+        self._hide_timer.stop()
+        self._opacity_anim.stop()
+        self._pos_anim.stop()
+        self._is_fading_out = False
+        self.setWindowOpacity(0.0)
+        self.hide()
+
+    def _on_hide_timeout(self) -> None:
+        if self.underMouse():
+            self._hide_timer.start(500)
+            return
+        self.fade_out()
+
+    def enterEvent(self, event: QEvent) -> None:
+        if self._is_fading_out or self.windowOpacity() < 0.99:
+            self._start_fade_in()
+        self._hide_timer.start(500)
+        super().enterEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._is_fading_out or self.windowOpacity() < 0.99:
+            self._start_fade_in()
+        self._hide_timer.start(500)
+        super().mouseMoveEvent(event)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        delta = event.angleDelta().y() or event.angleDelta().x()
+        if delta != 0:
+            step = 1 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 5
+            self.wheel_scrolled.emit(step if delta > 0 else -step)
+            self._hide_timer.start(500)
+        event.accept()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        key = event.key()
+        if key in (Qt.Key.Key_Escape, Qt.Key.Key_F):
+            self.exit_fullscreen_requested.emit()
+            event.accept()
+            return
+        if key == Qt.Key.Key_T:
+            self.theater_requested.emit()
+            event.accept()
+            return
+        if key == Qt.Key.Key_M:
+            self.mute_toggled.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _on_vol_changed(self, val: int) -> None:
+        self._muted = val <= 0
+        self._refresh_vol_icon()
+        self.volume_changed.emit(val)
+        self._hide_timer.start(500)
+
+    def set_title(self, title: str) -> None:
+        self.title_lbl.setText(str(title or "Pantalla compartida"))
+
+    def set_volume_silent(self, vol: int, muted: bool) -> None:
+        self._muted = bool(muted) or int(vol) <= 0
+        self.vol_slider.blockSignals(True)
+        self.vol_slider.setValue(max(0, min(100, int(vol))))
+        self.vol_slider.blockSignals(False)
+        self._refresh_vol_icon()
+
+    def _refresh_vol_icon(self) -> None:
+        is_mute = self._muted or self.vol_slider.value() == 0
+        self.mute_btn.setIcon(render_icon("mute" if is_mute else "volume", self._palette.text, 16))
+
+    def update_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.exit_fs_btn.setIcon(render_icon("exit_fullscreen", palette.text, 16))
+        self._refresh_vol_icon()

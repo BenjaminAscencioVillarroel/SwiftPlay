@@ -93,6 +93,12 @@ class AppConfig:
     discord_hotkey_share_start: str = "Ctrl+Alt+S"
     discord_hotkey_share_stop: str = "Ctrl+Alt+X"
     discord_hotkey_mute_priority: bool = True
+    discord_share_last_source_id: str = "monitor:0"
+    discord_share_last_quality: str = "720p"
+    discord_share_last_fps: int = 30
+    discord_share_last_audio: bool = True
+    discord_share_auto_targets: list[str] = field(default_factory=list)
+    discord_share_auto_target_names: dict[str, str] = field(default_factory=dict)
     discord_show_locked_channels: bool = False
     discord_overlay_enabled: bool = True
     discord_overlay_mode: str = "status"
@@ -199,6 +205,37 @@ class AppConfig:
                 if cid and label and cid in hidden_chs:
                     clean_hidden_names[cid] = label
         self.discord_hidden_channel_names = clean_hidden_names
+        self.discord_share_last_source_id = (
+            str(self.discord_share_last_source_id or "monitor:0").strip() or "monitor:0"
+        )
+        sq = str(self.discord_share_last_quality or "720p").strip().lower()
+        self.discord_share_last_quality = sq if sq in ("480p", "720p", "1080p") else "720p"
+        try:
+            sfps = int(self.discord_share_last_fps or 30)
+        except (TypeError, ValueError):
+            sfps = 30
+        self.discord_share_last_fps = 60 if sfps >= 60 else 30
+        self.discord_share_last_audio = bool(self.discord_share_last_audio)
+
+        seen_auto_targets: list[str] = []
+        for raw_tgt in (self.discord_share_auto_targets or []):
+            tgt = str(raw_tgt or "").strip()
+            if (tgt.startswith("channel:") or tgt.startswith("dm:")) and tgt.split(":", 1)[1].strip():
+                kind, tid = tgt.split(":", 1)
+                norm = f"{kind}:{tid.strip()}"
+                if norm not in seen_auto_targets:
+                    seen_auto_targets.append(norm)
+        self.discord_share_auto_targets = seen_auto_targets
+
+        raw_auto_names = self.discord_share_auto_target_names or {}
+        clean_auto_names: dict[str, str] = {}
+        if isinstance(raw_auto_names, dict):
+            for k, v in raw_auto_names.items():
+                key_s = str(k or "").strip()
+                val_s = str(v or "").strip()
+                if key_s and val_s and key_s in seen_auto_targets:
+                    clean_auto_names[key_s] = val_s
+        self.discord_share_auto_target_names = clean_auto_names
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:

@@ -1435,6 +1435,15 @@ def test_gui_and_libmpv_smoke(
                     assert card_p2 is not None and any(
                         b.text().strip() == "Ver pantalla" for b in card_p2.findChildren(QPushButton)
                     ), "La tarjeta del participante compartiendo debe mostrar botón 'Ver pantalla'"
+                    cards_live = list(dp._participant_cards_order)
+                    assert len(cards_live) >= 2
+                    first_sz = cards_live[0].size()
+                    assert all(c.size() == first_sz for c in cards_live), (
+                        "Todas las tarjetas deben conservar la misma forma uniforme al compartir"
+                    )
+                    assert all(
+                        c.height() >= max(202, c.sizeHint().height()) for c in cards_live
+                    ), f"Ninguna tarjeta debe comprimirse debajo de su sizeHint: {[(c.size(), c.sizeHint()) for c in cards_live]}"
                     assert any(
                         b.text().strip() == "EN VIVO" for b in dp.vc_list_widget.findChildren(QPushButton)
                     ), "La fila del canal de voz debe mostrar botón 'EN VIVO'"
@@ -1544,15 +1553,41 @@ def test_gui_and_libmpv_smoke(
                     "La vista previa local debe cerrarse al dejar de compartir"
                 )
 
-                # Verificar atajos separados de iniciar (Monitor 1 · 720p · 30fps) y cortar transmisión
+                # Verificar atajos separados de iniciar (usa última configuración guardada) y cortar transmisión
                 hotkey_starts: list[dict[str, object]] = []
                 hotkey_stops: list[str] = []
                 orig_start_share = dp.screen_share_svc.start_share
                 orig_stop_share = dp._stop_screen_share
                 prev_bot_state = dp._bot_state
+                prev_last_cfg = (
+                    win.cfg.discord_share_last_source_id,
+                    win.cfg.discord_share_last_quality,
+                    win.cfg.discord_share_last_fps,
+                    win.cfg.discord_share_last_audio,
+                    list(win.cfg.discord_share_auto_targets),
+                    dict(win.cfg.discord_share_auto_target_names),
+                )
                 try:
                     dp._bot_state = "connected"
                     dp._screen_share_state = "idle"
+                    dp._save_last_share_config(
+                        source_id="monitor:0",
+                        quality="1080p",
+                        fps=60,
+                        include_audio=False,
+                    )
+                    assert win.cfg.discord_share_last_quality == "1080p"
+                    assert win.cfg.discord_share_last_fps == 60
+                    assert win.cfg.discord_share_last_audio is False
+
+                    # Verificar combinación de destinos automáticos persistentes (canal + DM)
+                    win.cfg.discord_share_auto_targets = ["channel:201", "dm:777", "channel:201"]
+                    win.cfg.discord_share_auto_target_names = {
+                        "channel:201": "# bots (SrvDemo)",
+                        "dm:777": "@ Compa",
+                    }
+                    assert dp._get_auto_share_targets() == [("channel", "201"), ("dm", "777")]
+
                     dp.screen_share_svc.start_share = lambda **kw: hotkey_starts.append(dict(kw))  # type: ignore[method-assign]
                     dp._stop_screen_share = lambda: hotkey_stops.append("stopped")  # type: ignore[method-assign]
                     assert dp.stop_screen_share_from_hotkey() is False
@@ -1560,15 +1595,23 @@ def test_gui_and_libmpv_smoke(
                     if res_hk_start == "started":
                         assert len(hotkey_starts) == 1
                         assert hotkey_starts[0]["source_id"] == "monitor:0"
-                        assert hotkey_starts[0]["quality"] == "720p"
-                        assert hotkey_starts[0]["fps"] == 30
-                        assert hotkey_starts[0]["include_audio"] is True
+                        assert hotkey_starts[0]["quality"] == "1080p"
+                        assert hotkey_starts[0]["fps"] == 60
+                        assert hotkey_starts[0]["include_audio"] is False
                         dp._screen_share_state = "sharing"
                         assert dp.start_screen_share_from_hotkey() == "already_sharing"
                         assert len(hotkey_starts) == 1, "El atajo de iniciar no debe alternar ni reiniciar una transmisión activa"
                         assert dp.stop_screen_share_from_hotkey() is True
                         assert hotkey_stops == ["stopped"]
                 finally:
+                    (
+                        win.cfg.discord_share_last_source_id,
+                        win.cfg.discord_share_last_quality,
+                        win.cfg.discord_share_last_fps,
+                        win.cfg.discord_share_last_audio,
+                        win.cfg.discord_share_auto_targets,
+                        win.cfg.discord_share_auto_target_names,
+                    ) = prev_last_cfg
                     dp.screen_share_svc.start_share = orig_start_share  # type: ignore[method-assign]
                     dp._stop_screen_share = orig_stop_share  # type: ignore[method-assign]
                     dp._bot_state = prev_bot_state
@@ -1580,6 +1623,139 @@ def test_gui_and_libmpv_smoke(
             assert not discord_popups, (
                 f"Se detectaron ventanas fantasma en Discord: {discord_popups}"
             )
+
+            # Verificar visor Discord: Teatro (T mantiene sidebar), Fullscreen (F oculta todo), Mute (M) y Scroll
+            class _DummyScreenPlayer:
+                def set_volume(self, _v: int) -> None:
+                    pass
+
+                def play_stream(self, *_a: object, **_kw: object) -> None:
+                    pass
+
+                def set_mouse_tracking(self, _e: bool) -> None:
+                    pass
+
+                def set_cursor_autohide(self, _v: object) -> None:
+                    pass
+
+                def unload(self) -> None:
+                    pass
+
+            dummy_screen_player = _DummyScreenPlayer()
+            orig_ensure_player = dp._ensure_screen_player
+            try:
+                dp._ensure_screen_player = lambda: dummy_screen_player  # type: ignore[method-assign,assignment]
+                win._switch_page(win.PAGE_DISCORD)
+                dp._open_screen_share_viewer(
+                    {
+                        "author_id": "777",
+                        "author_name": "Compa",
+                        "watch_url": "https://demo.trycloudflare.com/view",
+                        "stream_url": "https://demo.trycloudflare.com/stream.m3u8",
+                        "rev": 2,
+                    }
+                )
+                app.processEvents()
+                assert dp.is_screen_viewer_active
+                assert not dp.is_screen_viewer_theater
+                assert not dp.is_screen_viewer_fullscreen
+
+                # T en Discord: entra a Teatro llenando el panel de Discord sin ocultar barra lateral
+                win._shortcut_theater()
+                app.processEvents()
+                assert dp.is_screen_viewer_theater
+                assert not win.sidebar.isHidden(), "Modo teatro de Discord no debe ocultar barra lateral"
+                assert dp.top_hdr_widget.isHidden()
+                assert dp.center_hdr_card.isHidden()
+                assert dp._svc_lay.indexOf(dp.screen_video_surface) < dp._svc_lay.indexOf(dp.screen_viewer_hdr_widget), (
+                    "La barra de controles del visor debe ir debajo del video para consistencia en modo Teatro"
+                )
+
+                # F en Discord: entra a pantalla completa real y muestra overlay simplificado
+                win._shortcut_fullscreen()
+                app.processEvents()
+                assert dp.is_screen_viewer_fullscreen
+                assert win._is_discord_screen_fs is True
+                assert win.sidebar.isHidden()
+                assert win.screen_fs_overlay.isVisible()
+
+                # M y rueda cambian volumen/mute del visor Discord
+                dp._on_screen_viewer_wheel(-10)
+                assert dp.screen_viewer_vol_slider.value() == 70
+                assert win.screen_fs_overlay.vol_slider.value() == 70
+                win._shortcut_mute()
+                assert dp._screen_viewer_muted is True
+                assert dp.screen_viewer_vol_slider.value() == 0
+                win._shortcut_mute()
+                assert dp._screen_viewer_muted is False
+                assert dp.screen_viewer_vol_slider.value() == 70
+
+                # T en pantalla completa de Discord baja a Teatro (no entra ni se queda en fullscreen)
+                win._shortcut_theater()
+                app.processEvents()
+                assert not dp.is_screen_viewer_fullscreen
+                assert win._is_discord_screen_fs is False
+                assert dp.is_screen_viewer_theater
+                assert not win.sidebar.isHidden()
+
+                # F -> Esc sale de pantalla completa
+                win._shortcut_fullscreen()
+                app.processEvents()
+                assert dp.is_screen_viewer_fullscreen
+                win._shortcut_escape()
+                app.processEvents()
+                assert not dp.is_screen_viewer_fullscreen
+                assert win._is_discord_screen_fs is False
+
+                dp._close_screen_share_viewer()
+                assert not dp.is_screen_viewer_active
+            finally:
+                dp._ensure_screen_player = orig_ensure_player  # type: ignore[method-assign]
+                dp._screen_player = None
+                win.vol_hud.hide()
+                win.screen_fs_overlay.hide_immediately()
+
+            # Verificar atajo T limitado al espacio actual (YouTube, Twitch, Música, Discord)
+            prev_vid_item = win._video_item
+            prev_mus_item = win._music_item
+            try:
+                yt_it = MediaItem(video_id="yt_t_test", title="YT Demo", author="Canal", kind="video")
+                tw_it = MediaItem(video_id="tw_demo", title="Twitch Demo", author="Streamer", kind="twitch", is_live=True)
+                mus_it = MediaItem(video_id="mus_t_test", title="Song Demo", author="Artista", kind="music")
+
+                # Twitch activo: T en YouTube no abre el reproductor; en Twitch sí abre/minimiza
+                win._video_item = tw_it
+                win._switch_page(win.PAGE_VIDEO_SEARCH)
+                win._shortcut_theater()
+                assert win.stack.currentIndex() == win.PAGE_VIDEO_SEARCH
+                win._switch_page(win.PAGE_TWITCH)
+                win._shortcut_theater()
+                assert win.stack.currentIndex() == win.PAGE_VIDEO_PLAYER
+                win._shortcut_theater()
+                assert win.stack.currentIndex() == win.PAGE_TWITCH
+
+                # YouTube activo: T en Twitch no abre el reproductor; en YouTube sí abre/minimiza
+                win._video_item = yt_it
+                win._switch_page(win.PAGE_TWITCH)
+                win._shortcut_theater()
+                assert win.stack.currentIndex() == win.PAGE_TWITCH
+                win._switch_page(win.PAGE_VIDEO_SEARCH)
+                win._shortcut_theater()
+                assert win.stack.currentIndex() == win.PAGE_VIDEO_PLAYER
+                win._shortcut_theater()
+                assert win.stack.currentIndex() == win.PAGE_VIDEO_SEARCH
+
+                # Música activa: T en Música abre/minimiza reproductor; en YouTube sigue operando YT
+                win._music_item = mus_it
+                win._switch_page(win.PAGE_MUSIC_SEARCH)
+                win._shortcut_theater()
+                assert win.stack.currentIndex() == win.PAGE_MUSIC_PLAYER
+                win._shortcut_theater()
+                assert win.stack.currentIndex() == win.PAGE_MUSIC_SEARCH
+            finally:
+                win._video_item = prev_vid_item
+                win._music_item = prev_mus_item
+                win._switch_page(win.PAGE_DISCORD)
 
             # Verificar tinte dinámico según color del avatar
             from swiftplay.ui.discord_panel import _extract_avatar_tint
@@ -1615,8 +1791,24 @@ def test_gui_and_libmpv_smoke(
             assert not any("clips" in t for t in tc_btns), f"El canal de texto oculto debe desaparecer: {tc_btns}"
             assert any("bots" in t for t in tc_btns), "# bots debe seguir visible"
             known_chs = dp.get_available_channels_for_settings()
+            known_targets = dp.get_available_share_targets_for_settings()
             assert any(cid == "101" for cid, _ in known_chs) and any(cid == "202" for cid, _ in known_chs)
-            hdlg = SettingsDialog(win.cfg, win.yt, thumb_cache=win.thumb_cache, discord_channels=known_chs, parent=win)
+            hdlg = SettingsDialog(
+                win.cfg,
+                win.yt,
+                thumb_cache=win.thumb_cache,
+                discord_channels=known_chs,
+                discord_share_targets=known_targets,
+                parent=win,
+            )
+            assert hdlg.discord_auto_share_combo.count() >= 1
+            hdlg._on_add_auto_share_target()
+            assert len(win.cfg.discord_share_auto_targets) >= 1
+            if hdlg.discord_auto_share_combo.count() >= 1 and str(hdlg.discord_auto_share_combo.currentData() or ""):
+                hdlg._on_add_auto_share_target()
+                assert len(win.cfg.discord_share_auto_targets) >= 2, "Debe permitir múltiples destinos automáticos a la vez"
+            hdlg._on_clear_auto_share_targets()
+            assert win.cfg.discord_share_auto_targets == []
             hdlg._on_unhide_all_channels()
             hdlg.done(0)
             hdlg.deleteLater()

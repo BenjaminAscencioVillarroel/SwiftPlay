@@ -90,6 +90,7 @@ from swiftplay.ui.shortcuts_dialog import ShortcutsDialog
 from swiftplay.ui.video_overlays import (
     FullscreenOverlayBar,
     PlaybackFeedbackHud,
+    ScreenShareFullscreenOverlay,
     VolumeHudOverlay,
 )
 from swiftplay.ui.video_surface import VideoPlayerPanel
@@ -262,6 +263,7 @@ class MainWindow(QMainWindow):
         self._pending_advance_after_radio = False
         self._force_quit = False
         self._is_fullscreen = False
+        self._is_discord_screen_fs = False
         self._sidebar_hidden = False
         self._pre_fs_was_maximized = False
         self._pre_fs_geometry: QRect | None = None
@@ -413,6 +415,7 @@ class MainWindow(QMainWindow):
             initial_volume=self.cfg.video_volume,
             initial_audio_only=self.cfg.video_audio_only,
         )
+        self.screen_fs_overlay = ScreenShareFullscreenOverlay(palette=self.palette)
         self.vol_hud = VolumeHudOverlay(palette=self.palette)
         self.action_hud = PlaybackFeedbackHud(palette=self.palette)
         self.discord_overlay = DiscordStatusOverlay(
@@ -1068,6 +1071,18 @@ class MainWindow(QMainWindow):
         self.discord_panel.sound_event_requested.connect(self.play_discord_sound)
         self.discord_panel.toast_requested.connect(self.show_toast)
         self.discord_panel.screen_share_ram_updated.connect(self._on_screen_share_ram_updated)
+        self.discord_panel.screen_viewer_fullscreen_changed.connect(
+            self._on_discord_screen_viewer_fullscreen_changed
+        )
+        self.discord_panel.screen_viewer_volume_hud_requested.connect(
+            self._on_discord_screen_viewer_volume_hud
+        )
+        self.discord_panel.screen_viewer_mouse_moved.connect(
+            self._on_discord_screen_viewer_mouse_moved
+        )
+        self.discord_panel.screen_viewer_state_updated.connect(
+            self._on_discord_screen_viewer_state_updated
+        )
         self.stack.addWidget(self.discord_panel)
 
         # Pág 10: Canal de YouTube (Videos y Directos sin Shorts)
@@ -1502,6 +1517,17 @@ class MainWindow(QMainWindow):
         ov.theater_requested.connect(self.toggle_sidebar)
         ov.wheel_scrolled.connect(self._on_video_wheel_volume)
 
+        sv = self.screen_fs_overlay
+        sv.volume_changed.connect(
+            lambda v: self.discord_panel.set_screen_viewer_volume(int(v), show_hud=False)
+        )
+        sv.mute_toggled.connect(
+            lambda: self.discord_panel.toggle_screen_viewer_mute_from_hotkey(show_hud=False)
+        )
+        sv.theater_requested.connect(self.discord_panel.toggle_screen_viewer_theater)
+        sv.exit_fullscreen_requested.connect(self.discord_panel.exit_screen_viewer_fullscreen)
+        sv.wheel_scrolled.connect(self.discord_panel._on_screen_viewer_wheel)
+
     def _connect_minibar_signals(self) -> None:
         mb = self.mini_bar
         mb.expand_requested.connect(self._restore_from_mini_bar)
@@ -1615,21 +1641,78 @@ class MainWindow(QMainWindow):
             self.toggle_play_pause()
 
     def _shortcut_fullscreen(self) -> None:
-        if not self._typing_in_input() and self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER:
+        if self._typing_in_input():
+            return
+        cur = self.stack.currentIndex()
+        if cur == self.PAGE_VIDEO_PLAYER:
             self.toggle_fullscreen()
+        elif (
+            cur == self.PAGE_DISCORD
+            and hasattr(self, "discord_panel")
+            and self.discord_panel.is_screen_viewer_active
+        ):
+            self.discord_panel.toggle_screen_viewer_fullscreen()
 
     def _shortcut_theater(self) -> None:
-        if not self._typing_in_input():
-            self.toggle_sidebar()
+        if self._typing_in_input():
+            return
+        cur = self.stack.currentIndex()
+        if cur == self.PAGE_DISCORD:
+            if hasattr(self, "discord_panel") and self.discord_panel.is_screen_viewer_active:
+                self.discord_panel.toggle_screen_viewer_theater()
+            return
+        if cur == self.PAGE_VIDEO_PLAYER:
+            if self._is_fullscreen:
+                self.toggle_fullscreen()
+                return
+            dest = (
+                self.PAGE_TWITCH
+                if (self._video_item is not None and self._video_item.kind == "twitch")
+                else getattr(self, "_video_return_page", self.PAGE_VIDEO_SEARCH)
+            )
+            self._switch_page(dest)
+            return
+        if cur in (
+            self.PAGE_VIDEO_SEARCH,
+            self.PAGE_WATCH_LATER,
+            self.PAGE_HISTORY,
+            self.PAGE_CHANNEL,
+        ):
+            if self._video_item is not None and self._video_item.kind != "twitch":
+                self._video_return_page = cur
+                self._switch_page(self.PAGE_VIDEO_PLAYER)
+            return
+        if cur == self.PAGE_TWITCH:
+            if self._video_item is not None and self._video_item.kind == "twitch":
+                self._video_return_page = self.PAGE_TWITCH
+                self._switch_page(self.PAGE_VIDEO_PLAYER)
+            return
+        if cur == self.PAGE_MUSIC_PLAYER:
+            self._switch_page(getattr(self, "_music_return_page", self.PAGE_MUSIC_SEARCH))
+            return
+        if cur in (self.PAGE_MUSIC_SEARCH, self.PAGE_MY_MUSIC, self.PAGE_MUSIC_HISTORY):
+            if self._music_item is not None:
+                self._remember_music_return_page()
+                self._switch_page(self.PAGE_MUSIC_PLAYER)
 
     def _shortcut_escape(self) -> None:
         if hasattr(self, "discord_panel") and self.discord_panel.close_image_lightbox():
+            return
+        if hasattr(self, "discord_panel") and self.discord_panel.is_screen_viewer_fullscreen:
+            self.discord_panel.exit_screen_viewer_fullscreen()
             return
         if self._is_fullscreen:
             self.toggle_fullscreen()
 
     def _shortcut_mute(self) -> None:
         if self._typing_in_input():
+            return
+        if (
+            self.stack.currentIndex() == self.PAGE_DISCORD
+            and hasattr(self, "discord_panel")
+            and self.discord_panel.is_screen_viewer_active
+        ):
+            self.discord_panel.toggle_screen_viewer_mute_from_hotkey(show_hud=True)
             return
         deck = self._get_effective_deck()
         if deck == "video":
@@ -1727,13 +1810,77 @@ class MainWindow(QMainWindow):
         if not (self.isVisible() and self.isActiveWindow()):
             return
         if res == "started":
-            self.show_toast("Discord: Iniciando transmisión (Monitor 1 · 720p 30fps)")
+            self.show_toast(
+                f"Discord: Iniciando transmisión ({self.cfg.discord_share_last_quality} "
+                f"{self.cfg.discord_share_last_fps}fps)"
+            )
         elif res == "not_connected":
             self.show_toast("Discord: Conecta el Bot primero para compartir pantalla")
         elif res == "no_cloudflared":
             self.show_toast("Falta cloudflared.exe: abre Compartir pantalla para descargarlo")
         elif res == "no_ffmpeg":
             self.show_toast("No se encontró bin/ffmpeg.exe para compartir pantalla")
+
+    def _on_discord_screen_viewer_fullscreen_changed(self, active: bool) -> None:
+        if active:
+            if self._is_fullscreen:
+                self.toggle_fullscreen()
+            if not self._is_discord_screen_fs:
+                self._pre_fs_was_maximized = bool(
+                    self.windowState() & Qt.WindowState.WindowMaximized
+                )
+                if not self._pre_fs_was_maximized:
+                    self._pre_fs_geometry = QRect(self.geometry())
+                self._is_discord_screen_fs = True
+                self.sidebar.setVisible(False)
+                self.top_bar.setVisible(False)
+                self._bottom_bar_anim.stop()
+                self._bottom_bar_hiding = False
+                self.bottom_bar_wrap.set_reveal_height(74)
+                self.bottom_bar_wrap.setVisible(False)
+                self.showFullScreen()
+            scr = self.screen() or QApplication.primaryScreen()
+            rect = scr.geometry() if scr else self.geometry()
+            self.screen_fs_overlay.reveal(rect)
+        else:
+            if self._is_discord_screen_fs:
+                self._is_discord_screen_fs = False
+                self.screen_fs_overlay.hide_immediately()
+                self.sidebar.setVisible(not self._sidebar_hidden)
+                self.top_bar.setVisible(self.stack.currentIndex() != self.PAGE_DISCORD)
+                if self._pre_fs_was_maximized:
+                    self.showMaximized()
+                else:
+                    self.showNormal()
+                    if self._pre_fs_geometry is not None and not self._pre_fs_geometry.isNull():
+                        self.setGeometry(self._pre_fs_geometry)
+                self._update_bottom_bar_visibility()
+            else:
+                self.screen_fs_overlay.hide_immediately()
+
+    def _on_discord_screen_viewer_mouse_moved(self) -> None:
+        if self._is_discord_screen_fs and self.stack.currentIndex() == self.PAGE_DISCORD:
+            scr = self.screen() or QApplication.primaryScreen()
+            rect = scr.geometry() if scr else self.geometry()
+            self.screen_fs_overlay.reveal(rect)
+
+    def _on_discord_screen_viewer_volume_hud(self, percent: int) -> None:
+        if not hasattr(self, "discord_panel"):
+            return
+        if self._is_discord_screen_fs:
+            scr = self.screen() or QApplication.primaryScreen()
+            anchor = scr.geometry() if scr else self.geometry()
+        else:
+            vs = self.discord_panel.screen_video_surface
+            top_left = vs.mapToGlobal(QPoint(0, 0))
+            anchor = QRect(top_left, vs.size())
+        self.vol_hud.show_volume(percent, anchor)
+
+    def _on_discord_screen_viewer_state_updated(
+        self, title: str, volume: int, muted: bool
+    ) -> None:
+        self.screen_fs_overlay.set_title(title)
+        self.screen_fs_overlay.set_volume_silent(volume, muted=muted)
 
     def _on_global_discord_share_stop(self) -> None:
         if self.discord_panel.stop_screen_share_from_hotkey():
@@ -1805,6 +1952,7 @@ class MainWindow(QMainWindow):
         self.video_panel.update_theme(p)
         self.music_panel.update_theme(p)
         self.fs_overlay.update_theme(p)
+        self.screen_fs_overlay.update_theme(p)
         self.vol_hud.update_theme(p)
         self.action_hud.update_theme(p)
         self.mini_bar.update_theme(p)
@@ -2641,6 +2789,12 @@ class MainWindow(QMainWindow):
     def _switch_page(self, page_idx: int) -> None:
         if self._is_fullscreen and page_idx != self.PAGE_VIDEO_PLAYER:
             self.toggle_fullscreen()
+        if (
+            self._is_discord_screen_fs
+            and page_idx != self.PAGE_DISCORD
+            and hasattr(self, "discord_panel")
+        ):
+            self.discord_panel.exit_screen_viewer_fullscreen()
 
         self._stop_page_fade()
         prev_idx = self.stack.currentIndex()
@@ -2675,7 +2829,11 @@ class MainWindow(QMainWindow):
             elif self._video_paused and self.video_player.is_loaded:
                 self._video_idle_unload_timer.start(20_000)
 
-            self.top_bar.setVisible(not self._is_fullscreen and page_idx != self.PAGE_DISCORD)
+            self.top_bar.setVisible(
+                not self._is_fullscreen
+                and not self._is_discord_screen_fs
+                and page_idx != self.PAGE_DISCORD
+            )
 
             music_return_nav = {
                 self.PAGE_MUSIC_SEARCH: self.nav_ytm,
@@ -5580,7 +5738,7 @@ class MainWindow(QMainWindow):
 
     def _update_bottom_bar_visibility(self) -> None:
         # Fija siempre mientras haya reproducción/contenido, excepto en video fullscreen o dentro del reproductor de video
-        if self._is_fullscreen:
+        if self._is_fullscreen or self._is_discord_screen_fs:
             self._bottom_bar_anim.stop()
             self._bottom_bar_hiding = False
             self.bottom_bar_wrap.set_reveal_height(74)
@@ -5699,6 +5857,8 @@ class MainWindow(QMainWindow):
         else:
             if self._is_fullscreen:
                 self.toggle_fullscreen()
+            if self._is_discord_screen_fs and hasattr(self, "discord_panel"):
+                self.discord_panel.exit_screen_viewer_fullscreen()
             self.hide()
             if self.video_player.is_loaded and (
                 self._video_paused or self.video_player.is_paused
@@ -5751,6 +5911,7 @@ class MainWindow(QMainWindow):
             self.yt,
             thumb_cache=self.thumb_cache,
             discord_channels=self.discord_panel.get_available_channels_for_settings(),
+            discord_share_targets=self.discord_panel.get_available_share_targets_for_settings(),
             parent=self,
         )
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -5886,6 +6047,8 @@ class MainWindow(QMainWindow):
             self.persist_session_state(force=True)
             if self._is_fullscreen:
                 self.toggle_fullscreen()
+            if self._is_discord_screen_fs and hasattr(self, "discord_panel"):
+                self.discord_panel.exit_screen_viewer_fullscreen()
             self.hide()
             if self.video_player.is_loaded and (
                 self._video_paused or self.video_player.is_paused
@@ -6049,6 +6212,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.fs_overlay.close()
+        except Exception:
+            pass
+        try:
+            self.screen_fs_overlay.close()
         except Exception:
             pass
         try:

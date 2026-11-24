@@ -255,6 +255,7 @@ class SettingsDialog(QDialog):
         yt_service: YouTubeService,
         thumb_cache: ThumbnailCache | None = None,
         discord_channels: list[tuple[str, str]] | None = None,
+        discord_share_targets: list[tuple[str, str]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -262,6 +263,7 @@ class SettingsDialog(QDialog):
         self.yt = yt_service
         self._thumb_cache = thumb_cache
         self._discord_channels: list[tuple[str, str]] = list(discord_channels or [])
+        self._discord_share_targets: list[tuple[str, str]] = list(discord_share_targets or [])
         self._pool = QThreadPool(self)
         self._active_tasks: set[_WorkerSignals] = set()
         self._login_cancel: threading.Event | None = None
@@ -1058,6 +1060,55 @@ class SettingsDialog(QDialog):
         hc_lay.addWidget(hidden_box)
 
         lay.addWidget(hidden_card)
+
+        # Destinos automáticos para enlaces de pantalla compartida (#canales y @DMs)
+        auto_share_card = QFrame()
+        auto_share_card.setObjectName("MediaCard")
+        ac_lay = QVBoxLayout(auto_share_card)
+        ac_lay.setContentsMargins(14, 10, 14, 10)
+        ac_lay.setSpacing(8)
+
+        ac_hdr = QHBoxLayout()
+        ac_hdr.setSpacing(8)
+        ac_title = QLabel("Destinos automáticos de transmisión (pantalla compartida)")
+        ac_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        ac_hdr.addWidget(ac_title, 1)
+
+        self.discord_clear_auto_share_btn = QPushButton("Quitar todos")
+        self.discord_clear_auto_share_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_clear_auto_share_btn.clicked.connect(self._on_clear_auto_share_targets)
+        ac_hdr.addWidget(self.discord_clear_auto_share_btn)
+        ac_lay.addLayout(ac_hdr)
+
+        ac_desc = QLabel(
+            "Mientras tengas canales #texto o @DMs aquí, SwiftPlay enviará el enlace siempre al iniciar una transmisión (por diálogo o atajo), sin importar si marcas la casilla en Discord."
+        )
+        ac_desc.setObjectName("MutedLabel")
+        ac_desc.setWordWrap(True)
+        ac_lay.addWidget(ac_desc)
+
+        add_share_row = QHBoxLayout()
+        add_share_row.setSpacing(8)
+        self.discord_auto_share_combo = QComboBox()
+        self.discord_auto_share_combo.setToolTip(
+            "Elige un canal #texto o @DM para enviar el enlace automáticamente siempre"
+        )
+        add_share_row.addWidget(self.discord_auto_share_combo, 1)
+
+        self.discord_add_auto_share_btn = QPushButton("Agregar destino")
+        self.discord_add_auto_share_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_add_auto_share_btn.clicked.connect(self._on_add_auto_share_target)
+        add_share_row.addWidget(self.discord_add_auto_share_btn)
+        ac_lay.addLayout(add_share_row)
+
+        auto_share_box = QWidget()
+        self.discord_auto_share_list_lay = QVBoxLayout(auto_share_box)
+        self.discord_auto_share_list_lay.setContentsMargins(0, 2, 0, 0)
+        self.discord_auto_share_list_lay.setSpacing(5)
+        ac_lay.addWidget(auto_share_box)
+
+        lay.addWidget(auto_share_card)
+        self._refresh_auto_share_ui()
         self._refresh_hidden_channels_ui()
 
         guide = QLabel(
@@ -1119,7 +1170,7 @@ class SettingsDialog(QDialog):
             ("mute", "Silenciar / Activar micrófono (Prioritario)", "discord_hotkey_mute"),
             ("deafen", "Ensordecer / Activar audio Discord", "discord_hotkey_deafen"),
             ("hangup", "Colgar / Salir del canal de voz", "discord_hotkey_hangup"),
-            ("share_start", "Compartir pantalla (Mon. 1 · 720p 30fps)", "discord_hotkey_share_start"),
+            ("share_start", "Compartir pantalla (última config)", "discord_hotkey_share_start"),
             ("share_stop", "Cortar transmisión de pantalla", "discord_hotkey_share_stop"),
         )
         form_card = QFrame()
@@ -1480,6 +1531,94 @@ class SettingsDialog(QDialog):
         save_config(self.cfg)
         self._refresh_hidden_channels_ui()
         self.discord_ui_settings_changed.emit()
+
+    def _refresh_auto_share_ui(self) -> None:
+        if not hasattr(self, "discord_auto_share_list_lay"):
+            return
+        while self.discord_auto_share_list_lay.count() > 0:
+            item = self.discord_auto_share_list_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+
+        active_keys = list(self.cfg.discord_share_auto_targets)
+        active_set = set(active_keys)
+        label_by_key: dict[str, str] = dict(self.cfg.discord_share_auto_target_names)
+        for key, lbl in self._discord_share_targets:
+            if key and lbl:
+                label_by_key.setdefault(key, lbl)
+
+        self.discord_auto_share_combo.clear()
+        for key, lbl in self._discord_share_targets:
+            if key and key not in active_set:
+                self.discord_auto_share_combo.addItem(lbl, key)
+        if self.discord_auto_share_combo.count() == 0:
+            self.discord_auto_share_combo.addItem("Conecta Discord para listar canales o DMs", "")
+            self.discord_add_auto_share_btn.setEnabled(False)
+        else:
+            self.discord_add_auto_share_btn.setEnabled(True)
+
+        self.discord_clear_auto_share_btn.setEnabled(len(active_keys) > 0)
+        if not active_keys:
+            empty_lbl = QLabel("Sin destinos automáticos configurados (solo presencia nativa SwiftPlay).")
+            empty_lbl.setObjectName("MutedLabel")
+            self.discord_auto_share_list_lay.addWidget(empty_lbl)
+            return
+
+        for key in active_keys:
+            row = QFrame()
+            row.setObjectName("DiscordChannelRow")
+            r_lay = QHBoxLayout(row)
+            r_lay.setContentsMargins(10, 5, 8, 5)
+            r_lay.setSpacing(8)
+            disp = label_by_key.get(key) or key
+            lbl = QLabel(disp)
+            lbl.setWordWrap(False)
+            r_lay.addWidget(lbl, 1)
+
+            rm_btn = QPushButton("Quitar")
+            rm_btn.setObjectName("PillBtn")
+            rm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            rm_btn.clicked.connect(lambda _c=False, tkey=key: self._on_remove_auto_share_target(tkey))
+            r_lay.addWidget(rm_btn)
+            self.discord_auto_share_list_lay.addWidget(row)
+
+    def _on_add_auto_share_target(self) -> None:
+        key = str(self.discord_auto_share_combo.currentData() or "").strip()
+        if not key:
+            return
+        label = str(self.discord_auto_share_combo.currentText() or "").strip()
+        if key not in self.cfg.discord_share_auto_targets:
+            self.cfg.discord_share_auto_targets = list(self.cfg.discord_share_auto_targets) + [key]
+        if label:
+            names = dict(self.cfg.discord_share_auto_target_names)
+            names[key] = label
+            self.cfg.discord_share_auto_target_names = names
+        save_config(self.cfg)
+        self._refresh_auto_share_ui()
+
+    def _on_remove_auto_share_target(self, target_key: str) -> None:
+        key = str(target_key or "").strip()
+        if not key:
+            return
+        self.cfg.discord_share_auto_targets = [
+            x for x in self.cfg.discord_share_auto_targets if x != key
+        ]
+        names = dict(self.cfg.discord_share_auto_target_names)
+        names.pop(key, None)
+        self.cfg.discord_share_auto_target_names = names
+        save_config(self.cfg)
+        self._refresh_auto_share_ui()
+
+    def _on_clear_auto_share_targets(self) -> None:
+        if not self.cfg.discord_share_auto_targets and not self.cfg.discord_share_auto_target_names:
+            return
+        self.cfg.discord_share_auto_targets = []
+        self.cfg.discord_share_auto_target_names = {}
+        save_config(self.cfg)
+        self._refresh_auto_share_ui()
 
     def _on_startup_toggled(self, checked: bool) -> None:
         try:

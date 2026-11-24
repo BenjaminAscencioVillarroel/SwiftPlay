@@ -88,6 +88,7 @@ from swiftplay.themes import ThemePalette, apply_windows_dark_titlebar
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
 from swiftplay.ui.video_surface import VideoSurface
+from swiftplay.ui.widgets import ClickableSlider
 
 _IMAGE_EXTS: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 _MAX_CHAT_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -1488,6 +1489,8 @@ def _compute_participant_card_size(
     avail_w: int,
     avail_h: int,
     spacing: int = 12,
+    *,
+    has_screen_share: bool = False,
 ) -> tuple[int, int]:
     """Dimensiona las tarjetas según la cantidad de participantes y el viewport disponible."""
     if count <= 1:
@@ -1501,14 +1504,20 @@ def _compute_participant_card_size(
     else:
         pref_w, pref_h = 205, 154
 
+    if has_screen_share:
+        pref_w = max(pref_w, 236)
+        pref_h = max(pref_h, 210 if count <= 2 else 204)
+
+    min_w = 204 if has_screen_share else 164
+    min_h = 202 if has_screen_share else 142
     max_row = max(row_sizes) if row_sizes else 1
     num_rows = max(1, len(row_sizes))
     usable_w = max(190, int(avail_w) - 24)
     usable_h = max(160, int(avail_h) - 24)
-    max_card_w = max(164, (usable_w - spacing * max(0, max_row - 1)) // max_row)
-    max_card_h = max(142, (usable_h - spacing * max(0, num_rows - 1)) // num_rows)
-    card_w = max(164, min(pref_w, max_card_w))
-    card_h = max(142, min(pref_h, max_card_h))
+    max_card_w = max(min_w, (usable_w - spacing * max(0, max_row - 1)) // max_row)
+    max_card_h = max(min_h, (usable_h - spacing * max(0, num_rows - 1)) // num_rows)
+    card_w = max(min_w, min(pref_w, max_card_w))
+    card_h = max(min_h, min(pref_h, max_card_h))
     return card_w, card_h
 
 
@@ -1665,15 +1674,15 @@ class _ParticipantCard(QFrame):
         self._card_bg_hex, self._card_border_hex = _default_card_tint(name)
 
         self.setObjectName("DiscordParticipantCard")
-        self.setMinimumWidth(164)
-        self.setMinimumHeight(168 if self._screen_share is not None else 142)
+        self.setMinimumWidth(204 if self._screen_share is not None else 164)
+        self.setMinimumHeight(202 if self._screen_share is not None else 142)
         if not self._is_self:
             self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.customContextMenuRequested.connect(self._on_context_menu)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 14, 14, 12)
-        lay.setSpacing(8)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(6)
         lay.addStretch(1)
 
         self.avatar = _AvatarCircleWidget(
@@ -1730,6 +1739,7 @@ class _ParticipantCard(QFrame):
 
             live_tag = QLabel("EN VIVO")
             live_tag.setObjectName("ScreenShareLiveBadge")
+            live_tag.setFixedHeight(22)
             ss_row.addWidget(live_tag)
 
             q_txt = str(self._screen_share.get("quality") or "").strip()
@@ -1737,6 +1747,7 @@ class _ParticipantCard(QFrame):
             spec = f" ({q_txt} {fps_txt}fps)" if q_txt and fps_txt else ""
             watch_btn = QPushButton("Ver pantalla")
             watch_btn.setObjectName("ScreenShareCardWatchBtn")
+            watch_btn.setFixedHeight(24)
             watch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             watch_btn.setToolTip(f"Ver pantalla compartida de {name}{spec} directo en SwiftPlay")
             watch_btn.clicked.connect(
@@ -1892,6 +1903,7 @@ class _ScreenShareSetupDialog(QDialog):
         current_quality: str = "720p",
         current_fps: int = 30,
         current_include_audio: bool = True,
+        auto_targets_count: int = 0,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1984,6 +1996,17 @@ class _ScreenShareSetupDialog(QDialog):
         self.announce_check.setChecked(False)
         self.announce_check.setEnabled(has_targets)
         root.addWidget(self.announce_check)
+
+        if int(auto_targets_count or 0) > 0 and not self._is_live_edit:
+            n_auto = int(auto_targets_count)
+            auto_lbl = QLabel(
+                f"Destinos automáticos activos en Ajustes → Discord: {n_auto} "
+                "(se enviará el enlace siempre al iniciar)."
+            )
+            auto_lbl.setObjectName("MutedLabel")
+            auto_lbl.setWordWrap(True)
+            auto_lbl.setStyleSheet("font-size: 11px; background: transparent;")
+            root.addWidget(auto_lbl)
 
         self.targets_box = QFrame()
         self.targets_box.setObjectName("ScreenShareBanner")
@@ -2204,6 +2227,10 @@ class DiscordVoicePanel(QWidget):
     toast_requested = Signal(str)
     screen_share_announced = Signal(str, str, str)  # kind, target_id, message_id
     screen_share_ram_updated = Signal(float, float)  # ws_mb, priv_mb
+    screen_viewer_fullscreen_changed = Signal(bool)
+    screen_viewer_volume_hud_requested = Signal(int)
+    screen_viewer_mouse_moved = Signal()
+    screen_viewer_state_updated = Signal(str, int, bool)  # title, effective_vol, muted
 
     _LIST_AVATAR_SIZE = QSize(28, 28)
 
@@ -2309,9 +2336,13 @@ class DiscordVoicePanel(QWidget):
         self._remote_screen_share: dict[str, Any] | None = None
         self._screen_viewer_active = False
         self._screen_viewer_is_local_preview = False
-        self._screen_viewer_expanded = False
+        self._screen_viewer_theater = False
+        self._screen_viewer_fullscreen = False
+        self._screen_viewer_pre_fs_theater = False
+        self._pre_theater_chrome: dict[str, bool] = {}
         self._screen_viewer_muted = False
         self._screen_viewer_volume = 80
+        self._screen_viewer_prev_vol = 80
         self._screen_viewer_stream_url = ""
         self._screen_viewer_watch_url = ""
         self._screen_viewer_author_id = ""
@@ -2347,9 +2378,13 @@ class DiscordVoicePanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 12, 18, 10)
         root.setSpacing(10)
+        self._root_lay = root
 
         # --- Cabecera minimalista ---
-        hdr = QHBoxLayout()
+        self.top_hdr_widget = QWidget()
+        self.top_hdr_widget.setObjectName("TransparentBox")
+        hdr = QHBoxLayout(self.top_hdr_widget)
+        hdr.setContentsMargins(0, 0, 0, 0)
         hdr.setSpacing(8)
         self.title_lbl = QLabel("Discord")
         self.title_lbl.setObjectName("ViewTitle")
@@ -2387,7 +2422,7 @@ class DiscordVoicePanel(QWidget):
         self.connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.connect_btn.clicked.connect(self._on_connect_toggle_clicked)
         hdr.addWidget(self.connect_btn)
-        root.addLayout(hdr)
+        root.addWidget(self.top_hdr_widget)
 
         # --- Tarjeta de configuración inicial (cuando aún no hay Bot Token) ---
         self.setup_card = QFrame()
@@ -2548,6 +2583,7 @@ class DiscordVoicePanel(QWidget):
         # Cabecera del área central (Voz / Chat toggles + canal activo)
         center_hdr_card = QFrame()
         center_hdr_card.setObjectName("DiscordHeaderBar")
+        self.center_hdr_card = center_hdr_card
         chdr = QHBoxLayout(center_hdr_card)
         chdr.setContentsMargins(12, 7, 12, 7)
         chdr.setSpacing(6)
@@ -2582,9 +2618,11 @@ class DiscordVoicePanel(QWidget):
         vp_lay = QVBoxLayout(self.voice_pane)
         vp_lay.setContentsMargins(10, 8, 10, 10)
         vp_lay.setSpacing(8)
+        self._vp_lay = vp_lay
 
         voice_hdr_frame = QFrame()
         voice_hdr_frame.setObjectName("DiscordVoiceHeader")
+        self.voice_hdr_frame = voice_hdr_frame
         vh_lay = QHBoxLayout(voice_hdr_frame)
         vh_lay.setContentsMargins(10, 5, 8, 5)
         vh_lay.setSpacing(6)
@@ -2695,11 +2733,23 @@ class DiscordVoicePanel(QWidget):
         self.screen_viewer_card = QFrame()
         self.screen_viewer_card.setObjectName("ScreenShareViewerCard")
         svc_lay = QVBoxLayout(self.screen_viewer_card)
-        svc_lay.setContentsMargins(8, 6, 8, 8)
+        svc_lay.setContentsMargins(8, 8, 8, 6)
         svc_lay.setSpacing(6)
+        self._svc_lay = svc_lay
 
-        sv_hdr = QHBoxLayout()
+        self.screen_video_surface = VideoSurface(self.screen_viewer_card)
+        self.screen_video_surface.setMinimumHeight(240)
+        self.screen_video_surface.double_clicked.connect(self.toggle_screen_viewer_fullscreen)
+        self.screen_video_surface.wheel_scrolled.connect(self._on_screen_viewer_wheel)
+        self.screen_video_surface.mouse_moved.connect(self.screen_viewer_mouse_moved.emit)
+        svc_lay.addWidget(self.screen_video_surface, 1)
+
+        self.screen_viewer_hdr_widget = QWidget()
+        self.screen_viewer_hdr_widget.setObjectName("TransparentBox")
+        sv_hdr = QHBoxLayout(self.screen_viewer_hdr_widget)
+        sv_hdr.setContentsMargins(0, 0, 0, 0)
         sv_hdr.setSpacing(6)
+        self._sv_hdr_lay = sv_hdr
         self.screen_viewer_title_lbl = QLabel("Pantalla compartida")
         self.screen_viewer_title_lbl.setStyleSheet(
             "font-size: 12px; font-weight: 700; background: transparent;"
@@ -2709,24 +2759,41 @@ class DiscordVoicePanel(QWidget):
         self.screen_viewer_mute_btn = QPushButton()
         self.screen_viewer_mute_btn.setObjectName("IconBtn")
         self.screen_viewer_mute_btn.setFixedSize(26, 26)
-        self.screen_viewer_mute_btn.setToolTip("Silenciar o activar audio del stream")
+        self.screen_viewer_mute_btn.setToolTip("Silenciar o activar audio del stream [M]")
         self.screen_viewer_mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.screen_viewer_mute_btn.clicked.connect(self._toggle_screen_viewer_mute)
+        self.screen_viewer_mute_btn.clicked.connect(
+            lambda _c=False: self.toggle_screen_viewer_mute_from_hotkey(show_hud=False)
+        )
         sv_hdr.addWidget(self.screen_viewer_mute_btn)
 
-        self.screen_viewer_vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.screen_viewer_vol_slider = ClickableSlider(
+            Qt.Orientation.Horizontal, volume_wheel=True
+        )
         self.screen_viewer_vol_slider.setRange(0, 100)
         self.screen_viewer_vol_slider.setValue(80)
         self.screen_viewer_vol_slider.setFixedWidth(90)
-        self.screen_viewer_vol_slider.setToolTip("Volumen del stream compartido")
+        self.screen_viewer_vol_slider.setToolTip(
+            "Volumen del stream compartido (rueda: ±5%, Shift: ±1%)"
+        )
         self.screen_viewer_vol_slider.valueChanged.connect(self._on_screen_viewer_vol_changed)
         sv_hdr.addWidget(self.screen_viewer_vol_slider)
 
-        self.screen_viewer_expand_btn = QPushButton("Expandir")
-        self.screen_viewer_expand_btn.setObjectName("PillBtn")
-        self.screen_viewer_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.screen_viewer_expand_btn.clicked.connect(self._toggle_screen_viewer_expanded)
-        sv_hdr.addWidget(self.screen_viewer_expand_btn)
+        self.screen_viewer_theater_btn = QPushButton("Teatro")
+        self.screen_viewer_theater_btn.setObjectName("PillBtn")
+        self.screen_viewer_theater_btn.setToolTip(
+            "Modo teatro (ocupa toda el área de Discord manteniendo la barra lateral) [T]"
+        )
+        self.screen_viewer_theater_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.screen_viewer_theater_btn.clicked.connect(self.toggle_screen_viewer_theater)
+        sv_hdr.addWidget(self.screen_viewer_theater_btn)
+
+        self.screen_viewer_fs_btn = QPushButton()
+        self.screen_viewer_fs_btn.setObjectName("IconBtn")
+        self.screen_viewer_fs_btn.setFixedSize(28, 28)
+        self.screen_viewer_fs_btn.setToolTip("Pantalla completa [F]")
+        self.screen_viewer_fs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.screen_viewer_fs_btn.clicked.connect(self.toggle_screen_viewer_fullscreen)
+        sv_hdr.addWidget(self.screen_viewer_fs_btn)
 
         self.screen_viewer_browser_btn = QPushButton("Navegador")
         self.screen_viewer_browser_btn.setObjectName("PillBtn")
@@ -2739,12 +2806,7 @@ class DiscordVoicePanel(QWidget):
         self.screen_viewer_close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.screen_viewer_close_btn.clicked.connect(self._close_screen_share_viewer)
         sv_hdr.addWidget(self.screen_viewer_close_btn)
-        svc_lay.addLayout(sv_hdr)
-
-        self.screen_video_surface = VideoSurface(self.screen_viewer_card)
-        self.screen_video_surface.setMinimumHeight(240)
-        self.screen_video_surface.double_clicked.connect(self._toggle_screen_viewer_expanded)
-        svc_lay.addWidget(self.screen_video_surface, 1)
+        svc_lay.addWidget(self.screen_viewer_hdr_widget)
 
         self.screen_viewer_card.setVisible(False)
         vp_lay.addWidget(self.screen_viewer_card, 3)
@@ -3568,6 +3630,32 @@ class DiscordVoicePanel(QWidget):
         self._voice_pane_visible = which == "voice"
         self._chat_pane_visible = which == "chat"
         self._sync_center_panes(animate=True)
+
+    def get_available_share_targets_for_settings(self) -> list[tuple[str, str]]:
+        """Retorna [('channel:<id>', '# canal (Servidor)'), ('dm:<id>', '@ Usuario (DM)')] para Ajustes."""
+        items: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for g in self._guilds:
+            gname = str(g.get("name") or "").strip() or "Servidor"
+            for tc in g.get("text_channels") or ():
+                cid = str(tc.get("id") or "").strip()
+                cname = str(tc.get("name") or "general").strip().lstrip("# ")
+                key = f"channel:{cid}"
+                if cid and key not in seen:
+                    seen.add(key)
+                    items.append((key, f"# {cname} ({gname})  ·  Canal"))
+        for uid, ulabel in self._current_dm_targets():
+            key = f"dm:{uid}"
+            if uid and key not in seen:
+                seen.add(key)
+                items.append((key, f"@ {ulabel.lstrip('@ ')}  ·  DM"))
+        for raw_key in self.cfg.discord_share_auto_targets:
+            key = str(raw_key or "").strip()
+            if key and key not in seen:
+                seen.add(key)
+                lbl = self.cfg.discord_share_auto_target_names.get(key) or key
+                items.append((key, lbl))
+        return items
 
     def get_available_channels_for_settings(self) -> list[tuple[str, str]]:
         """Retorna [(channel_id, etiqueta)] de los canales conocidos para la gestión en Ajustes."""
@@ -5757,6 +5845,18 @@ class DiscordVoicePanel(QWidget):
             return True
         return False
 
+    @property
+    def is_screen_viewer_active(self) -> bool:
+        return bool(self._screen_viewer_active)
+
+    @property
+    def is_screen_viewer_theater(self) -> bool:
+        return bool(self._screen_viewer_theater)
+
+    @property
+    def is_screen_viewer_fullscreen(self) -> bool:
+        return bool(self._screen_viewer_fullscreen)
+
     def start_screen_share_from_hotkey(self) -> str:
         if self._screen_share_state in ("starting", "sharing") or self.screen_share_svc.is_sharing:
             return "already_sharing"
@@ -5766,23 +5866,28 @@ class DiscordVoicePanel(QWidget):
             return "no_ffmpeg"
         if find_cloudflared() is None:
             return "no_cloudflared"
+        src_id = str(self.cfg.discord_share_last_source_id or "monitor:0").strip() or "monitor:0"
+        quality = str(self.cfg.discord_share_last_quality or "720p").strip() or "720p"
+        fps = 60 if int(self.cfg.discord_share_last_fps or 30) >= 60 else 30
+        include_audio = bool(self.cfg.discord_share_last_audio)
+        title = "Monitor 1" if src_id == "monitor:0" else ""
         self._screen_share_pending_opts = {
-            "source_id": "monitor:0",
-            "title": "Monitor 1",
-            "quality": "720p",
-            "fps": 30,
-            "include_audio": True,
+            "source_id": src_id,
+            "title": title,
+            "quality": quality,
+            "fps": fps,
+            "include_audio": include_audio,
             "announce": False,
             "targets": [],
         }
         self.screen_share_btn.setEnabled(False)
         self.screen_share_btn.setText(" Iniciando...")
         self.screen_share_svc.start_share(
-            source_id="monitor:0",
-            quality="720p",
-            fps=30,
-            include_audio=True,
-            title="Monitor 1",
+            source_id=src_id,
+            quality=quality,
+            fps=fps,
+            include_audio=include_audio,
+            title=title,
             use_tunnel=True,
             exclude_pid=int(self.svc.worker_pid or 0),
         )
@@ -5902,7 +6007,8 @@ class DiscordVoicePanel(QWidget):
         if not self._participant_cards_order:
             return
         avail_w, avail_h = self._voice_viewport_size()
-        key = (len(self._participant_cards_order), avail_w // 20, avail_h // 20)
+        has_share = any(c._screen_share is not None for c in self._participant_cards_order)
+        key = (len(self._participant_cards_order), has_share, avail_w // 20, avail_h // 20)
         if key != self._last_voice_layout_key:
             self._relayout_participant_cards()
 
@@ -5913,12 +6019,25 @@ class DiscordVoicePanel(QWidget):
         max_cols = self._compute_grid_cols()
         self._last_grid_cols = max_cols
         count = len(self._participant_cards_order)
+        has_share = any(c._screen_share is not None for c in self._participant_cards_order)
         row_sizes = _compute_voice_row_sizes(count, max_cols)
         card_w, card_h = _compute_participant_card_size(
-            count, row_sizes, avail_w, avail_h, spacing=12
+            count,
+            row_sizes,
+            avail_w,
+            avail_h,
+            spacing=12,
+            has_screen_share=has_share,
         )
+        req_w = max((c.minimumWidth() for c in self._participant_cards_order), default=card_w)
+        req_h = max(
+            (max(c.minimumHeight(), c.sizeHint().height()) for c in self._participant_cards_order),
+            default=card_h,
+        )
+        card_w = max(card_w, req_w)
+        card_h = max(card_h, req_h)
         self._last_voice_row_sizes = row_sizes
-        self._last_voice_layout_key = (count, avail_w // 20, avail_h // 20)
+        self._last_voice_layout_key = (count, has_share, avail_w // 20, avail_h // 20)
 
         self._detach_participant_rows()
         idx = 0
@@ -6204,9 +6323,43 @@ class DiscordVoicePanel(QWidget):
                 )
             )
         if hasattr(self, "screen_viewer_mute_btn"):
+            is_mute = self._screen_viewer_muted or self._screen_viewer_volume <= 0
             self.screen_viewer_mute_btn.setIcon(
-                render_icon("mute" if self._screen_viewer_muted else "volume", p.text, 14)
+                render_icon("mute" if is_mute else "volume", p.text, 14)
             )
+        if hasattr(self, "screen_viewer_fs_btn"):
+            fs_icon = "exit_fullscreen" if self._screen_viewer_fullscreen else "fullscreen"
+            self.screen_viewer_fs_btn.setIcon(render_icon(fs_icon, p.text, 15))
+
+    def _save_last_share_config(
+        self,
+        *,
+        source_id: str,
+        quality: str,
+        fps: int,
+        include_audio: bool,
+    ) -> None:
+        self.cfg.discord_share_last_source_id = str(source_id or "monitor:0").strip() or "monitor:0"
+        sq = str(quality or "720p").strip().lower()
+        self.cfg.discord_share_last_quality = sq if sq in ("480p", "720p", "1080p") else "720p"
+        self.cfg.discord_share_last_fps = 60 if int(fps or 30) >= 60 else 30
+        self.cfg.discord_share_last_audio = bool(include_audio)
+        save_config(self.cfg)
+
+    def _get_auto_share_targets(self) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw in (self.cfg.discord_share_auto_targets or []):
+            txt = str(raw or "").strip()
+            if ":" not in txt:
+                continue
+            kind, tid = txt.split(":", 1)
+            k = kind.strip()
+            t = tid.strip()
+            if k in ("channel", "dm") and t and (k, t) not in seen:
+                seen.add((k, t))
+                out.append((k, t))
+        return out
 
     def _current_guild_text_channels(self) -> list[tuple[str, str]]:
         gid = str(self.guild_combo.currentData() or self._selected_guild_id or "")
@@ -6265,6 +6418,11 @@ class DiscordVoicePanel(QWidget):
             channels,
             dm_targets=dm_targets,
             default_target=default_target,
+            current_source_id=self.cfg.discord_share_last_source_id,
+            current_quality=self.cfg.discord_share_last_quality,
+            current_fps=self.cfg.discord_share_last_fps,
+            current_include_audio=self.cfg.discord_share_last_audio,
+            auto_targets_count=len(self.cfg.discord_share_auto_targets),
             parent=self.window() or self,
         )
         try:
@@ -6274,6 +6432,12 @@ class DiscordVoicePanel(QWidget):
         finally:
             dlg.deleteLater()
 
+        self._save_last_share_config(
+            source_id=str(opts["source_id"]),
+            quality=str(opts["quality"]),
+            fps=int(opts["fps"]),
+            include_audio=bool(opts["include_audio"]),
+        )
         self._screen_share_pending_opts = opts
         self.screen_share_btn.setEnabled(False)
         self.screen_share_btn.setText(" Iniciando...")
@@ -6299,9 +6463,9 @@ class DiscordVoicePanel(QWidget):
             channels,
             dm_targets=dm_targets,
             is_live_edit=True,
-            current_source_id=str(info.get("source_id") or ""),
-            current_quality=str(info.get("quality") or "720p"),
-            current_fps=int(info.get("fps") or 30),
+            current_source_id=str(info.get("source_id") or self.cfg.discord_share_last_source_id),
+            current_quality=str(info.get("quality") or self.cfg.discord_share_last_quality),
+            current_fps=int(info.get("fps") or self.cfg.discord_share_last_fps),
             current_include_audio=bool(info.get("include_audio", info.get("has_audio", True))),
             parent=self.window() or self,
         )
@@ -6312,6 +6476,12 @@ class DiscordVoicePanel(QWidget):
         finally:
             dlg.deleteLater()
 
+        self._save_last_share_config(
+            source_id=str(opts["source_id"]),
+            quality=str(opts["quality"]),
+            fps=int(opts["fps"]),
+            include_audio=bool(opts["include_audio"]),
+        )
         self._screen_share_pending_opts = opts
         self.share_settings_btn.setEnabled(False)
         self.share_settings_btn.setText("Cambiando...")
@@ -6368,8 +6538,21 @@ class DiscordVoicePanel(QWidget):
 
             opts = self._screen_share_pending_opts
             self._screen_share_pending_opts = None
-            targets = list((opts or {}).get("targets") or [])
-            if opts and opts.get("announce") and targets:
+            manual_targets = (
+                list(opts.get("targets") or [])
+                if (opts and opts.get("announce"))
+                else []
+            )
+            auto_targets = [] if is_reconf else self._get_auto_share_targets()
+            merged_targets: list[tuple[str, str]] = []
+            seen_t: set[tuple[str, str]] = set()
+            for tgt_kind, tgt_id in [*auto_targets, *manual_targets]:
+                pair = (str(tgt_kind).strip(), str(tgt_id).strip())
+                if pair[0] in ("channel", "dm") and pair[1] and pair not in seen_t:
+                    seen_t.add(pair)
+                    merged_targets.append(pair)
+
+            if merged_targets and self.svc.is_connected:
                 txt = format_screen_share_announcement(
                     watch_url=str(data.get("watch_url") or ""),
                     quality=str(data.get("quality") or "720p"),
@@ -6377,7 +6560,7 @@ class DiscordVoicePanel(QWidget):
                     has_audio=bool(data.get("has_audio", False)),
                     title=str(data.get("title") or "Pantalla compartida"),
                 )
-                for tgt_kind, tgt_id in targets:
+                for tgt_kind, tgt_id in merged_targets:
                     fut = self.svc.send_chat_message(tgt_kind, tgt_id, txt, await_result=True)
                     if fut is not None:
                         def _on_sent(
@@ -6664,7 +6847,90 @@ class DiscordVoicePanel(QWidget):
                 parent=self,
             )
             self._screen_player.vo_error_detected.connect(self._on_screen_player_vo_error)
+            self._screen_player.wheel_scrolled.connect(self._on_screen_viewer_wheel)
+            self._screen_player.mouse_moved.connect(self.screen_viewer_mouse_moved.emit)
+            self._screen_player.double_clicked.connect(self.toggle_screen_viewer_fullscreen)
         return self._screen_player
+
+    def _emit_screen_viewer_state(self) -> None:
+        title = (
+            self.screen_viewer_title_lbl.text().strip()
+            if hasattr(self, "screen_viewer_title_lbl")
+            else "Pantalla compartida"
+        )
+        eff_vol = 0 if self._screen_viewer_muted else self._screen_viewer_volume
+        self.screen_viewer_state_updated.emit(title, eff_vol, self._screen_viewer_muted)
+
+    def _apply_screen_viewer_layout_mode(
+        self, *, theater: bool, fullscreen: bool
+    ) -> None:
+        in_expanded = bool(theater or fullscreen)
+        if in_expanded and not self._pre_theater_chrome:
+            self._pre_theater_chrome = {
+                "channels": self._channels_visible,
+                "members": self._members_visible,
+                "intents": self.intents_banner.isVisible(),
+            }
+
+        if in_expanded:
+            self._voice_pane_visible = True
+            self._chat_pane_visible = False
+            self.center_stack.setVisible(True)
+            self.center_collapsed_card.setVisible(False)
+            self.center_stack.setCurrentWidget(self.voice_pane)
+            self.top_hdr_widget.setVisible(False)
+            self.left_card.setVisible(False)
+            self.members_card.setVisible(False)
+            self.intents_banner.setVisible(False)
+            self.center_hdr_card.setVisible(False)
+            self.voice_hdr_frame.setVisible(False)
+            self.share_live_strip.setVisible(False)
+            self.remote_share_banner.setVisible(False)
+            self.participants_scroll.setVisible(False)
+            self._root_lay.setContentsMargins(0, 0, 0, 0)
+            self._vp_lay.setContentsMargins(0, 0, 0, 0)
+            if fullscreen:
+                self.screen_viewer_hdr_widget.setVisible(False)
+                self._svc_lay.setContentsMargins(0, 0, 0, 0)
+                self._svc_lay.setSpacing(0)
+                self._sv_hdr_lay.setContentsMargins(0, 0, 0, 0)
+            else:
+                self.screen_viewer_hdr_widget.setVisible(True)
+                self._svc_lay.setContentsMargins(0, 0, 0, 0)
+                self._svc_lay.setSpacing(0)
+                self._sv_hdr_lay.setContentsMargins(12, 8, 12, 8)
+        else:
+            saved = dict(self._pre_theater_chrome)
+            self._pre_theater_chrome = {}
+            self._root_lay.setContentsMargins(18, 12, 18, 10)
+            self._vp_lay.setContentsMargins(10, 8, 10, 10)
+            self._svc_lay.setContentsMargins(8, 8, 8, 6)
+            self._svc_lay.setSpacing(6)
+            self._sv_hdr_lay.setContentsMargins(0, 0, 0, 0)
+            self.top_hdr_widget.setVisible(True)
+            self.center_hdr_card.setVisible(True)
+            self.voice_hdr_frame.setVisible(True)
+            self.screen_viewer_hdr_widget.setVisible(True)
+            self.participants_scroll.setVisible(True)
+            self.left_card.setVisible(saved.get("channels", self._channels_visible))
+            self.members_card.setVisible(saved.get("members", self._members_visible))
+            self.intents_banner.setVisible(saved.get("intents", False))
+            self.share_live_strip.setVisible(self._screen_share_state == "sharing")
+            self._refresh_remote_share_banner()
+
+        if hasattr(self, "screen_viewer_theater_btn"):
+            theater_only = bool(theater and not fullscreen)
+            self.screen_viewer_theater_btn.setText(
+                "Salir teatro" if theater_only else "Teatro"
+            )
+            self.screen_viewer_theater_btn.setProperty(
+                "active", "true" if theater_only else "false"
+            )
+            self.screen_viewer_theater_btn.style().unpolish(self.screen_viewer_theater_btn)
+            self.screen_viewer_theater_btn.style().polish(self.screen_viewer_theater_btn)
+        self._sync_screen_share_icons()
+        if self._screen_viewer_active:
+            QTimer.singleShot(45, self.screen_video_surface.force_native_redraw)
 
     def _open_screen_share_viewer(self, payload: dict[str, Any]) -> None:
         if not isinstance(payload, dict):
@@ -6698,57 +6964,138 @@ class DiscordVoicePanel(QWidget):
         self._set_pane_visible("voice", True)
 
         player = self._ensure_screen_player()
-        player.set_volume(0 if self._screen_viewer_muted else self._screen_viewer_volume)
+        eff_vol = 0 if self._screen_viewer_muted else self._screen_viewer_volume
+        player.set_volume(eff_vol)
+        self.screen_viewer_vol_slider.blockSignals(True)
+        self.screen_viewer_vol_slider.setValue(eff_vol)
+        self.screen_viewer_vol_slider.blockSignals(False)
         player.play_stream(stream_url, is_live=True, low_latency=True)
         self._sync_screen_share_icons()
+        self._emit_screen_viewer_state()
         QTimer.singleShot(45, self.screen_video_surface.force_native_redraw)
 
     def _close_screen_share_viewer(self) -> None:
+        was_fs = self._screen_viewer_fullscreen
         self._screen_viewer_active = False
         self._screen_viewer_is_local_preview = False
-        self._screen_viewer_expanded = False
+        self._screen_viewer_theater = False
+        self._screen_viewer_fullscreen = False
+        self._screen_viewer_pre_fs_theater = False
         self._screen_viewer_stream_url = ""
         self._screen_viewer_watch_url = ""
         self._screen_viewer_author_id = ""
         self._screen_viewer_rev = 0
-        self.screen_viewer_expand_btn.setText("Expandir")
-        self.participants_scroll.setVisible(True)
-        self.screen_viewer_card.setVisible(False)
         if self._screen_player is not None:
+            self._screen_player.set_mouse_tracking(False)
+            self._screen_player.set_cursor_autohide("no")
             try:
                 self._screen_player.unload()
             except Exception:
                 pass
+        if self._pre_theater_chrome or was_fs:
+            self._apply_screen_viewer_layout_mode(theater=False, fullscreen=False)
+        if was_fs:
+            self.screen_viewer_fullscreen_changed.emit(False)
+        self.screen_viewer_card.setVisible(False)
 
-    def _toggle_screen_viewer_expanded(self) -> None:
+    def toggle_screen_viewer_theater(self) -> bool:
+        if not self._screen_viewer_active:
+            return False
+        if self._screen_viewer_fullscreen:
+            self._screen_viewer_fullscreen = False
+            self._screen_viewer_theater = True
+            if self._screen_player is not None:
+                self._screen_player.set_mouse_tracking(False)
+                self._screen_player.set_cursor_autohide("no")
+            self._apply_screen_viewer_layout_mode(theater=True, fullscreen=False)
+            self.screen_viewer_fullscreen_changed.emit(False)
+            return True
+        self._screen_viewer_theater = not self._screen_viewer_theater
+        self._apply_screen_viewer_layout_mode(
+            theater=self._screen_viewer_theater, fullscreen=False
+        )
+        return True
+
+    def toggle_screen_viewer_fullscreen(self) -> bool:
+        if not self._screen_viewer_active:
+            return False
+        if not self._screen_viewer_fullscreen:
+            self._screen_viewer_pre_fs_theater = self._screen_viewer_theater
+            self._screen_viewer_fullscreen = True
+            self._apply_screen_viewer_layout_mode(theater=True, fullscreen=True)
+            if self._screen_player is not None:
+                self._screen_player.set_mouse_tracking(True)
+                self._screen_player.set_cursor_autohide(500)
+            self._emit_screen_viewer_state()
+            self.screen_viewer_fullscreen_changed.emit(True)
+        else:
+            self._screen_viewer_fullscreen = False
+            self._screen_viewer_theater = bool(self._screen_viewer_pre_fs_theater)
+            if self._screen_player is not None:
+                self._screen_player.set_mouse_tracking(False)
+                self._screen_player.set_cursor_autohide("no")
+            self._apply_screen_viewer_layout_mode(
+                theater=self._screen_viewer_theater, fullscreen=False
+            )
+            self.screen_viewer_fullscreen_changed.emit(False)
+        return True
+
+    def exit_screen_viewer_fullscreen(self) -> bool:
+        if self._screen_viewer_fullscreen:
+            return self.toggle_screen_viewer_fullscreen()
+        return False
+
+    def set_screen_viewer_volume(self, value: int, *, show_hud: bool = False) -> int:
+        vol = max(0, min(100, int(value)))
+        if vol > 0:
+            self._screen_viewer_volume = vol
+            self._screen_viewer_prev_vol = vol
+            self._screen_viewer_muted = False
+        else:
+            self._screen_viewer_muted = True
+        self.screen_viewer_vol_slider.blockSignals(True)
+        self.screen_viewer_vol_slider.setValue(vol)
+        self.screen_viewer_vol_slider.blockSignals(False)
+        if self._screen_player is not None:
+            self._screen_player.set_volume(vol)
+        self._sync_screen_share_icons()
+        self._emit_screen_viewer_state()
+        if show_hud and self._screen_viewer_active:
+            self.screen_viewer_volume_hud_requested.emit(vol)
+        return vol
+
+    def toggle_screen_viewer_mute_from_hotkey(self, *, show_hud: bool = True) -> bool:
+        if self._screen_viewer_muted or self.screen_viewer_vol_slider.value() <= 0:
+            restore = max(10, int(self._screen_viewer_prev_vol or self._screen_viewer_volume or 80))
+            self._screen_viewer_muted = False
+            self._screen_viewer_volume = restore
+            eff = restore
+        else:
+            self._screen_viewer_prev_vol = max(10, int(self._screen_viewer_volume or 80))
+            self._screen_viewer_muted = True
+            eff = 0
+        self.screen_viewer_vol_slider.blockSignals(True)
+        self.screen_viewer_vol_slider.setValue(eff)
+        self.screen_viewer_vol_slider.blockSignals(False)
+        if self._screen_player is not None:
+            self._screen_player.set_volume(eff)
+        self._sync_screen_share_icons()
+        self._emit_screen_viewer_state()
+        if show_hud and self._screen_viewer_active:
+            self.screen_viewer_volume_hud_requested.emit(eff)
+        return self._screen_viewer_muted
+
+    def _on_screen_viewer_wheel(self, delta: int) -> None:
         if not self._screen_viewer_active:
             return
-        self._screen_viewer_expanded = not self._screen_viewer_expanded
-        self.participants_scroll.setVisible(not self._screen_viewer_expanded)
-        self.screen_viewer_expand_btn.setText(
-            "Mostrar miembros" if self._screen_viewer_expanded else "Expandir"
-        )
-        QTimer.singleShot(45, self.screen_video_surface.force_native_redraw)
+        cur = 0 if self._screen_viewer_muted else self._screen_viewer_volume
+        self.set_screen_viewer_volume(cur + int(delta), show_hud=True)
 
     def _toggle_screen_viewer_mute(self) -> None:
-        self._screen_viewer_muted = not self._screen_viewer_muted
-        if self._screen_player is not None:
-            self._screen_player.set_volume(
-                0 if self._screen_viewer_muted else self._screen_viewer_volume
-            )
-        self._sync_screen_share_icons()
+        self.toggle_screen_viewer_mute_from_hotkey(show_hud=False)
 
     def _on_screen_viewer_vol_changed(self, value: int) -> None:
-        self._screen_viewer_volume = max(0, min(100, int(value)))
-        if self._screen_viewer_volume > 0 and self._screen_viewer_muted:
-            self._screen_viewer_muted = False
-        elif self._screen_viewer_volume == 0:
-            self._screen_viewer_muted = True
-        if self._screen_player is not None:
-            self._screen_player.set_volume(
-                0 if self._screen_viewer_muted else self._screen_viewer_volume
-            )
-        self._sync_screen_share_icons()
+        self.set_screen_viewer_volume(value, show_hud=False)
 
     def _open_current_viewer_in_browser(self) -> None:
         if self._screen_viewer_watch_url:
