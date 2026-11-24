@@ -14,6 +14,13 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-24 (2) — Fix YouTube Cookies Fallback (`Requested format is not available`) y Anti-Bombazos DAVE/Opus en Discord
+- **Files:** `src/swiftplay/ytdlp_worker.py`, `src/swiftplay/discord_worker.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Fallback sin cookies en `ytdlp_worker.py`:** Cuando `yt-dlp` falla con cookies (`Requested format is not available`, `Signature solving failed`, `n challenge`, `403`, etc.) al resolver o descargar un video/canción de YouTube (caso reproducido en `FmMtvZkixUY`), `_handle_resolve_youtube` y `_handle_download_media` reintentan automáticamente sin cookies manteniendo el formato óptimo (`251 webm` / `bestaudio`).
+  - **Bloqueo estricto de ciphertext DAVE `0xFAFA` y anti-explosiones en `discord_worker.py`:** `is_dave_encrypted_frame()` impide que frames DAVE cifrados entren al decodificador Opus tanto cuando `can_passthrough` devuelve `True` durante transiciones MLS como cuando `dave_active=False` antes del handshake; además `UserJitterBuffer` re-prima ante saltos grandes de secuencia (`>200`) y silencia + reinicia el decodificador si detecta un estallido digital a escala completa (`RMS >= 18500` y pico `>= 32500`).
+- **Verified:** Resolución en vivo de `FmMtvZkixUY` + `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
 ## 2026-11-24 — WatchParty SwiftPlay-a-SwiftPlay (Cloudflare Relay, AFK 8m, Sub-Cards y Control Cruzado Dual-Deck)
 - **Files:** `watchparty_relay/` (`package.json`, `wrangler.toml`, `src/index.js`, `README.md`), `src/swiftplay/windows_os.py`, `src/swiftplay/config.py`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/ui/icons.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/watchparty_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

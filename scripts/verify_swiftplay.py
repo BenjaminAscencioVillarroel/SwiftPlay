@@ -3581,6 +3581,33 @@ def test_discord_voice_bridge() -> None:
         out_vals.append(struct.unpack_from("<h", fr, 0)[0])
     assert out_vals[:4] == [100, 110, 120, 130], f"Orden RTP roto: {out_vals}"
     assert out_vals[4] == 150 and decoded_order[4][1] is True, "Debe usar FEC al faltar seq 14 antes de 15"
+    # Guardias anti-explosión Opus (saturación digital completa) y saltos grandes de secuencia RTP
+    class _BlastMockDec:
+        def decode(self, pkt, fec=False):
+            val = 32767 if (pkt and pkt.startswith(b"BLAST")) else 1800
+            return struct.pack("<" + "h" * (PCM_FRAME_BYTES // 2), *([val] * (PCM_FRAME_BYTES // 2)))
+
+    blast_mix = VoiceAudioMixer()
+    for s_idx, payload_tag in enumerate((b"BLAST1", b"BLAST2", b"OKFRAME", b"OK2")):
+        blast_mix.push_opus(55, 200 + s_idx, payload_tag, decoder_factory=_BlastMockDec, now=t0)
+    assert blast_mix.mix_frame(now=t0) == SILENCE_PCM, "Frame blast #1 debe silenciarse"
+    assert blast_mix.mix_frame(now=t0 + 0.02) == SILENCE_PCM, "Frame blast #2 debe silenciarse y reiniciar decoder"
+    ok_pcm = blast_mix.mix_frame(now=t0 + 0.04)
+    assert struct.unpack_from("<h", ok_pcm, 0)[0] == 1800, "Voz normal tras blast debe recuperarse"
+    # Salto grande de secuencia (+5000) debe re-primar sin quedar colgado ni girar en bucle
+    for j in range(3):
+        blast_mix.push_opus(55, 5200 + j, b"OKJUMP", decoder_factory=_BlastMockDec, now=t0 + 0.1)
+    jump_pcm = blast_mix.mix_frame(now=t0 + 0.12)
+    assert struct.unpack_from("<h", jump_pcm, 0)[0] == 1800
+    blast_mix.clear()
+
+    # Fallback sin cookies ante errores de formato / EJS en ytdlp_worker
+    from swiftplay.ytdlp_worker import _should_retry_without_cookies
+
+    assert _should_retry_without_cookies("ERROR: [youtube] FmMtvZkixUY: Requested format is not available")
+    assert _should_retry_without_cookies("Signature solving failed")
+    assert not _should_retry_without_cookies("Video unavailable")
+
     mixer.clear()
 
     # Modo ensordecer
@@ -3625,7 +3652,7 @@ def test_discord_voice_bridge() -> None:
     rtp_probe = """
 import struct, davey, nacl.secret
 assert str(getattr(davey, "__version__", "")).startswith("0.1."), f"Versión davey incompatible con discord.py 2.7: {davey.__version__}"
-from swiftplay.discord_worker import OPUS_SILENCE, decrypt_discord_rtp_packet
+from swiftplay.discord_worker import OPUS_SILENCE, decrypt_discord_rtp_packet, is_dave_encrypted_frame
 
 class MockDaveSession:
     def __init__(self):
@@ -3686,6 +3713,15 @@ nonce_pt = struct.pack(">I", 79) + (b"\\x00" * 20)
 ct_pt = box.encrypt(b"RAW_OPUS_PT", bytes(hdr_pt), nonce_pt).ciphertext
 out_pt = decrypt_discord_rtp_packet(bytes(hdr_pt) + ct_pt + nonce_pt[:4], "aead_xchacha20_poly1305_rtpsize", key, ssrc_map, dave_pt, True, box)
 assert out_pt == (999, 424242, b"RAW_OPUS_PT"), f"Passthrough DAVE falló: {out_pt}"
+
+# Caso B3: paquete con marcador DAVE 0xFAFA nunca debe pasar a Opus aunque can_passthrough=True o dave_active=False
+dave_payload_0xfafa = b"\\x01\\x02\\x03\\x04\\x05\\x06\\x07\\x08\\x09\\x0b\\xfa\\xfa"
+assert is_dave_encrypted_frame(dave_payload_0xfafa) is True
+assert is_dave_encrypted_frame(OPUS_SILENCE) is False
+assert is_dave_encrypted_frame(b"RAW_OPUS_PT") is False
+ct_fafa = box.encrypt(dave_payload_0xfafa, bytes(hdr_pt), nonce_pt).ciphertext
+assert decrypt_discord_rtp_packet(bytes(hdr_pt) + ct_fafa + nonce_pt[:4], "aead_xchacha20_poly1305_rtpsize", key, ssrc_map, dave_pt, True, box) is None
+assert decrypt_discord_rtp_packet(bytes(hdr_pt) + ct_fafa + nonce_pt[:4], "aead_xchacha20_poly1305_rtpsize", key, ssrc_map, None, False, box) is None
 
 # Caso C: RTCP ignorado
 rtcp = bytearray(24)

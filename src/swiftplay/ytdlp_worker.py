@@ -342,6 +342,23 @@ def _make_youtube_ydl(opts: dict[str, Any], load_extractors: bool = True):
         return YoutubeDL(opts)
 
 
+def _should_retry_without_cookies(err_text: str) -> bool:
+    """Detecta fallos de extracción/descarga YT con cookies para reintentar sin sesión."""
+    low = str(err_text or "").lower()
+    return any(
+        tok in low
+        for tok in (
+            "requested format is not available",
+            "signature solving failed",
+            "n challenge",
+            "the page needs to be reloaded",
+            "po token",
+            "http error 403",
+            "url reproducible",
+        )
+    )
+
+
 def _handle_resolve_youtube(req: dict[str, Any]) -> dict[str, Any]:
     from swiftplay.youtube_service import QUALITY_HEIGHT_MAP, _pick_best_thumb
 
@@ -359,17 +376,16 @@ def _handle_resolve_youtube(req: dict[str, Any]) -> dict[str, Any]:
             f"best[height<={max_h}]/best"
         )
 
-    try:
-        with _cookiefile_context() as ck:
-            opts = _base_ydl_opts(ck)
-            opts["format"] = fmt
-            opts["noplaylist"] = True
-            opts["skip_download"] = True
-            opts["noprogress"] = True
-            opts["no_color"] = True
-            opts["extractor_args"] = {"youtube": {"player_skip": ["configs"]}}
-            with _make_youtube_ydl(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+    def _extract(cookiefile: str | None) -> dict[str, Any]:
+        opts = _base_ydl_opts(cookiefile)
+        opts["format"] = fmt
+        opts["noplaylist"] = True
+        opts["skip_download"] = True
+        opts["noprogress"] = True
+        opts["no_color"] = True
+        opts["extractor_args"] = {"youtube": {"player_skip": ["configs"]}}
+        with _make_youtube_ydl(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
         if not isinstance(info, dict):
             raise RuntimeError("No se pudo obtener la información del stream.")
@@ -412,6 +428,15 @@ def _handle_resolve_youtube(req: dict[str, Any]) -> dict[str, Any]:
                 float(info.get("release_timestamp") or 0.0) if is_live else 0.0
             ),
         }
+
+    try:
+        with _cookiefile_context() as ck:
+            try:
+                return _extract(ck)
+            except Exception as exc:
+                if ck is not None and _should_retry_without_cookies(str(exc)):
+                    return _extract(None)
+                raise
     finally:
         gc.collect()
 
@@ -507,34 +532,44 @@ def _handle_download_media(
                 downloaded_file.append(Path(fn))
             emit_progress(100.0, "Procesando archivo...")
 
+    def _run_dl(cookiefile: str | None) -> Path:
+        opts = _base_ydl_opts(cookiefile)
+        opts["noplaylist"] = True
+        opts["outtmpl"] = str(out_path / "%(title).120s [%(id)s].%(ext)s")
+        opts["progress_hooks"] = [_hook]
+
+        if mode == "music":
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "m4a",
+                    "preferredquality": "0",
+                },
+                {"key": "FFmpegMetadata"},
+            ]
+        else:
+            opts["format"] = (
+                f"bestvideo[height<={max_h}][vcodec!*=av01]+bestaudio/"
+                f"bestvideo[height<={max_h}]+bestaudio/"
+                f"best[height<={max_h}]/best"
+            )
+            opts["merge_output_format"] = "mp4"
+
+        with _make_youtube_ydl(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return Path(ydl.prepare_filename(info))
+
     try:
         with _cookiefile_context() as ck:
-            opts = _base_ydl_opts(ck)
-            opts["noplaylist"] = True
-            opts["outtmpl"] = str(out_path / "%(title).120s [%(id)s].%(ext)s")
-            opts["progress_hooks"] = [_hook]
-
-            if mode == "music":
-                opts["format"] = "bestaudio/best"
-                opts["postprocessors"] = [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "m4a",
-                        "preferredquality": "0",
-                    },
-                    {"key": "FFmpegMetadata"},
-                ]
-            else:
-                opts["format"] = (
-                    f"bestvideo[height<={max_h}][vcodec!*=av01]+bestaudio/"
-                    f"bestvideo[height<={max_h}]+bestaudio/"
-                    f"best[height<={max_h}]/best"
-                )
-                opts["merge_output_format"] = "mp4"
-
-            with _make_youtube_ydl(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                prepared = Path(ydl.prepare_filename(info))
+            try:
+                prepared = _run_dl(ck)
+            except Exception as exc:
+                if ck is not None and _should_retry_without_cookies(str(exc)):
+                    downloaded_file.clear()
+                    prepared = _run_dl(None)
+                else:
+                    raise
 
         if mode == "music":
             final = prepared.with_suffix(".m4a")

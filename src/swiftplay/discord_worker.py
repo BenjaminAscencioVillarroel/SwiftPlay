@@ -1079,6 +1079,14 @@ def _pcm_to_mono(pcm: bytes, channels: int) -> bytes:
     return out.tobytes()
 
 
+def is_dave_encrypted_frame(payload: bytes) -> bool:
+    """Detecta un frame cifrado con DAVE E2EE por su marcador final 0xFAFA y tamaño suplementario."""
+    if len(payload) < 11 or payload[-2:] != b"\xfa\xfa":
+        return False
+    supp_size = payload[-3]
+    return 11 <= supp_size <= len(payload)
+
+
 def decrypt_discord_rtp_packet(
     data: bytes,
     mode: str,
@@ -1222,6 +1230,8 @@ def decrypt_discord_rtp_packet(
         try:
             payload = dave_session.decrypt(user_id, dave_media_type, payload)
         except Exception:
+            if is_dave_encrypted_frame(payload):
+                return None
             try:
                 can_pt = getattr(dave_session, "can_passthrough", None)
                 if callable(can_pt) and can_pt(user_id):
@@ -1230,6 +1240,10 @@ def decrypt_discord_rtp_packet(
                     return None
             except Exception:
                 return None
+
+    # Nunca pasar ciphertext DAVE (0xFAFA) al decodificador Opus aunque DAVE aún no esté listo
+    if is_dave_encrypted_frame(payload):
+        return None
 
     if not payload:
         return None
@@ -1261,6 +1275,7 @@ class UserJitterBuffer:
         self._next_seq: int | None = None
         self._first_pkt_ts = 0.0
         self._consecutive_missing = 0
+        self._consecutive_blasts = 0
         self.last_rx_ts = time.monotonic()
         self._pcm_overflow = bytearray()
 
@@ -1282,7 +1297,15 @@ class UserJitterBuffer:
             if not opus_bytes or opus_bytes == OPUS_SILENCE:
                 return
             if not self._priming and self._next_seq is not None:
-                if _seq_diff(seq_u16, self._next_seq) < 0:
+                diff = _seq_diff(seq_u16, self._next_seq)
+                if abs(diff) > 200:
+                    self._packets.clear()
+                    self._pcm_overflow.clear()
+                    self._priming = True
+                    self._next_seq = None
+                    self._consecutive_missing = 0
+                    self._first_pkt_ts = ts
+                elif diff < 0:
                     return
             if self._priming and not self._packets:
                 self._first_pkt_ts = ts
@@ -1319,8 +1342,11 @@ class UserJitterBuffer:
 
             # Limitar latencia máxima si se acumulan demasiados paquetes
             while len(self._packets) > 7:
-                self._packets.pop(self._next_seq, None)
-                self._next_seq = (self._next_seq + 1) & 0xFFFF
+                anchor = next(iter(self._packets))
+                oldest = min(self._packets.keys(), key=lambda s: _seq_diff(s, anchor))
+                self._packets.pop(oldest, None)
+                if self._next_seq is None or _seq_diff(oldest, self._next_seq) >= 0:
+                    self._next_seq = (oldest + 1) & 0xFFFF
 
             dec = self._ensure_decoder()
             pcm: bytes | None = None
@@ -1356,12 +1382,20 @@ class UserJitterBuffer:
                     self._priming = True
                     self._next_seq = None
                     self._consecutive_missing = 0
+                    self._consecutive_blasts = 0
                     self._packets.clear()
                     self._pcm_overflow.clear()
                     return None
 
             if not pcm:
                 return SILENCE_PCM
+            # Guardia anti-explosión digital (ciphertext DAVE / Opus corrupto a escala completa)
+            if _pcm_rms(pcm) >= 18500 and _pcm_max_abs(pcm) >= 32500:
+                self._consecutive_blasts += 1
+                if self._consecutive_blasts >= 2:
+                    self._decoder = None
+                return SILENCE_PCM
+            self._consecutive_blasts = 0
             if len(pcm) == PCM_FRAME_BYTES:
                 return pcm
             if len(pcm) > PCM_FRAME_BYTES:
@@ -1376,6 +1410,7 @@ class UserJitterBuffer:
             self._priming = True
             self._next_seq = None
             self._consecutive_missing = 0
+            self._consecutive_blasts = 0
 
     def close(self) -> None:
         with self._lock:
@@ -1384,6 +1419,7 @@ class UserJitterBuffer:
             self._decoder = None
             self._priming = True
             self._next_seq = None
+            self._consecutive_blasts = 0
 
 
 class VoiceAudioMixer:
