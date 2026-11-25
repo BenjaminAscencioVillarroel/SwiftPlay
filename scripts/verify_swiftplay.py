@@ -568,7 +568,12 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
 
     video_stream = yt.resolve_stream(videos[0].video_id, audio_only=False, quality="720p")
     assert video_stream.primary_url.startswith("http"), "URL de video inválida"
-    print("   Stream video 720p resuelto OK.")
+    vid_proto = (
+        "HLS"
+        if ("m3u8" in video_stream.primary_url.lower() or "hls" in video_stream.primary_url.lower())
+        else "HTTPS"
+    )
+    print(f"   Stream video 720p resuelto OK ({vid_proto}).")
 
     radio = yt.get_music_radio_queue(songs[0].video_id, limit=10)
     assert len(radio) >= 1, "La cola/radio de YT Music no devolvió pistas"
@@ -1983,16 +1988,65 @@ def test_gui_and_libmpv_smoke(
             assert tw_pix is not None and not tw_pix.isNull(), (
                 "La sub-card debe renderizar la miniatura recibida por ThumbnailCache.ready"
             )
+
+            # Reutilización in-place de cards visibles + diferido cuando WatchParty está oculto
+            finz_obj_before = wp_pnl._cards["FINZ-1111"]
+            demo_friends_upd = [dict(x) for x in demo_friends]
+            demo_friends_upd[0]["video"] = {
+                "video_id": "tw_live_1",
+                "title": "Directo Actualizado Twitch",
+                "author": "IlloJuan",
+                "kind": "twitch",
+                "viewer_count": 12500,
+                "paused": False,
+            }
+            wp_pnl.set_friends_data(demo_friends_upd)
+            app.processEvents()
+            assert wp_pnl._cards["FINZ-1111"] is finz_obj_before, (
+                "Con el mismo orden de amigos, WatchPartyPanel debe actualizar en sitio sin destruir widgets"
+            )
+            assert "Directo Actualizado Twitch" in finz_obj_before.tw_sub.title_lbl.text()
+
+            win._switch_page(win.PAGE_VIDEO_SEARCH)
+            app.processEvents()
+            wp_pnl.set_friends_data(demo_friends)
+            assert wp_pnl._friends_dirty is True, "Con panel oculto debe diferirse el re-render de cards"
+            win._switch_page(win.PAGE_WATCHPARTY)
+            app.processEvents()
+            assert wp_pnl._friends_dirty is False, "Al mostrar WatchParty debe limpiarse el flag diferido"
             prev_wp_url = win.cfg.watchparty_relay_url
+            prev_wp_en = win.cfg.watchparty_enabled
             try:
                 win.cfg.watchparty_relay_url = "wss://demo.workers.dev"
+                win.cfg.watchparty_enabled = True
+                wp_pnl._sync_power_toggle_ui()
                 wp_pnl.set_connection_state("connected", "")
                 wp_pnl.refresh_from_config()
                 assert wp_pnl.status_pill.text() == "● En línea", (
                     f"refresh_from_config no debe pisar el estado En línea: {wp_pnl.status_pill.text()}"
                 )
+                assert wp_pnl.power_toggle_btn.text() == "Desconectar"
+                assert wp_pnl.refresh_btn.isEnabled()
+
+                # Interruptor rápido Desconectar / Conectar en cabecera WatchParty
+                wp_pnl.power_toggle_btn.click()
+                assert win.cfg.watchparty_enabled is False
+                assert wp_pnl.status_pill.text() == "Desactivado"
+                assert wp_pnl.power_toggle_btn.text() == "Conectar"
+                assert not wp_pnl.refresh_btn.isEnabled()
+                assert not win._wp_presence_timer.isActive()
+
+                wp_pnl.power_toggle_btn.click()
+                assert win.cfg.watchparty_enabled is True
+                assert wp_pnl.power_toggle_btn.text() == "Desconectar"
+                assert wp_pnl.refresh_btn.isEnabled()
             finally:
                 win.cfg.watchparty_relay_url = prev_wp_url
+                win.cfg.watchparty_enabled = prev_wp_en
+                save_config(win.cfg)
+                wp_pnl._sync_power_toggle_ui()
+                win._start_watchparty_service()
+                win.watchparty_svc.stop()
                 wp_pnl.set_connection_state("disconnected", "")
 
             # Verificar desactivación automática de "Audio inteligente" dentro de WatchParty y sincronización de cola (A CONTINUACIÓN)
@@ -2307,12 +2361,44 @@ def test_gui_and_libmpv_smoke(
                     mp_vod.play_stream("https://demo/v.mp4", audio_url="https://demo/a.m4a", start_pos=15.0, start_paused=True)
                     h_vod = fake_handles[-1]
                     assert h_vod._kwargs["cache_secs"] >= 15
+                    assert h_vod._kwargs["cache_pause_initial"] == "no"
                     assert "http_persistent=1" in str(h_vod._kwargs["demuxer_lavf_o"])
+                    assert "reconnect_at_eof" not in str(h_vod._kwargs["demuxer_lavf_o"])
                     assert h_vod["cache"] == "yes" and float(h_vod["cache-secs"]) >= 15.0
+                    assert h_vod["cache-pause-initial"] == "no"
                     assert h_vod["demuxer-max-bytes"] == "24MiB" and h_vod.pause is True
                     mp_vod.play_stream("http://127.0.0.1/ss.mp4", is_live=True, low_latency=True)
                     h_ll = fake_handles[-1]
                     assert h_ll["cache"] == "no" and h_ll["hwdec"] == "no"
+
+                    # Overlay flotante debe ignorar re-renders idénticos (_last_render_key)
+                    win.discord_overlay.update_state(
+                        overlay_mode="status",
+                        active=True,
+                        in_voice=False,
+                        muted=True,
+                        deafened=False,
+                        opacity_pct=45,
+                    )
+                    rk_first = win.discord_overlay._last_render_key
+                    assert bool(rk_first)
+                    win.discord_overlay.update_state(
+                        overlay_mode="status",
+                        active=True,
+                        in_voice=False,
+                        muted=True,
+                        deafened=False,
+                        opacity_pct=45,
+                    )
+                    assert win.discord_overlay._last_render_key == rk_first
+                    win.discord_overlay.hide()
+                    win.discord_overlay.update_state(
+                        overlay_mode="off",
+                        active=False,
+                        muted=False,
+                        deafened=False,
+                        opacity_pct=win.cfg.discord_overlay_opacity,
+                    )
                 finally:
                     _player_mod._get_mpv_module = orig_get_mpv  # type: ignore[assignment]
 
@@ -3797,12 +3883,28 @@ def test_discord_voice_bridge() -> None:
     assert struct.unpack_from("<h", jump_pcm, 0)[0] == 1800
     blast_mix.clear()
 
-    # Fallback sin cookies ante errores de formato / EJS en ytdlp_worker
-    from swiftplay.ytdlp_worker import _should_retry_without_cookies
+    # Fallback sin cookies ante errores de formato / EJS en ytdlp_worker + fallback con cookies para privados
+    import inspect as _insp
+    from swiftplay.ytdlp_worker import (
+        _handle_download_media,
+        _handle_resolve_youtube,
+        _should_retry_with_cookies,
+        _should_retry_without_cookies,
+    )
 
     assert _should_retry_without_cookies("ERROR: [youtube] FmMtvZkixUY: Requested format is not available")
+    assert _should_retry_without_cookies("ERROR: [youtube] uWzSqdcfPZw: No video formats found!")
     assert _should_retry_without_cookies("Signature solving failed")
     assert not _should_retry_without_cookies("Video unavailable")
+    assert _should_retry_with_cookies("Sign in to confirm your age")
+    assert _should_retry_with_cookies("This video is available to this channel's members") or _should_retry_with_cookies("Join this channel to get access to members-only content")
+    assert _should_retry_with_cookies("ERROR: [youtube] abc: No video formats found!")
+    assert not _should_retry_with_cookies("Video unavailable")
+    _res_src = _insp.getsource(_handle_resolve_youtube)
+    assert "protocol*=m3u8" in _res_src and "configs" in _res_src and '"js"' in _res_src, (
+        "_handle_resolve_youtube debe priorizar HLS m3u8 sin throttling"
+    )
+    assert "http_chunk_size" in _insp.getsource(_handle_download_media)
 
     mixer.clear()
 

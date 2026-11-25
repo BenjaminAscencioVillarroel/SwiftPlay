@@ -349,12 +349,36 @@ def _should_retry_without_cookies(err_text: str) -> bool:
         tok in low
         for tok in (
             "requested format is not available",
+            "no video formats found",
             "signature solving failed",
             "n challenge",
             "the page needs to be reloaded",
             "po token",
             "http error 403",
             "url reproducible",
+        )
+    )
+
+
+def _should_retry_with_cookies(err_text: str) -> bool:
+    """Detecta errores donde probar con sesión/cookies puede destrabar videos privados o restringidos."""
+    low = str(err_text or "").lower()
+    return any(
+        tok in low
+        for tok in (
+            "sign in",
+            "confirm your age",
+            "age-restricted",
+            "private video",
+            "members-only",
+            "members only",
+            "join this channel",
+            "login required",
+            "cookies",
+            "not a bot",
+            "requested format is not available",
+            "no video formats found",
+            "http error 403",
         )
     )
 
@@ -368,22 +392,32 @@ def _handle_resolve_youtube(req: dict[str, Any]) -> dict[str, Any]:
     url = f"https://www.youtube.com/watch?v={video_id}"
     max_h = QUALITY_HEIGHT_MAP.get(quality, 720)
     if audio_only:
-        fmt = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
+        fmt = (
+            "bestaudio[protocol*=m3u8]/"
+            "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
+        )
     else:
         fmt = (
+            f"bestvideo[height<={max_h}][vcodec!*=av01][protocol*=m3u8]+bestaudio[protocol*=m3u8]/"
+            f"bestvideo[height<={max_h}][protocol*=m3u8]+bestaudio[protocol*=m3u8]/"
+            f"best[height<={max_h}][protocol*=m3u8]/"
             f"bestvideo[height<={max_h}][vcodec!*=av01]+bestaudio/"
             f"bestvideo[height<={max_h}]+bestaudio/"
             f"best[height<={max_h}]/best"
         )
 
-    def _extract(cookiefile: str | None) -> dict[str, Any]:
+    def _extract(cookiefile: str | None, *, skip_js: bool = False) -> dict[str, Any]:
         opts = _base_ydl_opts(cookiefile)
         opts["format"] = fmt
         opts["noplaylist"] = True
         opts["skip_download"] = True
         opts["noprogress"] = True
         opts["no_color"] = True
-        opts["extractor_args"] = {"youtube": {"player_skip": ["configs"]}}
+        if skip_js:
+            opts["js_runtimes"] = {}
+            opts["extractor_args"] = {"youtube": {"player_skip": ["configs", "js"]}}
+        else:
+            opts["extractor_args"] = {"youtube": {"player_skip": ["configs"]}}
         with _make_youtube_ydl(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
@@ -430,12 +464,20 @@ def _handle_resolve_youtube(req: dict[str, Any]) -> dict[str, Any]:
         }
 
     try:
-        with _cookiefile_context() as ck:
+        try:
+            # Ruta rápida HLS-first sin cookies ni solver JS (evita throttling 17 KB/s y acelera ~2x).
+            return _extract(None, skip_js=True)
+        except Exception:
             try:
-                return _extract(ck)
-            except Exception as exc:
-                if ck is not None and _should_retry_without_cookies(str(exc)):
-                    return _extract(None)
+                return _extract(None, skip_js=False)
+            except Exception as exc_no_ck:
+                if _should_retry_with_cookies(str(exc_no_ck)):
+                    with _cookiefile_context() as ck:
+                        if ck is not None:
+                            try:
+                                return _extract(ck, skip_js=False)
+                            except Exception:
+                                raise exc_no_ck
                 raise
     finally:
         gc.collect()
@@ -535,6 +577,7 @@ def _handle_download_media(
     def _run_dl(cookiefile: str | None) -> Path:
         opts = _base_ydl_opts(cookiefile)
         opts["noplaylist"] = True
+        opts["http_chunk_size"] = 10 * 1024 * 1024
         opts["outtmpl"] = str(out_path / "%(title).120s [%(id)s].%(ext)s")
         opts["progress_hooks"] = [_hook]
 
@@ -561,15 +604,21 @@ def _handle_download_media(
             return Path(ydl.prepare_filename(info))
 
     try:
-        with _cookiefile_context() as ck:
-            try:
-                prepared = _run_dl(ck)
-            except Exception as exc:
-                if ck is not None and _should_retry_without_cookies(str(exc)):
-                    downloaded_file.clear()
-                    prepared = _run_dl(None)
-                else:
-                    raise
+        try:
+            prepared = _run_dl(None)
+        except Exception as exc_no_ck:
+            if _should_retry_with_cookies(str(exc_no_ck)):
+                with _cookiefile_context() as ck:
+                    if ck is not None:
+                        downloaded_file.clear()
+                        try:
+                            prepared = _run_dl(ck)
+                        except Exception:
+                            raise exc_no_ck
+                    else:
+                        raise
+            else:
+                raise
 
         if mode == "music":
             final = prepared.with_suffix(".m4a")

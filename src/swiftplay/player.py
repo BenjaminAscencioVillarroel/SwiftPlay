@@ -176,10 +176,9 @@ class MediaPlayer(QObject):
                 ytdl=False,
                 cache="yes",
                 cache_secs=20,
-                cache_pause_initial="yes",
-                cache_pause_wait=1.5,
+                cache_pause_initial="no",
                 demuxer_readahead_secs=20,
-                vd_lavc_threads=2,
+                vd_lavc_threads=4,
                 demuxer_lavf_probesize=1048576,
                 demuxer_lavf_analyzeduration=0.5,
                 demuxer_donate_buffer="no",
@@ -187,8 +186,7 @@ class MediaPlayer(QObject):
                 stream_buffer_size="512KiB",
                 audio_buffer=0.1,
                 demuxer_lavf_o=(
-                    "http_persistent=1,reconnect=1,reconnect_streamed=1,"
-                    "reconnect_at_eof=1,reconnect_delay_max=3"
+                    "http_persistent=1,reconnect=1,reconnect_streamed=1,reconnect_delay_max=3"
                 ),
                 volume=self._volume,
                 speed=self._speed,
@@ -455,8 +453,7 @@ class MediaPlayer(QObject):
                     player["hwdec"] = "d3d11va-copy"
                 player["cache"] = "yes"
                 player["cache-secs"] = 20
-                player["cache-pause-initial"] = "yes"
-                player["cache-pause-wait"] = 1.5
+                player["cache-pause-initial"] = "no"
                 player["demuxer-readahead-secs"] = 20
                 player["demuxer-hysteresis-secs"] = 3
                 player["demuxer-lavf-probesize"] = 1048576

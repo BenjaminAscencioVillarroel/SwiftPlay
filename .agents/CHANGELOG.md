@@ -14,6 +14,32 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-24 (6) — Botón Rápido Desconectar/Conectar en WatchParty + Verificación Bundle Wrangler
+- **Files:** `src/swiftplay/ui/watchparty_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Interruptor rápido `Desconectar` / `Conectar` en cabecera WatchParty:** Añadido `power_toggle_btn` en `WatchPartyPanel` para alternar `cfg.watchparty_enabled`, deteniendo el hilo WebSocket, el timer de presencia y limpiando espectadores/estado de invitados al desconectar (`status_pill = "Desactivado"`), y reactivándolo con un clic.
+  - **Validación del Worker Cloudflare (`watchparty_relay`):** `npx wrangler deploy --dry-run` validó el bundle (`25.26 KiB` / `5.48 KiB gzip` con Durable Object `WATCHPARTY_HUB`); queda pendiente `npx wrangler login` del usuario para publicar en Cloudflare.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+## 2026-11-24 (5) — Fix Definitivo Buffering < 2 s en YouTube (HLS `m3u8`-first contra throttling `17 KB/s`)
+- **Files:** `src/swiftplay/ytdlp_worker.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Causa raíz identificada:** Al fallar `yt-dlp-ejs` Node `n`-challenge por cambio en `base.js` de YouTube (`TypeError: a.addOnDisposeCallback is not a function`), los formatos DASH HTTPS de `c=VISIONOS` sufrían throttling extremo (`~17 KB/s`) en peticiones open-range desde `libmpv`, congelando videos a `< 2 s` en `"Buffering..."`.
+  - **Fix HLS-first + ruta rápida sin JS en `ytdlp_worker.py`:** `_handle_resolve_youtube` prioriza flujos **HLS (`protocol*=m3u8`)** para video+audio VOD y audio/música (`1.5+ MB/s`, buffer de `20 s` lleno en ~2–3 s) usando primero `player_skip=["configs", "js"]` sin cookies (~0.7–1.1 s de resolución) con fallback automático a `skip_js=False`, formatos DASH HTTPS y `_cookiefile_context()` para videos privados/restringidos; `_handle_download_media` fija `http_chunk_size = 10 MiB` para descargas por rangos acotados sin throttling.
+- **Verified:** Reproducción real sobre HWND de `p0y5bDyu6ew` (> 20 s en caché sin buffering) + `py_compile` + `scripts/verify_swiftplay.py` (`[1/6]`–`[6/6]`).
+
+## 2026-11-24 (4) — Fix Directos/Videos de YouTube, Actualización `yt-dlp` y Rendimiento WatchParty
+- **Files:** `pyproject.toml`/`uv.lock`/`.venv` (`yt-dlp 2026.11.23`), `src/swiftplay/ytdlp_worker.py`, `src/swiftplay/player.py`, `src/swiftplay/ui/watchparty_panel.py`, `src/swiftplay/ui/discord_overlay.py`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Fix de directos/videos de YouTube (`yt-dlp 2026.11.23` + `ytdlp_worker.py`):** Actualizado `yt-dlp` para resolver cambios de `base.js`/EJS de YouTube sin errores de solver; `_handle_resolve_youtube` y `_handle_download_media` ahora extraen primero **sin cookies** (evitando errores `"No video formats found!"` en directos y `"Requested format is not available"`, reduciendo latencia a la mitad) y solo recurren a `_cookiefile_context()` cuando `_should_retry_with_cookies` detecta videos privados/restringidos.
+  - **Reducción de lag UI/DWM en WatchParty y reproducción fluida:**
+    - `WatchPartyPanel` difiere renderizados mientras está oculto (`_friends_dirty`), omite llamadas redundantes y actualiza cards existentes en sitio cuando no cambia el orden.
+    - `DiscordStatusOverlay` deduplica repintados y llamadas Win32 `SetWindowPos` mediante `_last_render_key`, y `MainWindow._sync_watchparty_bar` solo llama `_sync_discord_overlay()` si cambió la lista de espectadores (`_wp_last_overlay_fp`).
+    - `MainWindow._soft_trim_after_stream_start` y `_on_periodic_ram_tick` omiten `trim_process_memory()` durante reproducción activa de video para no paginar buffers D3D11/libmpv.
+    - `MediaPlayer` ajusta `cache_pause_initial="no"` y `vd_lavc_threads=4`, y elimina `reconnect_at_eof=1` (que interfería con segmentos HLS de directos).
+    - `WatchPartyService` drena excepciones de todas las tareas completadas en `_pump_socket` y aplica backoff >= 10 s ante reemplazos `4001`.
+- **Verified:** Prueba en vivo YouTube VOD + Directo (`resolve_stream`), `py_compile` y suite completa `scripts/verify_swiftplay.py` (`[1/6]`–`[6/6]`).
+
 ## 2026-11-24 (3) — WatchParty YouTube: Caché estable en `libmpv` y sincronización sin re-resoluciones ni buffering repetido
 - **Files:** `src/swiftplay/player.py`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/ui/main_window.py`, `watchparty_relay/src/index.js`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

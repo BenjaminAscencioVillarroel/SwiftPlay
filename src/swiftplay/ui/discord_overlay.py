@@ -172,6 +172,7 @@ class DiscordStatusOverlay(QWidget):
         self._dragging: bool = False
         self._drag_offset = QPoint()
         self._edit_bar: _OverlayEditBar | None = None
+        self._last_render_key: str = ""
 
         if self._thumb_cache is not None:
             self._thumb_cache.ready.connect(self._on_avatar_ready)
@@ -428,13 +429,17 @@ class DiscordStatusOverlay(QWidget):
 
     def update_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
+        self._last_render_key = ""
         if self._edit_bar is not None:
             self._edit_bar._apply_theme(palette)
         if self.isVisible():
             self.update()
 
     def set_opacity_percent(self, opacity_pct: int) -> None:
-        self._opacity_pct = max(10, min(100, int(opacity_pct)))
+        val = max(10, min(100, int(opacity_pct)))
+        if val == self._opacity_pct and abs(self.windowOpacity() - (val / 100.0)) < 0.01:
+            return
+        self._opacity_pct = val
         self.setWindowOpacity(self._opacity_pct / 100.0)
 
     def _resolve_mode(self, muted: bool, deafened: bool, streaming: bool = False) -> str:
@@ -589,7 +594,7 @@ class DiscordStatusOverlay(QWidget):
         status_mode: str,
         participants: list[dict[str, Any]],
         extra_count: int,
-    ) -> None:
+    ) -> bool:
         if not participants:
             if not status_mode:
                 base_w = 0
@@ -614,6 +619,8 @@ class DiscordStatusOverlay(QWidget):
             target_h = max(36, header_h + rows_h + extra_h + 4)
         if self.width() != target_w or self.height() != target_h:
             self.setFixedSize(target_w, target_h)
+            return True
+        return False
 
     def _sync_visibility(self) -> None:
         eff_ov = self._effective_overlay_mode()
@@ -632,6 +639,7 @@ class DiscordStatusOverlay(QWidget):
             self._mode = status_mode
             self._apply_size_for_state(status_mode, parts, extra)
             self.set_opacity_percent(max(85, self._opacity_pct) if self._edit_mode else self._opacity_pct)
+            self._last_render_key = ""
             if not self.isVisible():
                 self._show_no_activate()
             else:
@@ -645,18 +653,37 @@ class DiscordStatusOverlay(QWidget):
         status_mode = raw_status if has_discord_status else ""
         has_content = bool(parts) or has_discord_status or has_wp
         if eff_ov != "off" and self._enabled and has_content:
+            render_key = repr((
+                eff_ov,
+                status_mode,
+                self._opacity_pct,
+                self._wp_count,
+                self._custom_pos,
+                self._muted,
+                self._deafened,
+                self._streaming,
+                parts,
+                extra,
+                self._speaking if eff_ov == "full" else None,
+            ))
+            if self.isVisible() and render_key == self._last_render_key:
+                self._sync_live_timer()
+                return
+            self._last_render_key = render_key
             self._mode = status_mode
-            self._apply_size_for_state(status_mode, parts, extra)
+            resized = self._apply_size_for_state(status_mode, parts, extra)
             self.set_opacity_percent(self._opacity_pct)
             if not self.isVisible():
                 self._show_no_activate()
             else:
                 self._apply_position()
-                self._apply_win32_flags(force_topmost=True)
+                if resized:
+                    self._apply_win32_flags(force_topmost=False)
                 self.update()
             self._sync_live_timer()
         else:
             self._mode = ""
+            self._last_render_key = ""
             if self.isVisible():
                 self.hide()
             self._sync_live_timer()

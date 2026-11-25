@@ -605,7 +605,10 @@ class WatchPartyService(QObject):
             except Exception as exc:
                 if self._stop_evt.is_set():
                     break
-                self._set_connection_state("error", str(exc)[:120])
+                err_txt = str(exc)
+                self._set_connection_state("error", err_txt[:120])
+                if "4001" in err_txt or "Replaced by newer connection" in err_txt:
+                    backoff = max(backoff, 10.0)
 
             if self._stop_evt.is_set():
                 break
@@ -678,10 +681,15 @@ class WatchPartyService(QObject):
             for t in pending:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+            first_exc: BaseException | None = None
             for t in done:
+                if t.cancelled():
+                    continue
                 exc = t.exception()
-                if exc is not None and not isinstance(exc, asyncio.CancelledError):
-                    raise exc
+                if exc is not None and not isinstance(exc, asyncio.CancelledError) and first_exc is None:
+                    first_exc = exc
+            if first_exc is not None:
+                raise first_exc
         finally:
             for t in tasks:
                 if not t.done():

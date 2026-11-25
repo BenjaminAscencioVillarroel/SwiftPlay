@@ -297,6 +297,7 @@ class MainWindow(QMainWindow):
         self._video_buffering_ui_timer.timeout.connect(self._show_debounced_video_buffering)
         self._wp_presence_status: str = "idle"
         self._wp_overlay_spectators: list[dict[str, Any]] = []
+        self._wp_last_overlay_fp: str = ""
         self._wp_personal_snapshots: dict[str, dict[str, Any] | None] = {
             "video": None,
             "music": None,
@@ -2424,10 +2425,13 @@ class MainWindow(QMainWindow):
             self.thumb_cache.trim(14 if high_ram else 16)
             QPixmapCache.clear()
             active_vid = self.video_player.has_active_stream and not self._video_paused
-            trim_process_memory(collect_gc=not active_vid)
+            if not active_vid:
+                trim_process_memory(collect_gc=True)
 
     def _soft_trim_after_stream_start(self) -> None:
         if self._cleaned_up:
+            return
+        if self.video_player.has_active_stream and not self._video_paused:
             return
         trim_process_memory(collect_gc=False)
 
@@ -5777,7 +5781,14 @@ class MainWindow(QMainWindow):
             self._on_watchparty_presence_tick(force=True)
         else:
             self._wp_presence_timer.stop()
+            if not self.cfg.watchparty_enabled:
+                self._wp_guest_decks.clear()
+                self._wp_restore_pending.clear()
+                self._wp_personal_snapshots = {"video": None, "music": None}
+                if hasattr(self, "watchparty_panel"):
+                    self.watchparty_panel.set_friends_data([])
             self.watchparty_panel.set_connection_state("disconnected", "")
+            self._sync_watchparty_bar()
 
     def _on_watchparty_config_changed(self) -> None:
         self._start_watchparty_service()
@@ -6120,7 +6131,10 @@ class MainWindow(QMainWindow):
         self._refresh_wp_restore_bar()
 
         self._wp_overlay_spectators = list(overlay_specs_by_code.values())
-        self._sync_discord_overlay()
+        ov_fp = repr(self._wp_overlay_spectators)
+        if ov_fp != self._wp_last_overlay_fp:
+            self._wp_last_overlay_fp = ov_fp
+            self._sync_discord_overlay()
 
     def _is_wp_guest_on_deck(self, deck: Literal["video", "music"]) -> bool:
         if deck in self._wp_guest_decks:

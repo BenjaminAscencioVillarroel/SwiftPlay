@@ -638,6 +638,8 @@ class WatchPartyPanel(QWidget):
         self._friends: list[dict[str, Any]] = []
         self._expanded_codes: set[str] = set()
         self._cards: dict[str, _WatchPartyFriendCard] = {}
+        self._rendered_order: list[str] = []
+        self._friends_dirty: bool = False
         self._joined_video_host: str = ""
         self._joined_music_host: str = ""
         self._conn_state: str = "disconnected"
@@ -657,6 +659,12 @@ class WatchPartyPanel(QWidget):
         self.status_pill = QLabel("Sin servidor")
         self.status_pill.setObjectName("DeckTag")
         hdr.addWidget(self.status_pill)
+
+        self.power_toggle_btn = QPushButton("Desconectar")
+        self.power_toggle_btn.setObjectName("PillBtn")
+        self.power_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.power_toggle_btn.clicked.connect(self._on_power_toggled)
+        hdr.addWidget(self.power_toggle_btn)
 
         hdr.addStretch(1)
 
@@ -853,6 +861,7 @@ class WatchPartyPanel(QWidget):
             self.thumb_cache.ready.connect(self._on_thumb_ready)
 
         self.update_theme(palette)
+        self._sync_power_toggle_ui()
         self._rebuild_from_offline_config()
 
     def _on_thumb_ready(self, key: str, pix: QPixmap) -> None:
@@ -861,6 +870,9 @@ class WatchPartyPanel(QWidget):
 
     def showEvent(self, event: Any) -> None:
         super().showEvent(event)
+        if self._friends_dirty:
+            self._friends_dirty = False
+            self._render_friends_list()
         self._refresh_tick_timer()
 
     def hideEvent(self, event: Any) -> None:
@@ -952,9 +964,42 @@ class WatchPartyPanel(QWidget):
         self.add_code_input.clear()
         self.add_friend_requested.emit(code)
 
+    def _sync_power_toggle_ui(self) -> None:
+        enabled = bool(self.cfg.watchparty_enabled)
+        if enabled:
+            self.power_toggle_btn.setText("Desconectar")
+            self.power_toggle_btn.setProperty("active", "false")
+            self.power_toggle_btn.setToolTip(
+                "Desconectar WatchParty por completo (detiene WebSocket y presencia en segundo plano)"
+            )
+        else:
+            self.power_toggle_btn.setText("Conectar")
+            self.power_toggle_btn.setProperty("active", "true")
+            self.power_toggle_btn.setToolTip("Activar y conectar WatchParty")
+        self.power_toggle_btn.style().unpolish(self.power_toggle_btn)
+        self.power_toggle_btn.style().polish(self.power_toggle_btn)
+        self.refresh_btn.setEnabled(enabled)
+
+    def _on_power_toggled(self) -> None:
+        self.cfg.watchparty_enabled = not bool(self.cfg.watchparty_enabled)
+        save_config(self.cfg)
+        self._sync_power_toggle_ui()
+        if not self.cfg.watchparty_enabled:
+            self.set_connection_state("disconnected", "")
+            self.toast_requested.emit("WatchParty desconectado.")
+        else:
+            self.toast_requested.emit("WatchParty activado.")
+        self.config_changed.emit()
+
     def set_connection_state(self, state: str, detail: str = "") -> None:
         self._conn_state = str(state or "disconnected")
         self._conn_detail = str(detail or "")
+        if not self.cfg.watchparty_enabled:
+            self.status_pill.setText("Desactivado")
+            self.status_pill.setStyleSheet(
+                f"color: {self.palette.text2}; background: {self.palette.surface2};"
+            )
+            return
         if not self.cfg.watchparty_relay_url:
             self.status_pill.setText("Sin servidor")
             self.status_pill.setStyleSheet(
@@ -979,12 +1024,21 @@ class WatchPartyPanel(QWidget):
             )
 
     def set_joined_hosts(self, *, video_host: str = "", music_host: str = "") -> None:
-        self._joined_video_host = str(video_host or "").upper()
-        self._joined_music_host = str(music_host or "").upper()
+        vh = str(video_host or "").upper()
+        mh = str(music_host or "").upper()
+        if vh == self._joined_video_host and mh == self._joined_music_host:
+            return
+        self._joined_video_host = vh
+        self._joined_music_host = mh
+        if not self.isVisible():
+            self._friends_dirty = True
+            return
         for f in self._friends:
             c = str(f.get("code") or "").upper()
             card = self._cards.get(c)
-            if card is not None:
+            if card is not None and (
+                card._joined_video_host != vh or card._joined_music_host != mh
+            ):
                 card.update_friend(
                     f,
                     joined_video_host=self._joined_video_host,
@@ -1016,14 +1070,42 @@ class WatchPartyPanel(QWidget):
                 str(it.get("name") or it.get("code") or "").lower(),
             ),
         )
+        if (
+            sorted_list == self._friends
+            and not self._friends_dirty
+            and len(self._cards) == len(sorted_list)
+        ):
+            return
         self._friends = sorted_list
+        if not self.isVisible():
+            self._friends_dirty = True
+            return
         self._render_friends_list()
 
     def _rebuild_from_offline_config(self) -> None:
         self.set_friends_data([])
 
     def _render_friends_list(self) -> None:
+        self._friends_dirty = False
         self.empty_lbl.setVisible(len(self._friends) == 0)
+
+        new_order = [str(f.get("code") or "").upper() for f in self._friends]
+        if new_order == self._rendered_order and all(c in self._cards for c in new_order):
+            for f in self._friends:
+                code = str(f.get("code") or "").upper()
+                card = self._cards[code]
+                if (
+                    card._friend != f
+                    or card._joined_video_host != self._joined_video_host
+                    or card._joined_music_host != self._joined_music_host
+                ):
+                    card.update_friend(
+                        f,
+                        joined_video_host=self._joined_video_host,
+                        joined_music_host=self._joined_music_host,
+                    )
+            self._refresh_tick_timer()
+            return
 
         # Remover tarjetas anteriores que ya no existen o cambiar orden limpiamente
         for c in list(self._cards.keys()):
@@ -1054,6 +1136,7 @@ class WatchPartyPanel(QWidget):
             self._list_lay.insertWidget(insert_idx, card)
             insert_idx += 1
 
+        self._rendered_order = new_order
         self._refresh_tick_timer()
 
     def _on_card_expanded_toggled(self, code: str, expanded: bool) -> None:
@@ -1076,6 +1159,7 @@ class WatchPartyPanel(QWidget):
         self.guest_ctrl_chk.setChecked(bool(self.cfg.watchparty_allow_guest_control))
         self.guest_ctrl_chk.blockSignals(False)
         self.sync_overlay_controls()
+        self._sync_power_toggle_ui()
         if conn_state is not None:
             self.set_connection_state(conn_state[0], conn_state[1])
         elif not self.cfg.watchparty_relay_url:
