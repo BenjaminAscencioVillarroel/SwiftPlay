@@ -122,6 +122,7 @@ class MusicNowPlayingPanel(QWidget):
     download_requested = Signal(object)           # MediaItem
     autoplay_toggled = Signal()
     clear_queue_requested = Signal()
+    artist_clicked = Signal(object)               # MediaItem
 
     COVER_FETCH_SIZE = QSize(380, 380)
 
@@ -220,6 +221,8 @@ class MusicNowPlayingPanel(QWidget):
         self.artist_lbl.setMaximumWidth(440)
         self.artist_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.artist_lbl.setStyleSheet("font-size: 14px;")
+        self.artist_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.artist_lbl.installEventFilter(self)
         left_col.addWidget(self.artist_lbl, 0, Qt.AlignmentFlag.AlignCenter)
 
         actions_row = QHBoxLayout()
@@ -293,6 +296,28 @@ class MusicNowPlayingPanel(QWidget):
         self.set_autoplay_state(autoplay_enabled)
         self.update_theme(palette)
 
+    def eventFilter(self, obj, event) -> bool:
+        try:
+            if (
+                obj is not getattr(self, "artist_lbl", None)
+                or self._current_item is None
+                or not (self._current_item.author or self._current_item.channel_id)
+            ):
+                return False
+            etype = event.type()
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self.artist_clicked.emit(self._current_item)
+                return True
+            if etype == QEvent.Type.Enter:
+                self.artist_lbl.setStyleSheet(
+                    f"font-size: 14px; color: {self._palette.text}; text-decoration: underline;"
+                )
+            elif etype == QEvent.Type.Leave:
+                self.artist_lbl.setStyleSheet("font-size: 14px;")
+        except Exception:
+            return False
+        return False
+
     def _on_stage_clicked(self) -> None:
         if self._current_item is not None:
             self.cover_widget.trigger_press_feedback()
@@ -313,6 +338,7 @@ class MusicNowPlayingPanel(QWidget):
             self.cover_widget.clear()
             self.title_lbl.setText("Sin canción seleccionada")
             self.artist_lbl.setText("")
+            self.artist_lbl.setToolTip("")
             self.fav_btn.setEnabled(False)
             self.dl_btn.setEnabled(False)
             self.set_my_music_state(False)
@@ -322,6 +348,9 @@ class MusicNowPlayingPanel(QWidget):
         self.dl_btn.setEnabled(True)
         self.title_lbl.setText(item.title)
         self.artist_lbl.setText(item.author or "YouTube Music")
+        self.artist_lbl.setToolTip(
+            f"Ver perfil de {item.author}" if item.author else ""
+        )
         self.set_my_music_state(in_my_music)
 
         self._current_thumb_url = upgrade_thumb_url(item.normalized_thumb(), 544)
@@ -419,6 +448,7 @@ class MusicNowPlayingPanel(QWidget):
                 compact=True,
             )
             row.play_requested.connect(lambda _it, i=idx: self.queue_index_requested.emit(i))
+            row.artist_clicked.connect(self.artist_clicked.emit)
             row.my_music_toggled.connect(self.my_music_toggled.emit)
             row.download_requested.connect(self.download_requested.emit)
             row.remove_requested.connect(self.remove_from_queue_requested.emit)

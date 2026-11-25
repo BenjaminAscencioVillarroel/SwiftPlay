@@ -22,9 +22,12 @@ from swiftplay.models import (
     ChannelInfo,
     FeedSection,
     MediaItem,
+    MusicAlbumInfo,
+    MusicArtistInfo,
     ResolvedStream,
     format_duration,
     parse_duration_text,
+    upgrade_thumb_url,
 )
 from swiftplay.security import (
     load_account_profile,
@@ -1231,7 +1234,15 @@ class YouTubeService:
         )
         return info, items, next_tok
 
-    def _parse_ytm_items(self, raw_items: list[dict], limit: int = 8) -> list[MediaItem]:
+    def _parse_ytm_items(
+        self,
+        raw_items: list[dict],
+        limit: int = 8,
+        *,
+        fallback_thumb: str = "",
+        fallback_author: str = "",
+        fallback_artist_id: str = "",
+    ) -> list[MediaItem]:
         tracks: list[MediaItem] = []
         seen: set[str] = set()
         for row in raw_items:
@@ -1244,28 +1255,218 @@ class YouTubeService:
             title = str(row.get("title") or "").strip()
             if not title:
                 continue
+            raw_artists = [a for a in (row.get("artists") or []) if isinstance(a, dict)]
             artists = ", ".join(
-                a.get("name", "")
-                for a in (row.get("artists") or [])
-                if isinstance(a, dict) and a.get("name")
+                str(a.get("name") or "").strip()
+                for a in raw_artists
+                if a.get("name")
             )
+            artist_id = next(
+                (str(a.get("id") or "").strip() for a in raw_artists if a.get("id")),
+                "",
+            ) or fallback_artist_id
             dur_str = str(row.get("duration") or row.get("length") or "")
             dur_sec = int(row.get("duration_seconds") or 0) or parse_duration_text(dur_str)
-            thumb = _pick_best_thumb(row.get("thumbnails") or row.get("thumbnail"), str(vid))
+            raw_thumbs = row.get("thumbnails") or row.get("thumbnail")
+            if not raw_thumbs and fallback_thumb:
+                thumb = fallback_thumb
+            else:
+                thumb = _pick_best_thumb(raw_thumbs, str(vid))
+                if not thumb and fallback_thumb:
+                    thumb = fallback_thumb
             tracks.append(
                 MediaItem(
                     video_id=str(vid),
                     title=title,
-                    author=artists or "YouTube Music",
+                    author=artists or fallback_author or "YouTube Music",
                     duration=dur_str or format_duration(dur_sec),
                     duration_sec=dur_sec,
                     thumb_url=thumb,
                     kind="music",
+                    channel_id=artist_id,
                 )
             )
             if len(tracks) >= limit:
                 break
         return tracks
+
+    # ------------------------------------------------------------------
+    # Perfil de artista y álbumes de YouTube Music
+    # ------------------------------------------------------------------
+
+    def resolve_music_artist_id(self, artist_name: str) -> str:
+        raw_name = str(artist_name or "").strip()
+        if not raw_name or raw_name.lower() == "youtube music":
+            return ""
+        primary = re.split(r"\s*(?:,|&|•|\bfeat\.?|\bft\.?)\s*", raw_name, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        queries = [primary] if primary else []
+        if raw_name and raw_name not in queries:
+            queries.append(raw_name)
+
+        ytm = self._get_search_ytmusic()
+        for q in queries:
+            try:
+                rows = ytm.search(q, filter="artists", limit=5) or []
+            except Exception:
+                rows = []
+            exact = next(
+                (
+                    str(r.get("browseId") or "").strip()
+                    for r in rows
+                    if isinstance(r, dict)
+                    and r.get("browseId")
+                    and str(r.get("artist") or r.get("name") or "").strip().lower() == q.lower()
+                ),
+                "",
+            )
+            if exact:
+                return exact
+            first_uc = next(
+                (
+                    str(r.get("browseId") or "").strip()
+                    for r in rows
+                    if isinstance(r, dict) and str(r.get("browseId") or "").strip().startswith("UC")
+                ),
+                "",
+            )
+            if first_uc:
+                return first_uc
+            first_any = next(
+                (
+                    str(r.get("browseId") or "").strip()
+                    for r in rows
+                    if isinstance(r, dict) and str(r.get("browseId") or "").strip()
+                ),
+                "",
+            )
+            if first_any:
+                return first_any
+        return ""
+
+    def get_music_artist_page(
+        self, artist_id: str, fallback_name: str = ""
+    ) -> tuple[MusicArtistInfo, list[MediaItem], list[MusicAlbumInfo]]:
+        cid = str(artist_id or "").strip()
+        if not cid and fallback_name:
+            cid = self.resolve_music_artist_id(fallback_name)
+        if not cid:
+            raise RuntimeError("No se encontró el perfil del artista.")
+
+        ytm = self._get_ytmusic()
+        data = ytm.get_artist(cid)
+        if not isinstance(data, dict):
+            raise RuntimeError("No se pudo cargar la información del artista.")
+
+        name = str(data.get("name") or fallback_name or "Artista").strip()
+        subscribers = str(data.get("subscribers") or "").strip()
+        monthly = str(data.get("monthlyListeners") or "").strip()
+        raw_thumbs = data.get("thumbnails")
+        av_url = upgrade_thumb_url(_pick_best_thumb(raw_thumbs, ""), 256) if raw_thumbs else ""
+        desc = str(data.get("description") or "").strip()
+        songs_sec = data.get("songs") if isinstance(data.get("songs"), dict) else {}
+        songs_browse_id = str(songs_sec.get("browseId") or "").strip()
+
+        songs: list[MediaItem] = []
+        if songs_browse_id:
+            try:
+                pl = ytm.get_playlist(songs_browse_id, limit=35)
+                if isinstance(pl, dict):
+                    songs = self._parse_ytm_items(
+                        pl.get("tracks") or [],
+                        limit=35,
+                        fallback_author=name,
+                        fallback_artist_id=cid,
+                    )
+            except Exception:
+                songs = []
+        if not songs:
+            songs = self._parse_ytm_items(
+                songs_sec.get("results") or [],
+                limit=35,
+                fallback_author=name,
+                fallback_artist_id=cid,
+            )
+        if len(songs) < 5 and name:
+            try:
+                extra = self.search_music(name, search_filter="songs", limit=20)
+                seen_vids = {s.video_id for s in songs if s.video_id}
+                for it in extra:
+                    if it.video_id and it.video_id not in seen_vids:
+                        seen_vids.add(it.video_id)
+                        if not it.channel_id:
+                            it.channel_id = cid
+                        songs.append(it)
+            except Exception:
+                pass
+
+        albums: list[MusicAlbumInfo] = []
+        seen_albums: set[str] = set()
+        for key, label in (("albums", "Álbum"), ("singles", "Sencillo / EP")):
+            sec = data.get(key) if isinstance(data.get(key), dict) else {}
+            for entry in sec.get("results") or []:
+                if not isinstance(entry, dict):
+                    continue
+                bid = str(entry.get("browseId") or "").strip()
+                atitle = str(entry.get("title") or "").strip()
+                if not bid or not atitle or bid in seen_albums:
+                    continue
+                seen_albums.add(bid)
+                ath = entry.get("thumbnails")
+                t_url = upgrade_thumb_url(_pick_best_thumb(ath, ""), 360) if ath else ""
+                albums.append(
+                    MusicAlbumInfo(
+                        browse_id=bid,
+                        title=atitle,
+                        year=str(entry.get("year") or "").strip(),
+                        thumb_url=t_url,
+                        album_type=label,
+                    )
+                )
+
+        info = MusicArtistInfo(
+            artist_id=str(data.get("channelId") or cid).strip() or cid,
+            name=name,
+            subscribers=subscribers,
+            monthly_listeners=monthly,
+            avatar_url=av_url,
+            description=desc,
+            songs_browse_id=songs_browse_id,
+        )
+        return info, songs[:35], albums
+
+    def get_music_album_tracks(
+        self,
+        browse_id: str,
+        *,
+        fallback_author: str = "",
+        fallback_artist_id: str = "",
+    ) -> tuple[str, str, list[MediaItem]]:
+        bid = str(browse_id or "").strip()
+        if not bid:
+            return "", "", []
+        ytm = self._get_ytmusic()
+        alb = ytm.get_album(bid)
+        if not isinstance(alb, dict):
+            return "", "", []
+        alb_title = str(alb.get("title") or "").strip()
+        ath = alb.get("thumbnails")
+        alb_thumb = upgrade_thumb_url(_pick_best_thumb(ath, ""), 544) if ath else ""
+        raw_artists = [a for a in (alb.get("artists") or []) if isinstance(a, dict)]
+        alb_author = ", ".join(
+            str(a.get("name") or "").strip() for a in raw_artists if a.get("name")
+        ) or fallback_author
+        alb_artist_id = (
+            next((str(a.get("id") or "").strip() for a in raw_artists if a.get("id")), "")
+            or fallback_artist_id
+        )
+        tracks = self._parse_ytm_items(
+            alb.get("tracks") or [],
+            limit=80,
+            fallback_thumb=alb_thumb,
+            fallback_author=alb_author,
+            fallback_artist_id=alb_artist_id,
+        )
+        return alb_title, alb_thumb, tracks
 
     # ------------------------------------------------------------------
     # Búsqueda (Video sin Shorts & Música)

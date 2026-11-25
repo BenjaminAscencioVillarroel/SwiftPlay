@@ -14,6 +14,14 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-25 — Perfil de Artista en YT Music, Sync de Cola WatchParty Music y Fallback `android` en `yt-dlp`
+- **Files:** `src/swiftplay/ytdlp_worker.py`, `src/swiftplay/models.py`, `src/swiftplay/youtube_service.py`, `src/swiftplay/ui/widgets.py`, `src/swiftplay/ui/music_player_panel.py`, `src/swiftplay/ui/main_window.py`, `watchparty_relay/src/index.js`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Fix error bot-check `Sign in to confirm you're not a bot` en música (`ytdlp_worker.py`):** Añadida ruta rápida `player_client=["android"]` sin cookies ni solver JS como segundo nivel en `_handle_resolve_youtube` y `_handle_download_media` (desbloquea pistas como `sX0Snobyt84` a ~2.7 MB/s sin requerir sesión ni fallar por formatos con cookies).
+  - **Sincronización unificada de playlist WatchParty Music (`main_window.py`, `watchparty_relay/src/index.js`):** Los eventos `queue_update` (radio generada, encolar, quitar o limpiar cola) ahora pasan `bypass_suppress=True` para no ser descartados por `_wp_suppress_until["music"]` cuando un invitado inicia una canción desde búsqueda; el anfitrión fuerza generación de radio al recibir un `play_item` único, los invitados se resincronizan si divergen del anfitrión y esperan al anfitrión al finalizar su cola en lugar de generar una radio distinta. También se preserva `channel_id` en snapshots de música.
+  - **Perfil de Artista en YouTube Music (`PAGE_MUSIC_ARTIST = 12`):** `YouTubeService._parse_ytm_items` ahora extrae `channel_id` del artista principal (`browseId`); agregados `MusicArtistInfo`, `MusicAlbumInfo`, `get_music_artist_page` y `get_music_album_tracks`; hechos clicables los nombres de artista en `MusicNowPlayingPanel`, `MusicTileWidget`, `MusicRowWidget` (y menús contextuales) y `bb_author` de la barra inferior para abrir el perfil completo con avatar, métricas, canciones, álbumes/sencillos y reproducción en lote/aleatoria.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
 ## 2026-11-24 (6) — Botón Rápido Desconectar/Conectar en WatchParty + Verificación Bundle Wrangler
 - **Files:** `src/swiftplay/ui/watchparty_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

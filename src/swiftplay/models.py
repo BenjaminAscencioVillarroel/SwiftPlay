@@ -143,6 +143,26 @@ class ChannelInfo:
 
 
 @dataclass(slots=True)
+class MusicAlbumInfo:
+    browse_id: str
+    title: str
+    year: str = ""
+    thumb_url: str = ""
+    album_type: str = ""
+
+
+@dataclass(slots=True)
+class MusicArtistInfo:
+    artist_id: str
+    name: str = ""
+    subscribers: str = ""
+    monthly_listeners: str = ""
+    avatar_url: str = ""
+    description: str = ""
+    songs_browse_id: str = ""
+
+
+@dataclass(slots=True)
 class AccountProfile:
     name: str = ""
     handle: str = ""

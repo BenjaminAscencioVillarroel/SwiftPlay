@@ -406,18 +406,26 @@ def _handle_resolve_youtube(req: dict[str, Any]) -> dict[str, Any]:
             f"best[height<={max_h}]/best"
         )
 
-    def _extract(cookiefile: str | None, *, skip_js: bool = False) -> dict[str, Any]:
+    def _extract(
+        cookiefile: str | None,
+        *,
+        skip_js: bool = False,
+        player_client: list[str] | None = None,
+    ) -> dict[str, Any]:
         opts = _base_ydl_opts(cookiefile)
         opts["format"] = fmt
         opts["noplaylist"] = True
         opts["skip_download"] = True
         opts["noprogress"] = True
         opts["no_color"] = True
+        yt_args: dict[str, Any] = {
+            "player_skip": ["configs", "js"] if skip_js else ["configs"]
+        }
+        if player_client:
+            yt_args["player_client"] = list(player_client)
         if skip_js:
             opts["js_runtimes"] = {}
-            opts["extractor_args"] = {"youtube": {"player_skip": ["configs", "js"]}}
-        else:
-            opts["extractor_args"] = {"youtube": {"player_skip": ["configs"]}}
+        opts["extractor_args"] = {"youtube": yt_args}
         with _make_youtube_ydl(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
@@ -469,16 +477,20 @@ def _handle_resolve_youtube(req: dict[str, Any]) -> dict[str, Any]:
             return _extract(None, skip_js=True)
         except Exception:
             try:
-                return _extract(None, skip_js=False)
-            except Exception as exc_no_ck:
-                if _should_retry_with_cookies(str(exc_no_ck)):
-                    with _cookiefile_context() as ck:
-                        if ck is not None:
-                            try:
-                                return _extract(ck, skip_js=False)
-                            except Exception:
-                                raise exc_no_ck
-                raise
+                # Respaldo rápido android sin cookies ni solver JS (evita bot-check en música/VOD).
+                return _extract(None, skip_js=True, player_client=["android"])
+            except Exception:
+                try:
+                    return _extract(None, skip_js=False)
+                except Exception as exc_no_ck:
+                    if _should_retry_with_cookies(str(exc_no_ck)):
+                        with _cookiefile_context() as ck:
+                            if ck is not None:
+                                try:
+                                    return _extract(ck, skip_js=False)
+                                except Exception:
+                                    raise exc_no_ck
+                    raise
     finally:
         gc.collect()
 
@@ -574,12 +586,22 @@ def _handle_download_media(
                 downloaded_file.append(Path(fn))
             emit_progress(100.0, "Procesando archivo...")
 
-    def _run_dl(cookiefile: str | None) -> Path:
+    def _run_dl(
+        cookiefile: str | None, *, player_client: list[str] | None = None
+    ) -> Path:
         opts = _base_ydl_opts(cookiefile)
         opts["noplaylist"] = True
         opts["http_chunk_size"] = 10 * 1024 * 1024
         opts["outtmpl"] = str(out_path / "%(title).120s [%(id)s].%(ext)s")
         opts["progress_hooks"] = [_hook]
+        if player_client:
+            opts["js_runtimes"] = {}
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": list(player_client),
+                    "player_skip": ["configs", "js"],
+                }
+            }
 
         if mode == "music":
             opts["format"] = "bestaudio/best"
@@ -607,18 +629,22 @@ def _handle_download_media(
         try:
             prepared = _run_dl(None)
         except Exception as exc_no_ck:
-            if _should_retry_with_cookies(str(exc_no_ck)):
-                with _cookiefile_context() as ck:
-                    if ck is not None:
-                        downloaded_file.clear()
-                        try:
-                            prepared = _run_dl(ck)
-                        except Exception:
+            try:
+                downloaded_file.clear()
+                prepared = _run_dl(None, player_client=["android"])
+            except Exception:
+                if _should_retry_with_cookies(str(exc_no_ck)):
+                    with _cookiefile_context() as ck:
+                        if ck is not None:
+                            downloaded_file.clear()
+                            try:
+                                prepared = _run_dl(ck)
+                            except Exception:
+                                raise exc_no_ck
+                        else:
                             raise exc_no_ck
-                    else:
-                        raise
-            else:
-                raise
+                else:
+                    raise exc_no_ck
 
         if mode == "music":
             final = prepared.with_suffix(".m4a")

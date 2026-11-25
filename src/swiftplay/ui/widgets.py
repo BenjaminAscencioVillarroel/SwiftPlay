@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from swiftplay.models import MediaItem, format_duration, upgrade_thumb_url
+from swiftplay.models import MediaItem, MusicAlbumInfo, format_duration, upgrade_thumb_url
 from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
@@ -1203,6 +1203,7 @@ class MusicTileWidget(QFrame):
     my_music_toggled = Signal(object)    # MediaItem
     enqueue_requested = Signal(object)   # MediaItem
     download_requested = Signal(object)  # MediaItem
+    artist_clicked = Signal(object)      # MediaItem
 
     TILE_SIZE = 172
     THUMB_FETCH_SIZE = QSize(180, 180)
@@ -1258,6 +1259,12 @@ class MusicTileWidget(QFrame):
             sub_text = f"{sub_text}  •  {item.duration}"
         self.artist_lbl = ElidedLabel(sub_text, max_lines=1)
         self.artist_lbl.setObjectName("MutedLabel")
+        if item.author or item.channel_id:
+            self.artist_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.artist_lbl.setToolTip(
+                f"Ver perfil de {item.author}" if item.author else "Ver perfil del artista"
+            )
+            self.artist_lbl.installEventFilter(self)
         text_col.addWidget(self.artist_lbl)
 
         bottom_row.addLayout(text_col, 1)
@@ -1292,11 +1299,19 @@ class MusicTileWidget(QFrame):
         self._disconnect_thumb_cache()
         if self._card_hover_anim is not None:
             self._card_hover_anim.stop()
+        try:
+            self.artist_lbl.removeEventFilter(self)
+        except Exception:
+            pass
         self.thumb_widget.clear()
 
     def _open_context_menu(self) -> None:
         menu = QMenu(self)
         try:
+            if self.item.author or self.item.channel_id:
+                act_art = menu.addAction("Ver perfil del artista")
+                act_art.triggered.connect(lambda: self.artist_clicked.emit(self.item))
+
             mm_label = (
                 "Quitar de Mi música"
                 if self._in_my_music
@@ -1369,6 +1384,24 @@ class MusicTileWidget(QFrame):
             p.drawRoundedRect(QRectF(self.rect()), 10.0, 10.0)
             p.end()
         super().paintEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        try:
+            if obj is not getattr(self, "artist_lbl", None) or not (
+                self.item.author or self.item.channel_id
+            ):
+                return False
+            etype = event.type()
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self.artist_clicked.emit(self.item)
+                return True
+            if etype == QEvent.Type.Enter:
+                self.artist_lbl.setStyleSheet(f"color: {self._palette.text}; text-decoration: underline;")
+            elif etype == QEvent.Type.Leave:
+                self.artist_lbl.setStyleSheet("")
+        except Exception:
+            return False
+        return False
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1706,6 +1739,7 @@ class MusicRowWidget(QFrame):
     enqueue_requested = Signal(object)   # MediaItem
     download_requested = Signal(object)  # MediaItem
     remove_requested = Signal(object)    # MediaItem
+    artist_clicked = Signal(object)      # MediaItem
 
     THUMB_SIZE = QSize(44, 44)
 
@@ -1763,6 +1797,9 @@ class MusicRowWidget(QFrame):
 
         self.artist_lbl = ElidedLabel(item.author or "YouTube Music", max_lines=1)
         self.artist_lbl.setObjectName("MutedLabel")
+        self.artist_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.artist_lbl.setToolTip(f"Ver perfil de {item.author}" if item.author else "Ver perfil del artista")
+        self.artist_lbl.installEventFilter(self)
         text_col.addWidget(self.artist_lbl)
         root.addLayout(text_col, 1)
 
@@ -1842,12 +1879,20 @@ class MusicRowWidget(QFrame):
         self._disconnect_thumb_cache()
         if self._hover_anim is not None:
             self._hover_anim.stop()
+        try:
+            self.artist_lbl.removeEventFilter(self)
+        except Exception:
+            pass
         self.thumb_label.set_playing_bars(False)
         self.thumb_label.clear()
 
     def _open_compact_menu(self) -> None:
         menu = QMenu(self)
         try:
+            if self.item.author or self.item.channel_id:
+                act_art = menu.addAction("Ver perfil del artista")
+                act_art.triggered.connect(lambda: self.artist_clicked.emit(self.item))
+
             mm_label = (
                 "Quitar de Mi música"
                 if self._in_my_music
@@ -1856,14 +1901,23 @@ class MusicRowWidget(QFrame):
             act_mm = menu.addAction(mm_label)
             act_mm.triggered.connect(lambda: self.my_music_toggled.emit(self.item))
 
+            if self.more_btn is None and self.queue_btn is not None:
+                act_q = menu.addAction("Agregar a la cola")
+                act_q.triggered.connect(lambda: self.enqueue_requested.emit(self.item))
+
             act_dl = menu.addAction("Descargar canción")
             act_dl.triggered.connect(lambda: self.download_requested.emit(self.item))
 
             if self.more_btn is not None:
                 pos = self.more_btn.mapToGlobal(self.more_btn.rect().bottomLeft())
                 menu.exec(pos)
+            else:
+                menu.exec(self.mapToGlobal(QPoint(self.width() - 24, self.height() // 2)))
         finally:
             menu.deleteLater()
+
+    def contextMenuEvent(self, _event) -> None:
+        self._open_compact_menu()
 
     def _on_thumb_ready(self, url: str, pix: QPixmap) -> None:
         if url == self._thumb_url and pix.size() == self.THUMB_SIZE:
@@ -1950,9 +2004,155 @@ class MusicRowWidget(QFrame):
             painter.end()
         super().paintEvent(event)
 
+    def eventFilter(self, obj, event) -> bool:
+        try:
+            if obj is not getattr(self, "artist_lbl", None) or not (
+                self.item.author or self.item.channel_id
+            ):
+                return False
+            etype = event.type()
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self.artist_clicked.emit(self.item)
+                return True
+            if etype == QEvent.Type.Enter:
+                self.artist_lbl.setStyleSheet(f"color: {self._palette.text}; text-decoration: underline;")
+            elif etype == QEvent.Type.Leave:
+                self.artist_lbl.setStyleSheet("")
+        except Exception:
+            return False
+        return False
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.play_requested.emit(self.item)
+        super().mousePressEvent(event)
+
+
+class MusicAlbumCard(QFrame):
+    """Tarjeta cuadrada compacta de álbum o sencillo para el perfil de artista."""
+
+    clicked = Signal(object)  # MusicAlbumInfo
+
+    CARD_W = 184
+    THUMB_SIZE = 168
+
+    def __init__(
+        self,
+        album: MusicAlbumInfo,
+        thumb_cache: ThumbnailCache,
+        palette: ThemePalette,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.album = album
+        self._thumb_cache = thumb_cache
+        self._palette = palette
+        self._thumb_url = upgrade_thumb_url(album.thumb_url, 360)
+        self._thumb_connected = False
+        self._hover_t = 0.0
+        self._hover_anim: QVariantAnimation | None = None
+        self.setObjectName("YtMusicTile")
+        self.setFixedSize(self.CARD_W, 238)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        self.thumb_widget = RoundedThumbWidget(
+            radius=10,
+            show_play_on_hover=True,
+            bg_color=palette.surface1,
+            enable_hover_zoom=True,
+        )
+        self.thumb_widget.setFixedSize(self.THUMB_SIZE, self.THUMB_SIZE)
+        root.addWidget(self.thumb_widget)
+
+        self.title_lbl = ElidedLabel(album.title, max_lines=2)
+        self.title_lbl.setStyleSheet("font-size: 13px; font-weight: 600;")
+        root.addWidget(self.title_lbl)
+
+        meta_parts = [p for p in (album.year, album.album_type) if p]
+        self.meta_lbl = ElidedLabel("  •  ".join(meta_parts), max_lines=1)
+        self.meta_lbl.setObjectName("MutedLabel")
+        root.addWidget(self.meta_lbl)
+        root.addStretch()
+
+        if self._thumb_url:
+            cached = thumb_cache.get_or_fetch(
+                self._thumb_url, QSize(self.THUMB_SIZE, self.THUMB_SIZE)
+            )
+            if cached is not None:
+                self.thumb_widget.set_pixmap(cached)
+            else:
+                thumb_cache.ready.connect(self._on_thumb_ready)
+                self._thumb_connected = True
+
+    def _disconnect_thumb_cache(self) -> None:
+        if self._thumb_connected:
+            self._thumb_connected = False
+            try:
+                self._thumb_cache.ready.disconnect(self._on_thumb_ready)
+            except (RuntimeError, TypeError):
+                pass
+
+    def release_resources(self) -> None:
+        self._disconnect_thumb_cache()
+        if self._hover_anim is not None:
+            self._hover_anim.stop()
+        self.thumb_widget.clear()
+
+    def _on_thumb_ready(self, url: str, pix: QPixmap) -> None:
+        if url == self._thumb_url and pix.size() == QSize(self.THUMB_SIZE, self.THUMB_SIZE):
+            self.thumb_widget.set_pixmap(pix)
+            self._disconnect_thumb_cache()
+
+    def update_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.thumb_widget.set_bg_color(palette.surface1)
+        self.thumb_widget.set_accent_color(palette.accent)
+        self.update()
+
+    def _on_hover_val(self, val: object) -> None:
+        self._hover_t = float(val)
+        self.update()
+
+    def _start_hover_anim(self, target: float) -> None:
+        if self._hover_anim is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(150)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.valueChanged.connect(self._on_hover_val)
+            self._hover_anim = anim
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover_t)
+        self._hover_anim.setEndValue(float(target))
+        self._hover_anim.start()
+
+    def enterEvent(self, event) -> None:
+        self._start_hover_anim(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._start_hover_anim(0.0)
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        if self._hover_t > 0.01:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            bg = QColor(self._palette.surface2)
+            bg.setAlpha(int(95 * self._hover_t))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(bg)
+            p.drawRoundedRect(QRectF(self.rect()), 10.0, 10.0)
+            p.end()
+        super().paintEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.thumb_widget.trigger_press_feedback()
+            self.clicked.emit(self.album)
         super().mousePressEvent(event)
 
 

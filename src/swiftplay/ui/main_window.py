@@ -64,7 +64,15 @@ from PySide6.QtWidgets import (
 from swiftplay.config import AppConfig, clamp_speed, load_config, save_config, validate_theme
 from swiftplay.discord_service import DiscordService
 from swiftplay.media_keys import GlobalMediaKeyFilter
-from swiftplay.models import ChannelInfo, FeedSection, MediaItem, ResolvedStream, format_duration
+from swiftplay.models import (
+    ChannelInfo,
+    FeedSection,
+    MediaItem,
+    MusicAlbumInfo,
+    MusicArtistInfo,
+    ResolvedStream,
+    format_duration,
+)
 from swiftplay.paths import (
     APP_NAME,
     ICON_ICO_PATH,
@@ -116,6 +124,7 @@ from swiftplay.ui.widgets import (
     ContinueWatchingBanner,
     ElidedLabel,
     LoadingShimmerBar,
+    MusicAlbumCard,
     MusicRowWidget,
     MusicShelfWidget,
     MusicTileWidget,
@@ -246,6 +255,7 @@ class MainWindow(QMainWindow):
     PAGE_DISCORD = 9
     PAGE_CHANNEL = 10
     PAGE_WATCHPARTY = 11
+    PAGE_MUSIC_ARTIST = 12
     MAX_FEED_ITEMS = 120
 
     def __init__(
@@ -288,6 +298,7 @@ class MainWindow(QMainWindow):
         self._wp_pending_music_sync: dict[str, Any] | None = None
         self._wp_user_pause_intent: dict[str, float] = {"video": 0.0, "music": 0.0}
         self._wp_last_remote_seek_ts: dict[str, float] = {"video": 0.0, "music": 0.0}
+        self._wp_last_local_play_ts: dict[str, float] = {"video": 0.0, "music": 0.0}
         self._video_resolving_id: str | None = None
         self._music_resolving_id: str | None = None
         self._video_buffering: bool = False
@@ -332,6 +343,18 @@ class MainWindow(QMainWindow):
         self._channel_cards: list[VideoGridCard] = []
         self._channel_page_dirty: bool = True
         self._channel_avatar_url: str = ""
+        self._music_artist_gen = 0
+        self._music_artist_return_page: int = self.PAGE_MUSIC_SEARCH
+        self._music_artist_id: str = ""
+        self._music_artist_info: MusicArtistInfo | None = None
+        self._music_artist_tab: Literal["songs", "albums"] = "songs"
+        self._music_artist_songs: list[MediaItem] = []
+        self._music_artist_albums: list[MusicAlbumInfo] = []
+        self._music_artist_selected_album: tuple[str, str, list[MediaItem]] | None = None
+        self._music_artist_rows: list[MusicRowWidget] = []
+        self._music_artist_album_cards: list[MusicAlbumCard] = []
+        self._music_artist_page_dirty: bool = True
+        self._music_artist_avatar_url: str = ""
         self._video_play_gen = 0
         self._music_play_gen = 0
         self._radio_gen = 0
@@ -1221,6 +1244,7 @@ class MainWindow(QMainWindow):
         self.music_panel.download_requested.connect(lambda it: self._download_item(it, "music"))
         self.music_panel.autoplay_toggled.connect(self._toggle_autoplay)
         self.music_panel.clear_queue_requested.connect(self._clear_queue)
+        self.music_panel.artist_clicked.connect(self.open_music_artist)
         self.stack.addWidget(self.music_panel)
 
         # Pág 6: Historial de video con progreso exacto
@@ -1410,6 +1434,137 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.stack.addWidget(self.watchparty_panel)
+
+        # Pág 12: Perfil de Artista de YouTube Music
+        self.music_artist_page = QWidget()
+        ma_root = QVBoxLayout(self.music_artist_page)
+        ma_root.setContentsMargins(18, 14, 18, 10)
+        ma_root.setSpacing(10)
+
+        ma_hdr = QHBoxLayout()
+        ma_hdr.setSpacing(10)
+
+        self.music_artist_back_btn = QPushButton(" Volver")
+        self.music_artist_back_btn.setObjectName("PillBtn")
+        self.music_artist_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.music_artist_back_btn.clicked.connect(self._on_music_artist_back)
+        ma_hdr.addWidget(self.music_artist_back_btn)
+
+        self.music_artist_avatar_lbl = QLabel()
+        self.music_artist_avatar_lbl.setFixedSize(44, 44)
+        self.music_artist_avatar_lbl.setScaledContents(True)
+        self.music_artist_avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ma_hdr.addWidget(self.music_artist_avatar_lbl)
+
+        ma_meta_box = QWidget()
+        ma_meta_lay = QVBoxLayout(ma_meta_box)
+        ma_meta_lay.setContentsMargins(0, 0, 0, 0)
+        ma_meta_lay.setSpacing(1)
+        self.music_artist_title_lbl = QLabel("Artista")
+        self.music_artist_title_lbl.setObjectName("ViewTitle")
+        ma_meta_lay.addWidget(self.music_artist_title_lbl)
+        self.music_artist_meta_lbl = QLabel("")
+        self.music_artist_meta_lbl.setObjectName("MutedLabel")
+        self.music_artist_meta_lbl.setVisible(False)
+        ma_meta_lay.addWidget(self.music_artist_meta_lbl)
+        ma_hdr.addWidget(ma_meta_box)
+
+        self.music_artist_songs_btn = QPushButton("Canciones")
+        self.music_artist_songs_btn.setObjectName("PillBtn")
+        self.music_artist_songs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.music_artist_songs_btn.clicked.connect(lambda: self._set_music_artist_tab("songs"))
+        ma_hdr.addWidget(self.music_artist_songs_btn)
+
+        self.music_artist_albums_btn = QPushButton("Álbumes")
+        self.music_artist_albums_btn.setObjectName("PillBtn")
+        self.music_artist_albums_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.music_artist_albums_btn.clicked.connect(lambda: self._set_music_artist_tab("albums"))
+        ma_hdr.addWidget(self.music_artist_albums_btn)
+
+        ma_hdr.addStretch()
+
+        self.music_artist_play_btn = QPushButton(" Reproducir")
+        self.music_artist_play_btn.setObjectName("AccentBtn")
+        self.music_artist_play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.music_artist_play_btn.clicked.connect(lambda: self._play_music_artist_all(shuffle=False))
+        ma_hdr.addWidget(self.music_artist_play_btn)
+
+        self.music_artist_shuffle_btn = QPushButton(" Aleatorio")
+        self.music_artist_shuffle_btn.setObjectName("PillBtn")
+        self.music_artist_shuffle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.music_artist_shuffle_btn.clicked.connect(lambda: self._play_music_artist_all(shuffle=True))
+        ma_hdr.addWidget(self.music_artist_shuffle_btn)
+
+        self.music_artist_refresh_btn = QPushButton()
+        self.music_artist_refresh_btn.setObjectName("IconBtn")
+        self.music_artist_refresh_btn.setFixedSize(32, 32)
+        self.music_artist_refresh_btn.setToolTip("Actualizar artista")
+        self.music_artist_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.music_artist_refresh_btn.clicked.connect(self._reload_music_artist_page)
+        ma_hdr.addWidget(self.music_artist_refresh_btn)
+
+        ma_root.addLayout(ma_hdr)
+
+        ma_shimmer = LoadingShimmerBar(self.palette.accent)
+        ma_root.addWidget(ma_shimmer)
+        self._page_shimmers.append(ma_shimmer)
+        self.music_artist_page._shimmer_bar = ma_shimmer  # type: ignore[attr-defined]
+
+        self.music_artist_album_bar = QWidget()
+        self.music_artist_album_bar.setVisible(False)
+        alb_bar_lay = QHBoxLayout(self.music_artist_album_bar)
+        alb_bar_lay.setContentsMargins(0, 2, 0, 2)
+        alb_bar_lay.setSpacing(10)
+        self.music_artist_album_back_btn = QPushButton("← Álbumes")
+        self.music_artist_album_back_btn.setObjectName("PillBtn")
+        self.music_artist_album_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.music_artist_album_back_btn.clicked.connect(self._close_music_artist_album)
+        alb_bar_lay.addWidget(self.music_artist_album_back_btn)
+        self.music_artist_album_title_lbl = QLabel("")
+        self.music_artist_album_title_lbl.setStyleSheet("font-size: 14px; font-weight: 700;")
+        alb_bar_lay.addWidget(self.music_artist_album_title_lbl, 1)
+        self.music_artist_album_play_btn = QPushButton(" Reproducir álbum")
+        self.music_artist_album_play_btn.setObjectName("AccentBtn")
+        self.music_artist_album_play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.music_artist_album_play_btn.clicked.connect(self._play_selected_music_album)
+        alb_bar_lay.addWidget(self.music_artist_album_play_btn)
+        ma_root.addWidget(self.music_artist_album_bar)
+
+        self.music_artist_scroll = QScrollArea()
+        self.music_artist_scroll.setWidgetResizable(True)
+        self.music_artist_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.music_artist_page._scroll_area = self.music_artist_scroll  # type: ignore[attr-defined]
+        ma_container = QWidget()
+        ma_container.setMinimumWidth(0)
+        self.music_artist_body_lay = QVBoxLayout(ma_container)
+        self.music_artist_body_lay.setContentsMargins(0, 4, 4, 14)
+        self.music_artist_body_lay.setSpacing(8)
+
+        self.music_artist_empty_lbl = QLabel("Cargando artista...")
+        self.music_artist_empty_lbl.setObjectName("MutedLabel")
+        self.music_artist_empty_lbl.setWordWrap(True)
+        self.music_artist_body_lay.addWidget(self.music_artist_empty_lbl)
+
+        self.music_artist_songs_box = QWidget()
+        self.music_artist_songs_lay = QVBoxLayout(self.music_artist_songs_box)
+        self.music_artist_songs_lay.setContentsMargins(0, 0, 0, 0)
+        self.music_artist_songs_lay.setSpacing(4)
+        self.music_artist_songs_lay.addStretch()
+        self.music_artist_body_lay.addWidget(self.music_artist_songs_box)
+
+        self.music_artist_albums_grid = ResponsiveGridWidget(
+            min_col_width=184, max_cols=6, spacing=14
+        )
+        self.music_artist_albums_grid.setVisible(False)
+        self.music_artist_body_lay.addWidget(self.music_artist_albums_grid)
+        self.music_artist_body_lay.addStretch()
+
+        self.music_artist_scroll.setWidget(ma_container)
+        ma_root.addWidget(self.music_artist_scroll, 1)
+
+        self.thumb_cache.ready.connect(self._on_music_artist_avatar_ready)
+        self._refresh_music_artist_tab_pills()
+        self.stack.addWidget(self.music_artist_page)
 
         right_col.addWidget(self.stack, 1)
         body_row.addLayout(right_col, 1)
@@ -1603,6 +1758,8 @@ class MainWindow(QMainWindow):
         self.bb_author = ElidedLabel("", max_lines=1)
         self.bb_author.setObjectName("MutedLabel")
         self.bb_author.setMaximumWidth(270)
+        self.bb_author.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.bb_author.installEventFilter(self)
         info_col.addWidget(self.bb_author)
         click_lay.addLayout(info_col)
         lay.addWidget(self.bb_click_area)
@@ -1857,6 +2014,28 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Right"), self, activated=lambda: self._shortcut_seek(5.0))
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if obj is getattr(self, "bb_author", None):
+            etype = event.type()
+            deck = self._get_bottom_bar_deck()
+            clickable = (
+                (deck == "music" and self._music_item is not None and bool(self._music_item.author or self._music_item.channel_id))
+                or (deck == "video" and self._video_item is not None and self._video_item.kind == "video")
+            )
+            if clickable:
+                if (
+                    etype == QEvent.Type.MouseButtonPress
+                    and isinstance(event, QMouseEvent)
+                    and event.button() == Qt.MouseButton.LeftButton
+                ):
+                    if deck == "music" and self._music_item is not None:
+                        self.open_music_artist(self._music_item)
+                    elif deck == "video" and self._video_item is not None:
+                        self.open_youtube_channel(self._video_item)
+                    return True
+                if etype == QEvent.Type.Enter:
+                    self.bb_author.setStyleSheet(f"color: {self.palette.text}; text-decoration: underline;")
+                elif etype == QEvent.Type.Leave:
+                    self.bb_author.setStyleSheet("")
         if obj is self and event.type() == QEvent.Type.WindowActivate:
             if hasattr(self, "discord_panel"):
                 self.discord_panel.on_window_activated()
@@ -1948,7 +2127,12 @@ class MainWindow(QMainWindow):
         if cur == self.PAGE_MUSIC_PLAYER:
             self._switch_page(getattr(self, "_music_return_page", self.PAGE_MUSIC_SEARCH))
             return
-        if cur in (self.PAGE_MUSIC_SEARCH, self.PAGE_MY_MUSIC, self.PAGE_MUSIC_HISTORY):
+        if cur in (
+            self.PAGE_MUSIC_SEARCH,
+            self.PAGE_MY_MUSIC,
+            self.PAGE_MUSIC_HISTORY,
+            self.PAGE_MUSIC_ARTIST,
+        ):
             if self._music_item is not None:
                 self._remember_music_return_page()
                 self._switch_page(self.PAGE_MUSIC_PLAYER)
@@ -2265,6 +2449,18 @@ class MainWindow(QMainWindow):
                 f"border-radius: 20px; border: 1px solid {p.border}; "
                 "font-size: 16px; font-weight: 700;"
             )
+        if hasattr(self, "music_artist_back_btn"):
+            self.music_artist_back_btn.setIcon(render_icon("back", p.text, 15))
+            self.music_artist_play_btn.setIcon(render_icon("play", p.text, 15))
+            self.music_artist_shuffle_btn.setIcon(render_icon("shuffle", p.text, 15))
+            self.music_artist_refresh_btn.setIcon(render_icon("refresh", p.text, 15))
+            self.music_artist_album_play_btn.setIcon(render_icon("play", p.text, 15))
+            if not self._music_artist_avatar_url:
+                self.music_artist_avatar_lbl.setStyleSheet(
+                    f"background-color: {p.surface2}; color: {p.text2}; "
+                    f"border-radius: 22px; border: 1px solid {p.border}; "
+                    "font-size: 17px; font-weight: 700;"
+                )
         self._refresh_account_badge()
         self._sync_bottom_bar()
         self._clear_hidden_browse_pages(clear_all=False)
@@ -2276,6 +2472,8 @@ class MainWindow(QMainWindow):
             self.twitch_grid._widgets,
             self._music_rows,
             self._music_shelves,
+            self._music_artist_rows,
+            self.music_artist_albums_grid._widgets,
         ):
             for card in list(group):
                 if hasattr(card, "update_theme"):
@@ -3015,6 +3213,16 @@ class MainWindow(QMainWindow):
             self.channel_grid.clear_widgets()
             self._channel_cards.clear()
             self._channel_page_dirty = True
+        if cur != self.PAGE_MUSIC_ARTIST and (
+            self._music_artist_rows
+            or self._music_artist_album_cards
+            or self.music_artist_albums_grid._widgets
+        ):
+            self._clear_layout_widgets(self.music_artist_songs_lay)
+            self._music_artist_rows.clear()
+            self.music_artist_albums_grid.clear_widgets()
+            self._music_artist_album_cards.clear()
+            self._music_artist_page_dirty = True
 
     def _schedule_video_surface_refresh(self, delay_ms: int = 55) -> None:
         if self._cleaned_up:
@@ -3189,6 +3397,7 @@ class MainWindow(QMainWindow):
                 self.PAGE_MUSIC_SEARCH: self.nav_ytm,
                 self.PAGE_MY_MUSIC: self.nav_mymusic,
                 self.PAGE_MUSIC_HISTORY: self.nav_music_history,
+                self.PAGE_MUSIC_ARTIST: self.nav_ytm,
             }.get(self._music_return_page, self.nav_ytm)
 
             video_player_nav = (
@@ -3209,6 +3418,7 @@ class MainWindow(QMainWindow):
                 self.PAGE_DISCORD: self.nav_discord,
                 self.PAGE_WATCHPARTY: self.nav_watchparty,
                 self.PAGE_CHANNEL: self.nav_yt,
+                self.PAGE_MUSIC_ARTIST: self.nav_ytm,
             }
             active_btn = nav_map.get(page_idx)
             for btn in (
@@ -3265,6 +3475,7 @@ class MainWindow(QMainWindow):
                     self.PAGE_MUSIC_SEARCH,
                     self.PAGE_MY_MUSIC,
                     self.PAGE_MUSIC_HISTORY,
+                    self.PAGE_MUSIC_ARTIST,
                 ):
                     self._music_return_page = page_idx
                 self.search_input.setPlaceholderText(
@@ -3328,6 +3539,15 @@ class MainWindow(QMainWindow):
                     self._render_channel_cards(self._channel_items, hint_width=hint_w)
                 else:
                     self._maybe_relayout_grid(self.channel_grid, hint_w)
+            elif page_idx == self.PAGE_MUSIC_ARTIST:
+                if self._music_artist_page_dirty and (
+                    self._music_artist_songs
+                    or self._music_artist_albums
+                    or self._music_artist_selected_album is not None
+                ):
+                    self._render_music_artist_content(hint_width=hint_w)
+                elif self._music_artist_tab == "albums" and self._music_artist_selected_album is None:
+                    self._maybe_relayout_grid(self.music_artist_albums_grid, hint_w)
 
             self.stack.setCurrentIndex(page_idx)
         finally:
@@ -4111,6 +4331,304 @@ class MainWindow(QMainWindow):
         self._switch_page(target)
 
     # ------------------------------------------------------------------
+    # Perfil de artista de YouTube Music
+    # ------------------------------------------------------------------
+
+    def _refresh_music_artist_tab_pills(self) -> None:
+        if not hasattr(self, "music_artist_songs_btn"):
+            return
+        for btn, active in (
+            (self.music_artist_songs_btn, self._music_artist_tab == "songs"),
+            (self.music_artist_albums_btn, self._music_artist_tab == "albums"),
+        ):
+            btn.setProperty("active", "true" if active else "false")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def _on_music_artist_avatar_ready(self, url: str, pix: QPixmap) -> None:
+        if url and url == self._music_artist_avatar_url and pix.size() == QSize(44, 44):
+            self.music_artist_avatar_lbl.setText("")
+            self.music_artist_avatar_lbl.setPixmap(pix)
+            self.music_artist_avatar_lbl.setStyleSheet("background-color: transparent; border: none;")
+
+    def _apply_music_artist_header(
+        self, name: str, avatar_url: str, sub_info: str = ""
+    ) -> None:
+        self.music_artist_title_lbl.setText(name or "Artista")
+        if sub_info:
+            self.music_artist_meta_lbl.setText(sub_info)
+            self.music_artist_meta_lbl.setVisible(True)
+        else:
+            self.music_artist_meta_lbl.setVisible(False)
+        self._music_artist_avatar_url = avatar_url or ""
+        if self._music_artist_avatar_url:
+            pix = self.thumb_cache.get_or_fetch(
+                self._music_artist_avatar_url, QSize(44, 44), circular=True
+            )
+            if pix is not None and not pix.isNull():
+                self.music_artist_avatar_lbl.setText("")
+                self.music_artist_avatar_lbl.setPixmap(pix)
+                self.music_artist_avatar_lbl.setStyleSheet(
+                    "background-color: transparent; border: none;"
+                )
+                return
+        self.music_artist_avatar_lbl.clear()
+        self.music_artist_avatar_lbl.setText((name or "A").strip()[:1].upper())
+        self.music_artist_avatar_lbl.setStyleSheet(
+            f"background-color: {self.palette.surface2}; color: {self.palette.text2}; "
+            f"border-radius: 22px; border: 1px solid {self.palette.border}; "
+            "font-size: 17px; font-weight: 700;"
+        )
+
+    def open_music_artist(self, item: MediaItem) -> None:
+        if self._cleaned_up or item is None:
+            return
+        artist_id = (item.channel_id or "").strip()
+        artist_name = (item.author or "").strip()
+        if not artist_id and (not artist_name or artist_name.lower() == "youtube music"):
+            return
+        cur = self.stack.currentIndex()
+        if cur != self.PAGE_MUSIC_ARTIST:
+            self._music_artist_return_page = cur
+        self._music_artist_tab = "songs"
+        self._music_artist_info = None
+        self._music_artist_id = artist_id
+        self._music_artist_songs = []
+        self._music_artist_albums = []
+        self._music_artist_selected_album = None
+        self._refresh_music_artist_tab_pills()
+        self._apply_music_artist_header(artist_name or "Artista", "")
+        self._switch_page(self.PAGE_MUSIC_ARTIST)
+        self._load_music_artist_page(refresh=False, artist_id=artist_id, fallback_name=artist_name)
+
+    def _set_music_artist_tab(self, tab: Literal["songs", "albums"]) -> None:
+        if self._music_artist_tab == tab and self._music_artist_selected_album is None:
+            return
+        self._music_artist_tab = tab
+        if tab == "songs":
+            self._music_artist_selected_album = None
+        self._refresh_music_artist_tab_pills()
+        self._render_music_artist_content()
+
+    def _reload_music_artist_page(self) -> None:
+        name = (
+            self._music_artist_info.name
+            if self._music_artist_info is not None
+            else self.music_artist_title_lbl.text()
+        )
+        self._load_music_artist_page(
+            refresh=True, artist_id=self._music_artist_id, fallback_name=name
+        )
+
+    def _load_music_artist_page(
+        self, *, refresh: bool, artist_id: str, fallback_name: str = ""
+    ) -> None:
+        self._music_artist_gen += 1
+        gen = self._music_artist_gen
+        self._music_artist_page_dirty = True
+        self._clear_layout_widgets(self.music_artist_songs_lay)
+        self._music_artist_rows.clear()
+        self.music_artist_albums_grid.clear_widgets()
+        self._music_artist_album_cards.clear()
+        self.music_artist_album_bar.setVisible(False)
+        self.music_artist_songs_box.setVisible(False)
+        self.music_artist_albums_grid.setVisible(False)
+        if refresh:
+            self.thumb_cache.clear()
+            QPixmapCache.clear()
+            trim_process_memory(collect_gc=True)
+        self.music_artist_empty_lbl.setText("Cargando perfil del artista...")
+        self.music_artist_empty_lbl.setVisible(True)
+        self._set_page_loading(self.music_artist_page, True)
+
+        self._run_async(
+            lambda: self.yt.get_music_artist_page(artist_id, fallback_name=fallback_name),
+            on_done=lambda res: self._on_music_artist_loaded(gen, res),
+            on_error=lambda err: self._on_music_artist_error(gen, err),
+        )
+
+    def _on_music_artist_loaded(
+        self,
+        gen: int,
+        res: tuple[MusicArtistInfo, list[MediaItem], list[MusicAlbumInfo]],
+    ) -> None:
+        if gen != self._music_artist_gen:
+            return
+        self._set_page_loading(self.music_artist_page, False)
+        info, songs, albums = res
+        self._music_artist_info = info
+        self._music_artist_id = info.artist_id
+        self._music_artist_songs = list(songs)
+        self._music_artist_albums = list(albums)
+        self._music_artist_selected_album = None
+        meta_parts = [x for x in (info.subscribers, info.monthly_listeners) if x]
+        self._apply_music_artist_header(info.name, info.avatar_url, " · ".join(meta_parts))
+        self._music_artist_page_dirty = True
+        if self.stack.currentIndex() == self.PAGE_MUSIC_ARTIST:
+            self._render_music_artist_content()
+
+    def _on_music_artist_error(self, gen: int, err: str) -> None:
+        if gen != self._music_artist_gen:
+            return
+        self._set_page_loading(self.music_artist_page, False)
+        self.music_artist_empty_lbl.setText(f"No se pudo cargar el artista: {err}")
+        self.music_artist_empty_lbl.setVisible(True)
+
+    def _render_music_artist_content(self, hint_width: int = 0) -> None:
+        self._clear_layout_widgets(self.music_artist_songs_lay)
+        self._music_artist_rows.clear()
+        self.music_artist_albums_grid.clear_widgets()
+        self._music_artist_album_cards.clear()
+        self._music_artist_page_dirty = False
+
+        if self._music_artist_selected_album is not None:
+            alb_title, _alb_thumb, tracks = self._music_artist_selected_album
+            self.music_artist_album_title_lbl.setText(alb_title or "Álbum")
+            self.music_artist_album_bar.setVisible(True)
+            self.music_artist_albums_grid.setVisible(False)
+            self.music_artist_songs_box.setVisible(True)
+            if not tracks:
+                self.music_artist_empty_lbl.setText("Este álbum no tiene pistas disponibles.")
+                self.music_artist_empty_lbl.setVisible(True)
+                return
+            self.music_artist_empty_lbl.setVisible(False)
+            mm_ids = self.db.list_my_music_ids()
+            for idx, it in enumerate(tracks):
+                row = self._create_music_row(
+                    it,
+                    show_enqueue=True,
+                    show_remove=False,
+                    on_play=lambda _it, i=idx, lst=tracks: self._play_list_from(lst, i),
+                    mm_ids=mm_ids,
+                )
+                self._music_artist_rows.append(row)
+                self.music_artist_songs_lay.insertWidget(
+                    self.music_artist_songs_lay.count() - 1, row
+                )
+            return
+
+        self.music_artist_album_bar.setVisible(False)
+        if self._music_artist_tab == "albums":
+            self.music_artist_songs_box.setVisible(False)
+            if not self._music_artist_albums:
+                self.music_artist_albums_grid.setVisible(False)
+                self.music_artist_empty_lbl.setText(
+                    "Este artista no tiene álbumes o sencillos listados."
+                )
+                self.music_artist_empty_lbl.setVisible(True)
+                return
+            self.music_artist_empty_lbl.setVisible(False)
+            self.music_artist_albums_grid.setVisible(True)
+            cards: list[QWidget] = []
+            for alb in self._music_artist_albums:
+                card = MusicAlbumCard(alb, thumb_cache=self.thumb_cache, palette=self.palette)
+                card.clicked.connect(self._open_music_artist_album)
+                self._music_artist_album_cards.append(card)
+                cards.append(card)
+            hint_w = hint_width if hint_width > 0 else max(480, self.stack.width() - 52)
+            self.music_artist_albums_grid.set_items_widgets(cards, hint_width=hint_w)
+            self.music_artist_albums_grid.setProperty("_rendered_hint_w", int(hint_w))
+            return
+
+        self.music_artist_albums_grid.setVisible(False)
+        self.music_artist_songs_box.setVisible(True)
+        songs = self._music_artist_songs
+        if not songs:
+            self.music_artist_empty_lbl.setText(
+                "No se encontraron canciones para este artista."
+            )
+            self.music_artist_empty_lbl.setVisible(True)
+            return
+        self.music_artist_empty_lbl.setVisible(False)
+        mm_ids = self.db.list_my_music_ids()
+        for idx, it in enumerate(songs):
+            row = self._create_music_row(
+                it,
+                show_enqueue=True,
+                show_remove=False,
+                on_play=lambda _it, i=idx, lst=songs: self._play_list_from(lst, i),
+                mm_ids=mm_ids,
+            )
+            self._music_artist_rows.append(row)
+            self.music_artist_songs_lay.insertWidget(
+                self.music_artist_songs_lay.count() - 1, row
+            )
+
+    def _open_music_artist_album(self, album: MusicAlbumInfo) -> None:
+        if not album or not album.browse_id:
+            return
+        self._music_artist_gen += 1
+        gen = self._music_artist_gen
+        self._set_page_loading(self.music_artist_page, True)
+        fb_name = (
+            self._music_artist_info.name
+            if self._music_artist_info is not None
+            else self.music_artist_title_lbl.text()
+        )
+        fb_id = self._music_artist_id
+        self._run_async(
+            lambda: self.yt.get_music_album_tracks(
+                album.browse_id, fallback_author=fb_name, fallback_artist_id=fb_id
+            ),
+            on_done=lambda res: self._on_music_artist_album_loaded(gen, album, res),
+            on_error=lambda err: self._on_music_artist_error(gen, err),
+        )
+
+    def _on_music_artist_album_loaded(
+        self,
+        gen: int,
+        album: MusicAlbumInfo,
+        res: tuple[str, str, list[MediaItem]],
+    ) -> None:
+        if gen != self._music_artist_gen:
+            return
+        self._set_page_loading(self.music_artist_page, False)
+        alb_title, alb_thumb, tracks = res
+        self._music_artist_selected_album = (
+            alb_title or album.title,
+            alb_thumb or album.thumb_url,
+            list(tracks),
+        )
+        self._music_artist_tab = "albums"
+        self._refresh_music_artist_tab_pills()
+        self._render_music_artist_content()
+
+    def _close_music_artist_album(self) -> None:
+        self._music_artist_selected_album = None
+        self._render_music_artist_content()
+
+    def _play_selected_music_album(self) -> None:
+        if self._music_artist_selected_album and self._music_artist_selected_album[2]:
+            self._play_list_from(list(self._music_artist_selected_album[2]), 0)
+
+    def _play_music_artist_all(self, *, shuffle: bool = False) -> None:
+        pool = (
+            list(self._music_artist_selected_album[2])
+            if (self._music_artist_selected_album and self._music_artist_selected_album[2])
+            else list(self._music_artist_songs)
+        )
+        if not pool:
+            self.show_toast("No hay canciones disponibles para reproducir")
+            return
+        if shuffle:
+            random.shuffle(pool)
+        self._play_list_from(pool, 0)
+
+    def _on_music_artist_back(self) -> None:
+        if self._music_artist_selected_album is not None:
+            self._close_music_artist_album()
+            return
+        target = getattr(self, "_music_artist_return_page", self.PAGE_MUSIC_SEARCH)
+        if (
+            not isinstance(target, int)
+            or target < 0
+            or target >= self.stack.count()
+            or target == self.PAGE_MUSIC_ARTIST
+        ):
+            target = self.PAGE_MUSIC_SEARCH
+        self._switch_page(target)
+
+    # ------------------------------------------------------------------
     # Cuenta e ícono superior de perfil
     # ------------------------------------------------------------------
 
@@ -4485,6 +5003,7 @@ class MainWindow(QMainWindow):
             palette=self.palette,
         )
         tile.play_requested.connect(self._play_music_from_search)
+        tile.artist_clicked.connect(self.open_music_artist)
         tile.my_music_toggled.connect(self._toggle_my_music_item)
         tile.enqueue_requested.connect(self._enqueue_music_item)
         tile.download_requested.connect(lambda it: self._download_item(it, "music"))
@@ -4517,6 +5036,7 @@ class MainWindow(QMainWindow):
             is_current=is_cur,
         )
         row.play_requested.connect(on_play or self._play_music_from_search)
+        row.artist_clicked.connect(self.open_music_artist)
         row.my_music_toggled.connect(self._toggle_my_music_item)
         row.enqueue_requested.connect(self._enqueue_music_item)
         row.download_requested.connect(lambda it: self._download_item(it, "music"))
@@ -4524,7 +5044,9 @@ class MainWindow(QMainWindow):
             row.remove_requested.connect(on_remove or self._remove_from_queue)
         return row
 
-    def _clear_layout_widgets(self, lay: QVBoxLayout, keep_widget: QWidget) -> None:
+    def _clear_layout_widgets(
+        self, lay: QVBoxLayout, keep_widget: QWidget | None = None
+    ) -> None:
         for i in reversed(range(lay.count())):
             item = lay.itemAt(i)
             w = item.widget() if item else None
@@ -5174,14 +5696,24 @@ class MainWindow(QMainWindow):
 
     def _remember_music_return_page(self) -> None:
         cur = self.stack.currentIndex()
-        if cur in (self.PAGE_MUSIC_SEARCH, self.PAGE_MY_MUSIC, self.PAGE_MUSIC_HISTORY):
+        if cur in (
+            self.PAGE_MUSIC_SEARCH,
+            self.PAGE_MY_MUSIC,
+            self.PAGE_MUSIC_HISTORY,
+            self.PAGE_MUSIC_ARTIST,
+        ):
             self._music_return_page = cur
 
     def _on_music_panel_back(self) -> None:
         target = (
             self._music_return_page
             if self._music_return_page
-            in (self.PAGE_MUSIC_SEARCH, self.PAGE_MY_MUSIC, self.PAGE_MUSIC_HISTORY)
+            in (
+                self.PAGE_MUSIC_SEARCH,
+                self.PAGE_MY_MUSIC,
+                self.PAGE_MUSIC_HISTORY,
+                self.PAGE_MUSIC_ARTIST,
+            )
             else self.PAGE_MUSIC_SEARCH
         )
         self._switch_page(target)
@@ -5271,7 +5803,7 @@ class MainWindow(QMainWindow):
         if self.stack.currentIndex() == self.PAGE_MUSIC_PLAYER or added > 0:
             self._render_queue()
         if added > 0:
-            self._notify_wp_local_event("music", "queue_update")
+            self._notify_wp_local_event("music", "queue_update", bypass_suppress=True)
 
         if self._pending_advance_after_radio:
             self._pending_advance_after_radio = False
@@ -5338,7 +5870,7 @@ class MainWindow(QMainWindow):
         self.show_toast(f"Agregado a la cola: {item.title}")
         if self.stack.currentIndex() == self.PAGE_MUSIC_PLAYER:
             self._render_queue()
-        self._notify_wp_local_event("music", "queue_update")
+        self._notify_wp_local_event("music", "queue_update", bypass_suppress=True)
 
     def _remove_from_queue(self, item: MediaItem) -> None:
         for i, q_it in enumerate(self._music_queue):
@@ -5352,7 +5884,7 @@ class MainWindow(QMainWindow):
         self._refresh_badges()
         self.persist_session_state(force=True)
         self._render_queue()
-        self._notify_wp_local_event("music", "queue_update")
+        self._notify_wp_local_event("music", "queue_update", bypass_suppress=True)
 
     def _clear_queue(self) -> None:
         self._music_queue.clear()
@@ -5361,7 +5893,7 @@ class MainWindow(QMainWindow):
         self._refresh_badges()
         self.persist_session_state(force=True)
         self._render_queue()
-        self._notify_wp_local_event("music", "queue_update")
+        self._notify_wp_local_event("music", "queue_update", bypass_suppress=True)
 
     def _toggle_autoplay(self) -> None:
         self.cfg.autoplay_music = not self.cfg.autoplay_music
@@ -5489,6 +6021,7 @@ class MainWindow(QMainWindow):
             self.PAGE_MY_MUSIC,
             self.PAGE_MUSIC_PLAYER,
             self.PAGE_MUSIC_HISTORY,
+            self.PAGE_MUSIC_ARTIST,
         ):
             if self._music_item is not None or self._video_item is None:
                 return "music"
@@ -5574,18 +6107,22 @@ class MainWindow(QMainWindow):
 
 
     def _on_music_ended(self) -> None:
+        is_guest = self._is_wp_guest_on_deck("music")
         if self._queue_index + 1 < len(self._music_queue):
-            if self._is_wp_guest_on_deck("music"):
-                self._wp_suppress_until["music"] = time.monotonic() + 1.5
+            if is_guest:
+                self._wp_suppress_until["music"] = time.monotonic() + 2.0
             self._play_queue_index(self._queue_index + 1)
-        elif self.cfg.autoplay_music and self._music_queue:
+        elif not is_guest and self.cfg.autoplay_music and self._music_queue:
             self._pending_advance_after_radio = True
             self._maybe_extend_radio(force=True)
         else:
             self._music_paused = True
             self._sync_bottom_bar()
             self._sync_mini_bar()
-            self._notify_wp_local_event("music", "pause", paused_override=True, broadcast_sync=False)
+            if not is_guest:
+                self._notify_wp_local_event(
+                    "music", "pause", paused_override=True, broadcast_sync=False
+                )
 
     # ------------------------------------------------------------------
     # Sincronización de ambos decks con UI, Barra Inferior, Overlay y Mini-barra
@@ -6131,7 +6668,20 @@ class MainWindow(QMainWindow):
         self._refresh_wp_restore_bar()
 
         self._wp_overlay_spectators = list(overlay_specs_by_code.values())
-        ov_fp = repr(self._wp_overlay_spectators)
+        ov_fp = repr((
+            self.cfg.discord_overlay_mode,
+            self.cfg.discord_overlay_opacity,
+            self.cfg.discord_overlay_x,
+            self.cfg.discord_overlay_y,
+            self._discord_voice_active,
+            self._discord_in_voice,
+            self._discord_muted,
+            self._discord_deafened,
+            self._discord_participants,
+            self._discord_speaking,
+            self._discord_streaming,
+            self._wp_overlay_spectators,
+        ))
         if ov_fp != self._wp_last_overlay_fp:
             self._wp_last_overlay_fp = ov_fp
             self._sync_discord_overlay()
@@ -6333,6 +6883,7 @@ class MainWindow(QMainWindow):
                     "video_id": q_it.video_id,
                     "title": q_it.title,
                     "author": q_it.author,
+                    "channel_id": q_it.channel_id,
                     "duration": q_it.duration,
                     "duration_sec": int(q_it.duration_sec or 0),
                     "thumb_url": q_it.normalized_thumb(),
@@ -6362,6 +6913,7 @@ class MainWindow(QMainWindow):
                         duration_sec=int(entry.get("duration_sec") or 0),
                         thumb_url=str(entry.get("thumb_url") or ""),
                         kind="music",
+                        channel_id=str(entry.get("channel_id") or ""),
                     )
                 )
         if not new_queue and fallback_item is not None:
@@ -6416,6 +6968,7 @@ class MainWindow(QMainWindow):
             "video_id": item.video_id,
             "title": item.title,
             "author": item.author,
+            "channel_id": item.channel_id,
             "thumb_url": item.normalized_thumb(),
             "kind": kind,
             "is_live": bool(item.is_live or kind == "twitch"),
@@ -6443,6 +6996,7 @@ class MainWindow(QMainWindow):
         pos_override: float | None = None,
         force_presence: bool = False,
         broadcast_sync: bool = True,
+        bypass_suppress: bool = False,
     ) -> None:
         if self._cleaned_up:
             return
@@ -6482,10 +7036,12 @@ class MainWindow(QMainWindow):
         )
         will_broadcast_sync = bool(
             broadcast_sync
-            and time.monotonic() >= float(self._wp_suppress_until.get(deck, 0.0))
+            and (bypass_suppress or time.monotonic() >= float(self._wp_suppress_until.get(deck, 0.0)))
             and active_party
             and active_party.get("host_code")
         )
+        if will_broadcast_sync and action == "play_item":
+            self._wp_last_local_play_ts[deck] = time.monotonic()
         is_host_sync = bool(
             will_broadcast_sync
             and str(active_party.get("host_code") or "").upper()
@@ -6619,8 +7175,19 @@ class MainWindow(QMainWindow):
             and cur_item.video_id == vid_id
             and cur_item.kind == item_kind
         )
+        host_code = str(payload.get("host_code") or "").upper()
+        from_host = bool(updated_by and host_code and updated_by == host_code)
+        is_guest = self._is_wp_guest_on_deck(deck)
         if not same_item and cur_item is not None and reason != "join" and action != "play_item":
-            return
+            allow_host_resync = (
+                deck == "music"
+                and is_guest
+                and from_host
+                and action in ("queue_update", "play", "pause", "seek", "presence")
+                and (now_m - float(self._wp_last_local_play_ts.get("music", 0.0))) > 3.0
+            )
+            if not allow_host_resync:
+                return
         new_item = MediaItem(
             video_id=vid_id,
             title=str(state.get("title") or vid_id),
@@ -6632,9 +7199,18 @@ class MainWindow(QMainWindow):
             is_live=bool(state.get("is_live") or item_kind == "twitch"),
             game_name=str(state.get("game_name") or ""),
             viewer_count=int(state.get("viewer_count") or 0),
+            channel_id=str(state.get("channel_id") or ""),
         )
         if deck == "music":
-            self._apply_wp_music_queue(state, new_item)
+            raw_q = state.get("queue")
+            should_apply_queue = (
+                reason == "join"
+                or action in ("play_item", "queue_update")
+                or is_guest
+                or (isinstance(raw_q, list) and len(raw_q) > 1)
+            )
+            if should_apply_queue:
+                self._apply_wp_music_queue(state, new_item)
             if action == "queue_update" and same_item:
                 return
 
@@ -6681,6 +7257,8 @@ class MainWindow(QMainWindow):
                     self._wp_pending_music_sync = pending_payload
                     self._wp_pending_music_pause = want_paused
                     self._play_music_item(new_item, start_pos=pos)
+                    if not is_guest and len(self._music_queue) <= 1 and self.cfg.autoplay_music:
+                        self._maybe_extend_radio(force=True)
             finally:
                 self._wp_applying_remote_play = False
                 self._wp_suppress_auto_pause = False
@@ -6902,6 +7480,7 @@ class MainWindow(QMainWindow):
             self.PAGE_MY_MUSIC,
             self.PAGE_MUSIC_PLAYER,
             self.PAGE_MUSIC_HISTORY,
+            self.PAGE_MUSIC_ARTIST,
         ):
             if self._music_item is not None:
                 return "music"

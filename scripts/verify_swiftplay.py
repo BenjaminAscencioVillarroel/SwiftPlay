@@ -550,7 +550,13 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
 
     songs = yt.search_music("daft punk", search_filter="songs", limit=10)
     assert len(songs) >= 5, f"Se esperaban >= 5 canciones, llegaron {len(songs)}"
-    print(f"   Canciones encontradas: {len(songs)} (ej: {songs[0].title})")
+    assert any(s.channel_id for s in songs), "search_music debe extraer channel_id del artista"
+    art_id = next(s.channel_id for s in songs if s.channel_id)
+    art_info, art_songs, art_albums = yt.get_music_artist_page(art_id)
+    assert art_info.name and len(art_songs) >= 1, (
+        f"El perfil de artista YTM debe devolver nombre y canciones: {art_info}"
+    )
+    print(f"   Canciones encontradas: {len(songs)} (ej: {songs[0].title}) | Artista: {art_info.name} ({len(art_songs)} temas, {len(art_albums)} álbumes)")
 
     music_secs = yt.get_music_home_sections(local_listen_again=songs[:2])
     assert len(music_secs) >= 2, f"Se esperaban >= 2 secciones de música, llegaron {len(music_secs)}"
@@ -564,7 +570,11 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
 
     audio_stream = yt.resolve_stream(songs[0].video_id, audio_only=True)
     assert audio_stream.primary_url.startswith("http"), "URL de audio inválida"
-    print("   Stream solo audio resuelto OK.")
+    botcheck_audio = yt.resolve_stream("sX0Snobyt84", audio_only=True, use_cache=False)
+    assert botcheck_audio.primary_url.startswith("http"), (
+        "Fallback android en ytdlp_worker debe resolver pistas con bot-check (sX0Snobyt84)"
+    )
+    print("   Stream solo audio resuelto OK (incluido fallback android sX0Snobyt84).")
 
     video_stream = yt.resolve_stream(videos[0].video_id, audio_only=False, quality="720p")
     assert video_stream.primary_url.startswith("http"), "URL de video inválida"
@@ -3481,6 +3491,193 @@ def test_gui_and_libmpv_smoke(
             win._on_channel_back()
             app.processEvents()
             assert win.stack.currentIndex() == MainWindow.PAGE_VIDEO_SEARCH
+
+        # Perfil de Artista YT Music: señales clicables en panel, tiles y filas + navegación PAGE_MUSIC_ARTIST
+        from swiftplay.models import MusicAlbumInfo, MusicArtistInfo
+        from swiftplay.ui.widgets import MusicRowWidget, MusicTileWidget
+
+        fake_art_info = MusicArtistInfo(
+            artist_id="UCRr1xG_2WIDs18a6cIiCxeA",
+            name="Daft Punk",
+            subscribers="7.22M suscriptores",
+            monthly_listeners="20M oyentes",
+        )
+        fake_art_songs = [
+            MediaItem(
+                "m_art1",
+                "One More Time",
+                "Daft Punk",
+                "5:20",
+                320,
+                "",
+                "music",
+                channel_id="UCRr1xG_2WIDs18a6cIiCxeA",
+            )
+        ]
+        fake_art_albums = [
+            MusicAlbumInfo(
+                browse_id="MPRE_alb1",
+                title="Discovery",
+                year="2001",
+                thumb_url="",
+                album_type="Álbum",
+            )
+        ]
+        win._switch_page(MainWindow.PAGE_MUSIC_SEARCH)
+        app.processEvents()
+        with _mock_patch.object(
+            win.yt,
+            "get_music_artist_page",
+            return_value=(fake_art_info, fake_art_songs, fake_art_albums),
+        ):
+            t_art = MusicTileWidget(
+                fake_art_songs[0], False, win.thumb_cache, win.palette
+            )
+            r_art = MusicRowWidget(
+                fake_art_songs[0], False, win.thumb_cache, win.palette
+            )
+            t_clicks: list[MediaItem] = []
+            r_clicks: list[MediaItem] = []
+            t_art.artist_clicked.connect(t_clicks.append)
+            r_art.artist_clicked.connect(r_clicks.append)
+            assert hasattr(win.music_panel, "artist_clicked")
+            win.music_panel.artist_clicked.emit(fake_art_songs[0])
+            t_art.release_resources()
+            r_art.release_resources()
+            t_art.deleteLater()
+            r_art.deleteLater()
+
+            t_ma_deadline = time.monotonic() + 3.0
+            while (
+                win.stack.currentIndex() == MainWindow.PAGE_MUSIC_ARTIST
+                and not win._music_artist_songs
+                and time.monotonic() < t_ma_deadline
+            ):
+                app.processEvents()
+                time.sleep(0.02)
+            assert win.stack.currentIndex() == MainWindow.PAGE_MUSIC_ARTIST
+            assert win.music_artist_title_lbl.text() == "Daft Punk"
+            assert len(win._music_artist_rows) == 1
+            win._set_music_artist_tab("albums")
+            app.processEvents()
+            assert len(win._music_artist_album_cards) == 1
+            win._on_music_artist_back()
+            app.processEvents()
+            assert win.stack.currentIndex() == MainWindow.PAGE_MUSIC_SEARCH
+
+        # Sincronización de playlist WatchParty Music (host radio queue_update no suprimido + resync invitado)
+        sent_wp_syncs: list[tuple[str, str, str, dict | None]] = []
+        orig_wp_code = win.cfg.watchparty_code
+        orig_wp_sup = win._wp_suppress_until["music"]
+        orig_wp_auto = win.cfg.autoplay_music
+        orig_mq = list(win._music_queue)
+        orig_qi = win._queue_index
+        orig_mi = win._music_item
+        orig_rgen = win._radio_gen
+        orig_rseen = list(win._radio_seen_ids)
+        try:
+            win.cfg.watchparty_code = "HOST-1111"
+            win.cfg.autoplay_music = True
+            win._radio_seen_ids.clear()
+            seed_song = MediaItem(
+                "m_wpsync_0",
+                "Clublights",
+                "Artista",
+                "3:10",
+                190,
+                "",
+                "music",
+                channel_id="UC_art0",
+            )
+            win._music_item = seed_song
+            win._music_queue = [seed_song]
+            win._queue_index = 0
+            # Simula la ventana de 8s tras recibir play_item del invitado: queue_update debe enviarse igual
+            win._wp_suppress_until["music"] = time.monotonic() + 8.0
+            with (
+                _mock_patch.object(
+                    win.watchparty_svc,
+                    "active_party_for",
+                    return_value={"host_code": "HOST-1111", "host_name": "Host", "members": []},
+                ),
+                _mock_patch.object(
+                    win.watchparty_svc,
+                    "send_party_sync",
+                    side_effect=lambda hc, dk, act, st: sent_wp_syncs.append((hc, dk, act, st)),
+                ),
+            ):
+                radio_items = [
+                    MediaItem(f"m_wpsync_{i}", f"Radio {i}", "Art", "3:00", 180, "", "music", channel_id=f"UC_r{i}")
+                    for i in range(1, 6)
+                ]
+                win._on_radio_tracks_loaded(win._radio_gen, radio_items)
+            assert any(
+                act == "queue_update"
+                and st is not None
+                and len(st.get("queue") or []) == 6
+                for _, _, act, st in sent_wp_syncs
+            ), f"queue_update de radio del anfitrión fue suprimido o incompleto: {sent_wp_syncs}"
+
+            # Simular invitado con pista divergente recibiendo resync del anfitrión
+            win.cfg.watchparty_code = "GUEST-2222"
+            win._music_item = MediaItem("m_drift", "Otra", "Otro", "3:00", 180, "", "music")
+            win._music_queue = [win._music_item]
+            win._queue_index = 0
+            win._wp_last_local_play_ts["music"] = 0.0
+            with (
+                _mock_patch.object(win, "_is_wp_guest_on_deck", return_value=True),
+                _mock_patch.object(win, "_play_music_item") as _mock_pm,
+            ):
+                win._on_watchparty_state_received(
+                    {
+                        "host_code": "HOST-1111",
+                        "updated_by": "HOST-1111",
+                        "updated_by_name": "Host",
+                        "deck": "music",
+                        "reason": "sync",
+                        "action": "queue_update",
+                        "state": {
+                            "video_id": "m_wpsync_0",
+                            "title": "Clublights",
+                            "author": "Artista",
+                            "channel_id": "UC_art0",
+                            "kind": "music",
+                            "paused": False,
+                            "pos": 4.0,
+                            "queue": [
+                                {"video_id": "m_wpsync_0", "title": "Clublights", "author": "Artista", "channel_id": "UC_art0"},
+                                {"video_id": "m_wpsync_1", "title": "Radio 1", "author": "Art", "channel_id": "UC_r1"},
+                                {"video_id": "m_wpsync_2", "title": "Radio 2", "author": "Art", "channel_id": "UC_r2"},
+                            ],
+                            "queue_index": 0,
+                        },
+                    }
+                )
+                assert [it.video_id for it in win._music_queue] == ["m_wpsync_0", "m_wpsync_1", "m_wpsync_2"]
+                assert win._music_queue[0].channel_id == "UC_art0"
+                assert _mock_pm.called
+
+            # Invitado al terminar la cola no debe inventar radio divergente por su cuenta
+            win._pending_advance_after_radio = False
+            win._queue_index = len(win._music_queue) - 1
+            with (
+                _mock_patch.object(win, "_is_wp_guest_on_deck", return_value=True),
+                _mock_patch.object(win, "_maybe_extend_radio") as _mock_rad,
+            ):
+                win._on_music_ended()
+                assert not _mock_rad.called and not win._pending_advance_after_radio
+        finally:
+            win.cfg.watchparty_code = orig_wp_code
+            win._wp_suppress_until["music"] = orig_wp_sup
+            win.cfg.autoplay_music = orig_wp_auto
+            win._music_queue = orig_mq
+            win._queue_index = orig_qi
+            win._music_item = orig_mi
+            win._radio_gen = orig_rgen
+            win._radio_seen_ids.clear()
+            win._radio_seen_ids.extend(orig_rseen)
+            win._render_queue()
+            win._sync_bottom_bar()
 
         win._switch_page(MainWindow.PAGE_WATCH_LATER)
         app.processEvents()
