@@ -301,6 +301,7 @@ class _WatchPartyFriendCard(QFrame):
     """Card expandible por amigo: muestra estado + resumen y al abrir revela YT / Twitch / Music."""
 
     toggle_expanded_requested = Signal(str, bool)
+    chat_requested = Signal(str)  # friend_code
     join_requested = Signal(str, str)  # host_code, deck
     leave_requested = Signal(str)  # deck
     remove_requested = Signal(str)  # friend_code
@@ -324,6 +325,8 @@ class _WatchPartyFriendCard(QFrame):
         self._avatar_url = ""
         self._avatar_key = ""
         self._expanded = bool(expanded)
+        self._unread_count = 0
+        self._chat_active = False
 
         self.setObjectName("WatchPartyFriendCard")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -385,6 +388,14 @@ class _WatchPartyFriendCard(QFrame):
         self.mus_pill = QLabel("Music")
         self.mus_pill.setObjectName("DeckTag")
         hdr.addWidget(self.mus_pill)
+
+        self.chat_btn = QPushButton(" Chat")
+        self.chat_btn.setObjectName("PillBtn")
+        self.chat_btn.setFixedHeight(28)
+        self.chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chat_btn.setToolTip(f"Enviar mensaje directo a {self.friend_code}")
+        self.chat_btn.clicked.connect(lambda: self.chat_requested.emit(self.friend_code))
+        hdr.addWidget(self.chat_btn)
 
         self.expand_btn = QPushButton()
         self.expand_btn.setObjectName("IconBtn")
@@ -588,6 +599,37 @@ class _WatchPartyFriendCard(QFrame):
             joined_this_deck=mus_joined,
         )
         self.remove_btn.setIcon(render_icon("close", self._palette.text2, 13))
+        self._refresh_chat_btn_ui()
+
+    def _refresh_chat_btn_ui(self) -> None:
+        if self._unread_count > 0:
+            self.chat_btn.setText(f" Chat ({self._unread_count})")
+            self.chat_btn.setStyleSheet(
+                "background-color: #EF4444; color: #FFFFFF; border: 1px solid #EF4444; "
+                "border-radius: 10px; font-weight: 700; padding: 4px 10px;"
+            )
+            self.chat_btn.setIcon(render_icon("chat", "#FFFFFF", 13))
+        else:
+            self.chat_btn.setText(" Chat")
+            self.chat_btn.setStyleSheet("")
+            self.chat_btn.setProperty("active", "true" if self._chat_active else "false")
+            self.chat_btn.style().unpolish(self.chat_btn)
+            self.chat_btn.style().polish(self.chat_btn)
+            self.chat_btn.setIcon(render_icon("chat", self._palette.text, 13))
+
+    def set_unread_count(self, count: int) -> None:
+        val = max(0, int(count or 0))
+        if val == self._unread_count:
+            return
+        self._unread_count = val
+        self._refresh_chat_btn_ui()
+
+    def set_chat_active(self, active: bool) -> None:
+        val = bool(active)
+        if val == self._chat_active:
+            return
+        self._chat_active = val
+        self._refresh_chat_btn_ui()
 
     def handle_thumb_ready(self, url: str, pix: QPixmap) -> None:
         if url and url == self._avatar_url and not pix.isNull():
@@ -622,6 +664,9 @@ class WatchPartyPanel(QWidget):
     overlay_preview_requested = Signal(int)
     overlay_edit_requested = Signal()
     toast_requested = Signal(str)
+    chat_opened = Signal(str)  # friend_code
+    chat_closed = Signal()
+    send_message_requested = Signal(str, str)  # friend_code, text
 
     def __init__(
         self,
@@ -644,6 +689,9 @@ class WatchPartyPanel(QWidget):
         self._joined_music_host: str = ""
         self._conn_state: str = "disconnected"
         self._conn_detail: str = ""
+        self._active_chat_code: str = ""
+        self._chat_rendered_ids: set[str] = set()
+        self._unread_counts: dict[str, int] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 14, 18, 12)
@@ -851,7 +899,110 @@ class WatchPartyPanel(QWidget):
         self._list_lay.addStretch(1)
 
         self.scroll.setWidget(container)
-        root.addWidget(self.scroll, 1)
+
+        # Panel lateral derecho de chat directo con amigo seleccionado
+        self.chat_card = QFrame()
+        self.chat_card.setObjectName("DiscordChatCard")
+        self.chat_card.setMinimumWidth(290)
+        self.chat_card.setMaximumWidth(420)
+        self.chat_card.setVisible(False)
+        chat_lay = QVBoxLayout(self.chat_card)
+        chat_lay.setContentsMargins(0, 0, 0, 0)
+        chat_lay.setSpacing(0)
+
+        chat_hdr = QFrame()
+        chat_hdr.setObjectName("DiscordChatHeader")
+        chat_hdr_lay = QHBoxLayout(chat_hdr)
+        chat_hdr_lay.setContentsMargins(12, 10, 10, 10)
+        chat_hdr_lay.setSpacing(8)
+
+        self.chat_status_dot = QLabel()
+        self.chat_status_dot.setFixedSize(10, 10)
+        chat_hdr_lay.addWidget(self.chat_status_dot)
+
+        chat_hdr_meta = QVBoxLayout()
+        chat_hdr_meta.setContentsMargins(0, 0, 0, 0)
+        chat_hdr_meta.setSpacing(1)
+        self.chat_title_lbl = QLabel("Chat")
+        self.chat_title_lbl.setStyleSheet("font-size: 13px; font-weight: 700; background: transparent;")
+        chat_hdr_meta.addWidget(self.chat_title_lbl)
+        self.chat_sub_lbl = QLabel("")
+        self.chat_sub_lbl.setObjectName("MutedLabel")
+        self.chat_sub_lbl.setStyleSheet("font-size: 11px; background: transparent;")
+        chat_hdr_meta.addWidget(self.chat_sub_lbl)
+        chat_hdr_lay.addLayout(chat_hdr_meta, 1)
+
+        self.chat_close_btn = QPushButton()
+        self.chat_close_btn.setObjectName("IconBtn")
+        self.chat_close_btn.setFixedSize(26, 26)
+        self.chat_close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chat_close_btn.setToolTip("Cerrar chat")
+        self.chat_close_btn.clicked.connect(self.close_chat)
+        chat_hdr_lay.addWidget(self.chat_close_btn)
+        chat_lay.addWidget(chat_hdr)
+
+        self.chat_hint_lbl = QLabel("")
+        self.chat_hint_lbl.setObjectName("MutedLabel")
+        self.chat_hint_lbl.setWordWrap(True)
+        self.chat_hint_lbl.setContentsMargins(12, 8, 12, 4)
+        self.chat_hint_lbl.setStyleSheet("font-size: 11px; background: transparent;")
+        self.chat_hint_lbl.setVisible(False)
+        chat_lay.addWidget(self.chat_hint_lbl)
+
+        self.chat_scroll = QScrollArea()
+        self.chat_scroll.setObjectName("TransparentScroll")
+        self.chat_scroll.setWidgetResizable(True)
+        self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.chat_scroll.viewport().setObjectName("TransparentBox")
+        self.chat_scroll.viewport().setAutoFillBackground(False)
+
+        chat_msgs_box = QWidget()
+        chat_msgs_box.setObjectName("TransparentBox")
+        self._chat_msgs_lay = QVBoxLayout(chat_msgs_box)
+        self._chat_msgs_lay.setContentsMargins(12, 10, 12, 10)
+        self._chat_msgs_lay.setSpacing(8)
+
+        self.chat_empty_lbl = QLabel(
+            "Todavía no hay mensajes con este amigo.\n"
+            "Escríbele abajo para coordinar qué ver o escuchar."
+        )
+        self.chat_empty_lbl.setObjectName("MutedLabel")
+        self.chat_empty_lbl.setWordWrap(True)
+        self.chat_empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.chat_empty_lbl.setContentsMargins(12, 24, 12, 24)
+        self._chat_msgs_lay.addWidget(self.chat_empty_lbl)
+        self._chat_msgs_lay.addStretch(1)
+
+        self.chat_scroll.setWidget(chat_msgs_box)
+        chat_lay.addWidget(self.chat_scroll, 1)
+
+        chat_input_wrap = QWidget()
+        chat_input_wrap.setObjectName("TransparentBox")
+        chat_input_lay = QHBoxLayout(chat_input_wrap)
+        chat_input_lay.setContentsMargins(10, 8, 10, 10)
+        chat_input_lay.setSpacing(8)
+
+        self.chat_input = QLineEdit()
+        self.chat_input.setObjectName("DiscordChatInput")
+        self.chat_input.setPlaceholderText("Escribe un mensaje...")
+        self.chat_input.setMaxLength(1000)
+        self.chat_input.returnPressed.connect(self._on_send_chat_clicked)
+        chat_input_lay.addWidget(self.chat_input, 1)
+
+        self.chat_send_btn = QPushButton(" Enviar")
+        self.chat_send_btn.setObjectName("PillBtn")
+        self.chat_send_btn.setFixedHeight(32)
+        self.chat_send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chat_send_btn.clicked.connect(self._on_send_chat_clicked)
+        chat_input_lay.addWidget(self.chat_send_btn)
+        chat_lay.addWidget(chat_input_wrap)
+
+        body_lay = QHBoxLayout()
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(12)
+        body_lay.addWidget(self.scroll, 3)
+        body_lay.addWidget(self.chat_card, 2)
+        root.addLayout(body_lay, 1)
 
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(1000)
@@ -1129,9 +1280,12 @@ class WatchPartyPanel(QWidget):
                 parent=self,
             )
             card.toggle_expanded_requested.connect(self._on_card_expanded_toggled)
+            card.chat_requested.connect(self.chat_opened.emit)
             card.join_requested.connect(self.join_party_requested.emit)
             card.leave_requested.connect(self.leave_party_requested.emit)
             card.remove_requested.connect(self.remove_friend_requested.emit)
+            card.set_unread_count(self._unread_counts.get(code, 0))
+            card.set_chat_active(bool(self._active_chat_code and code == self._active_chat_code))
             self._cards[code] = card
             self._list_lay.insertWidget(insert_idx, card)
             insert_idx += 1
@@ -1169,10 +1323,190 @@ class WatchPartyPanel(QWidget):
         if not self._friends:
             self._rebuild_from_offline_config()
 
+    @property
+    def active_chat_code(self) -> str:
+        return self._active_chat_code
+
+    def is_viewing_chat(self, friend_code: str) -> bool:
+        fc = str(friend_code or "").strip().upper()
+        return bool(fc and self.chat_card.isVisible() and self._active_chat_code == fc)
+
+    def _clear_chat_bubbles(self) -> None:
+        self._chat_rendered_ids.clear()
+        for i in range(self._chat_msgs_lay.count() - 1, -1, -1):
+            item = self._chat_msgs_lay.itemAt(i)
+            w = item.widget() if item is not None else None
+            if w is not None and w is not self.chat_empty_lbl:
+                self._chat_msgs_lay.takeAt(i)
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+
+    def _scroll_chat_to_bottom(self) -> None:
+        sb = self.chat_scroll.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(sb.maximum())
+
+    def _create_chat_bubble(self, msg: dict[str, Any]) -> QWidget:
+        is_self = bool(msg.get("is_self", False))
+        sender_name = "Tú" if is_self else str(msg.get("sender_name") or msg.get("from_name") or "Amigo")
+        ts = str(msg.get("timestamp") or "").strip()
+        content = str(msg.get("content") or msg.get("text") or "").strip()
+
+        row = QWidget()
+        row.setObjectName("TransparentBox")
+        row_lay = QHBoxLayout(row)
+        row_lay.setContentsMargins(0, 0, 0, 0)
+        row_lay.setSpacing(6)
+        if is_self:
+            row_lay.addStretch(1)
+
+        bubble = QFrame()
+        bubble.setObjectName("WatchPartyMsgSelf" if is_self else "WatchPartyMsgPeer")
+        bubble.setMaximumWidth(290)
+        bubble_lay = QVBoxLayout(bubble)
+        bubble_lay.setContentsMargins(10, 7, 10, 7)
+        bubble_lay.setSpacing(3)
+
+        meta_lay = QHBoxLayout()
+        meta_lay.setContentsMargins(0, 0, 0, 0)
+        meta_lay.setSpacing(8)
+        author_lbl = QLabel(sender_name)
+        author_lbl.setStyleSheet(
+            f"font-size: 11px; font-weight: 700; color: {self.palette.accent if is_self else self.palette.text}; "
+            "background: transparent;"
+        )
+        meta_lay.addWidget(author_lbl)
+        meta_lay.addStretch(1)
+        if ts:
+            ts_lbl = QLabel(ts)
+            ts_lbl.setObjectName("MutedLabel")
+            ts_lbl.setStyleSheet("font-size: 10px; background: transparent;")
+            meta_lay.addWidget(ts_lbl)
+        bubble_lay.addLayout(meta_lay)
+
+        body_lbl = QLabel(content)
+        body_lbl.setWordWrap(True)
+        body_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        body_lbl.setStyleSheet("font-size: 12.5px; background: transparent;")
+        bubble_lay.addWidget(body_lbl)
+
+        row_lay.addWidget(bubble)
+        if not is_self:
+            row_lay.addStretch(1)
+        return row
+
+    def sync_chat_peer_status(self, friend_name: str, online: bool, connected: bool) -> None:
+        if not self._active_chat_code:
+            return
+        name = str(friend_name or self._active_chat_code).strip() or self._active_chat_code
+        self.chat_title_lbl.setText(name)
+        dot_hex = "#4ADE80" if online else "#6B7280"
+        pm = QPixmap(10, 10)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(dot_hex))
+        painter.drawEllipse(1, 1, 8, 8)
+        painter.end()
+        self.chat_status_dot.setPixmap(pm)
+
+        status_txt = "En línea" if online else "Desconectado"
+        self.chat_sub_lbl.setText(f"{self._active_chat_code} · {status_txt}")
+        if not self.cfg.watchparty_relay_url or not connected:
+            self.chat_hint_lbl.setText(
+                "Sin conexión al servidor WatchParty: conecta para enviar o recibir mensajes."
+            )
+            self.chat_hint_lbl.setVisible(True)
+        elif not online:
+            self.chat_hint_lbl.setText(
+                "Tu amigo está desconectado: el mensaje se entregará cuando se conecte."
+            )
+            self.chat_hint_lbl.setVisible(True)
+        else:
+            self.chat_hint_lbl.setVisible(False)
+        self.chat_send_btn.setEnabled(bool(connected))
+
+    def open_chat_for(
+        self,
+        friend_code: str,
+        messages: list[dict[str, Any]],
+        *,
+        friend_name: str = "",
+        online: bool = False,
+        connected: bool = True,
+    ) -> None:
+        fc = str(friend_code or "").strip().upper()
+        if not fc:
+            return
+        self._active_chat_code = fc
+        self._clear_chat_bubbles()
+        for c, card in self._cards.items():
+            card.set_chat_active(c == fc)
+        self.sync_chat_peer_status(friend_name or fc, online=online, connected=connected)
+        for m in messages or []:
+            if isinstance(m, dict):
+                self._insert_chat_bubble(m)
+        self.chat_empty_lbl.setVisible(len(self._chat_rendered_ids) == 0)
+        self.chat_card.setVisible(True)
+        self.chat_input.setFocus(Qt.FocusReason.OtherFocusReason)
+        QTimer.singleShot(0, self._scroll_chat_to_bottom)
+
+    def _insert_chat_bubble(self, msg: dict[str, Any]) -> None:
+        mid = str(msg.get("id") or "").strip()
+        if mid and mid in self._chat_rendered_ids:
+            return
+        if mid:
+            self._chat_rendered_ids.add(mid)
+        else:
+            self._chat_rendered_ids.add(f"_anon_{self._chat_msgs_lay.count()}")
+        bubble = self._create_chat_bubble(msg)
+        insert_pos = max(1, self._chat_msgs_lay.count() - 1)
+        self._chat_msgs_lay.insertWidget(insert_pos, bubble)
+
+    def append_chat_message(self, friend_code: str, msg: dict[str, Any]) -> None:
+        fc = str(friend_code or "").strip().upper()
+        if not fc or fc != self._active_chat_code or not self.chat_card.isVisible():
+            return
+        self._insert_chat_bubble(msg)
+        self.chat_empty_lbl.setVisible(len(self._chat_rendered_ids) == 0)
+        QTimer.singleShot(0, self._scroll_chat_to_bottom)
+
+    def close_chat(self) -> None:
+        self._active_chat_code = ""
+        self._clear_chat_bubbles()
+        self.chat_card.setVisible(False)
+        for card in self._cards.values():
+            card.set_chat_active(False)
+        self.chat_closed.emit()
+
+    def set_unread_counts(self, counts: dict[str, int]) -> None:
+        clean: dict[str, int] = {}
+        for k, v in (counts or {}).items():
+            c = str(k or "").strip().upper()
+            n = max(0, int(v or 0))
+            if c and n > 0:
+                clean[c] = n
+        self._unread_counts = clean
+        for c, card in self._cards.items():
+            card.set_unread_count(clean.get(c, 0))
+
+    def _on_send_chat_clicked(self) -> None:
+        if not self._active_chat_code:
+            return
+        txt = str(self.chat_input.text() or "").strip()
+        if not txt:
+            return
+        self.chat_input.clear()
+        self.send_message_requested.emit(self._active_chat_code, txt)
+
     def update_theme(self, palette: ThemePalette) -> None:
         self.palette = palette
         self.add_friend_btn.setIcon(render_icon("plus", palette.text, 14))
         self.refresh_btn.setIcon(render_icon("refresh", palette.text, 14))
+        self.chat_close_btn.setIcon(render_icon("close", palette.text2, 13))
+        self.chat_send_btn.setIcon(render_icon("send", palette.text, 14))
         for card in self._cards.values():
             card.update_theme(palette)
         self.set_connection_state(self._conn_state, self._conn_detail)

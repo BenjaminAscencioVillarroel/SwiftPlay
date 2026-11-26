@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import threading
 import time
 from typing import Any, Literal
@@ -178,6 +179,8 @@ class WatchPartyService(QObject):
     party_members_updated = Signal(str, str, list, bool)  # host_code, deck, members, allow_guest
     party_notice = Signal(str)
     lookup_result = Signal(dict)
+    direct_message_received = Signal(dict)
+    direct_message_ack = Signal(dict)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -337,6 +340,23 @@ class WatchPartyService(QObject):
         if not clean:
             return
         self._enqueue({"type": "lookup", "code": clean})
+
+    def send_direct_message(self, to_code: str, text: str, client_id: str = "") -> str:
+        """Envía un mensaje directo 1-a-1 a un amigo de WatchParty."""
+        to = str(to_code or "").strip().upper()
+        body = str(text or "").replace("\r\n", "\n").strip()[:1000]
+        if not to or not body:
+            return ""
+        cid = str(client_id or "").strip()[:64] or f"wp_{int(time.time() * 1000)}_{secrets.token_hex(3)}"
+        self._enqueue(
+            {
+                "type": "direct_message",
+                "to": to,
+                "text": body,
+                "client_id": cid,
+            }
+        )
+        return cid
 
     def _compute_presence_fp_locked(self) -> str:
         vid = self._video_state if self._share_enabled else None
@@ -788,3 +808,42 @@ class WatchPartyService(QObject):
             txt = str(msg.get("message") or "").strip()
             if txt:
                 self.party_notice.emit(txt)
+            return
+        if mtype == "dm_message":
+            raw_msg = msg.get("message")
+            if isinstance(raw_msg, dict):
+                from_code = str(raw_msg.get("from_code") or "").strip().upper()
+                text = str(raw_msg.get("text") or "").strip()
+                if from_code and text:
+                    try:
+                        ts = float(raw_msg.get("ts") or time.time())
+                    except (TypeError, ValueError):
+                        ts = time.time()
+                    self.direct_message_received.emit(
+                        {
+                            "id": str(raw_msg.get("id") or "").strip(),
+                            "from_code": from_code,
+                            "from_name": str(raw_msg.get("from_name") or from_code).strip(),
+                            "from_avatar_url": str(raw_msg.get("from_avatar_url") or "").strip(),
+                            "to_code": str(raw_msg.get("to_code") or "").strip().upper(),
+                            "text": text,
+                            "ts": ts,
+                        }
+                    )
+            return
+        if mtype == "dm_ack":
+            try:
+                ts = float(msg.get("ts") or time.time())
+            except (TypeError, ValueError):
+                ts = time.time()
+            self.direct_message_ack.emit(
+                {
+                    "client_id": str(msg.get("client_id") or "").strip(),
+                    "to_code": str(msg.get("to_code") or "").strip().upper(),
+                    "ok": bool(msg.get("ok", True)),
+                    "delivered": bool(msg.get("delivered", False)),
+                    "queued": bool(msg.get("queued", False)),
+                    "error": str(msg.get("error") or "").strip(),
+                    "ts": ts,
+                }
+            )

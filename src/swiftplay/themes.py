@@ -1368,6 +1368,28 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
         font-size: 12px;
         font-weight: 700;
     }}
+
+    QLabel#WatchPartyUnreadBadge {{
+        background-color: #EF4444;
+        color: #FFFFFF;
+        border: none;
+        border-radius: 9px;
+        padding: 0px 5px;
+        font-size: 10px;
+        font-weight: 700;
+    }}
+
+    QFrame#WatchPartyMsgSelf {{
+        background-color: {p.active_bg};
+        border: 1px solid {p.accent};
+        border-radius: 10px;
+    }}
+
+    QFrame#WatchPartyMsgPeer {{
+        background-color: {p.surface2};
+        border: 1px solid {p.border};
+        border-radius: 10px;
+    }}
     """
 
 

@@ -522,6 +522,113 @@ def trim_process_memory(*, collect_gc: bool = True) -> None:
         pass
 
 
+class _PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+    _fields_ = [
+        ("Version", wintypes.DWORD),
+        ("ControlMask", wintypes.DWORD),
+        ("StateMask", wintypes.DWORD),
+    ]
+
+
+_RT_AUDIO_LOCK = threading.Lock()
+_RT_TIMER_ACTIVE = False
+
+
+def set_realtime_audio_process_priority(enabled: bool) -> bool:
+    """Eleva o restaura prioridad real-time, EcoQoS off, timer 1 ms e intervalo GIL para voz."""
+    global _RT_TIMER_ACTIVE
+    want = bool(enabled)
+    try:
+        sys.setswitchinterval(0.002 if want else 0.005)
+    except Exception:
+        pass
+    if sys.platform != "win32":
+        return False
+    ok = False
+    with _RT_AUDIO_LOCK:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.SetPriorityClass.restype = wintypes.BOOL
+            h_proc = kernel32.GetCurrentProcess()
+            prio_cls = 0x00000080 if want else 0x00000020  # HIGH_PRIORITY_CLASS / NORMAL_PRIORITY_CLASS
+            ok = bool(kernel32.SetPriorityClass(h_proc, prio_cls))
+            try:
+                kernel32.SetProcessInformation.argtypes = [
+                    wintypes.HANDLE,
+                    wintypes.DWORD,
+                    ctypes.c_void_p,
+                    wintypes.DWORD,
+                ]
+                kernel32.SetProcessInformation.restype = wintypes.BOOL
+                # ProcessPowerThrottling (4), Version=1, EXEC_SPEED=0x1
+                ppt = _PROCESS_POWER_THROTTLING_STATE(1, 1 if want else 0, 0)
+                kernel32.SetProcessInformation(h_proc, 4, ctypes.byref(ppt), ctypes.sizeof(ppt))
+            except Exception:
+                pass
+        except Exception:
+            ok = False
+
+        try:
+            winmm = ctypes.windll.winmm
+            winmm.timeBeginPeriod.argtypes = [wintypes.UINT]
+            winmm.timeBeginPeriod.restype = wintypes.UINT
+            winmm.timeEndPeriod.argtypes = [wintypes.UINT]
+            winmm.timeEndPeriod.restype = wintypes.UINT
+            if want and not _RT_TIMER_ACTIVE:
+                if winmm.timeBeginPeriod(1) == 0:
+                    _RT_TIMER_ACTIVE = True
+            elif not want and _RT_TIMER_ACTIVE:
+                winmm.timeEndPeriod(1)
+                _RT_TIMER_ACTIVE = False
+        except Exception:
+            pass
+    return ok
+
+
+def register_mmcss_audio_thread(
+    task_name: str = "Pro Audio", *, high_priority: bool = True
+) -> int:
+    """Registra el hilo actual en Windows MMCSS (Pro Audio) devolviendo el handle."""
+    if sys.platform != "win32":
+        return 0
+    if high_priority:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentThread.restype = wintypes.HANDLE
+            kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+            kernel32.SetThreadPriority.restype = wintypes.BOOL
+            kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 2)  # THREAD_PRIORITY_HIGHEST
+        except Exception:
+            pass
+    try:
+        avrt = ctypes.windll.avrt
+        avrt.AvSetMmThreadCharacteristicsW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        avrt.AvSetMmThreadCharacteristicsW.restype = ctypes.c_void_p
+        task_idx = wintypes.DWORD(0)
+        handle = avrt.AvSetMmThreadCharacteristicsW(str(task_name or "Pro Audio"), ctypes.byref(task_idx))
+        return int(handle or 0)
+    except Exception:
+        return 0
+
+
+def revert_mmcss_audio_thread(handle: int) -> None:
+    """Revierte un registro MMCSS previo."""
+    if sys.platform != "win32" or not handle:
+        return
+    try:
+        avrt = ctypes.windll.avrt
+        avrt.AvRevertMmThreadCharacteristics.argtypes = [ctypes.c_void_p]
+        avrt.AvRevertMmThreadCharacteristics.restype = wintypes.BOOL
+        avrt.AvRevertMmThreadCharacteristics(ctypes.c_void_p(int(handle)))
+    except Exception:
+        pass
+
+
 def open_folder_in_explorer(path: str) -> None:
     target = Path(path)
     target.mkdir(parents=True, exist_ok=True)

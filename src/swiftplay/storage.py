@@ -92,6 +92,18 @@ class LocalLibrary:
                 );
                 CREATE INDEX IF NOT EXISTS idx_discord_dm_user_created
                     ON discord_dm_messages (user_id, created_at);
+                CREATE TABLE IF NOT EXISTS watchparty_dm_messages (
+                    msg_key TEXT PRIMARY KEY,
+                    friend_code TEXT NOT NULL,
+                    sender_code TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    is_self INTEGER NOT NULL DEFAULT 0,
+                    content TEXT NOT NULL DEFAULT '',
+                    timestamp TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_wp_dm_friend_created
+                    ON watchparty_dm_messages (friend_code, created_at DESC);
                 """
             )
             # Migraciones seguras para bases de datos previas
@@ -793,3 +805,95 @@ class LocalLibrary:
                     }
                 )
             return out
+
+    # --- Mensajes Directos de WatchParty persistentes ---
+
+    def save_watchparty_dm_message(self, friend_code: str, msg: dict) -> None:
+        fc = str(friend_code or "").strip().upper()
+        if not fc or not isinstance(msg, dict):
+            return
+        content = str(msg.get("content") or msg.get("text") or "").strip()
+        if not content:
+            return
+        raw_id = str(msg.get("id") or "").strip()
+        if not raw_id:
+            raw_id = f"local_{fc}_{int(time.time() * 1000)}_{hash(content) & 0xFFFF}"
+        msg_key = f"{fc}:{raw_id}"
+        sender_code = str(msg.get("sender_code") or msg.get("from_code") or fc).strip().upper()
+        sender_name = str(msg.get("sender_name") or msg.get("from_name") or sender_code).strip()
+        is_self = 1 if msg.get("is_self", False) else 0
+        ts_lbl = str(msg.get("timestamp") or "").strip()
+        try:
+            created_at = float(msg.get("created_ts") or msg.get("ts") or time.time())
+        except (TypeError, ValueError):
+            created_at = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO watchparty_dm_messages (
+                    msg_key, friend_code, sender_code, sender_name,
+                    is_self, content, timestamp, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(msg_key) DO UPDATE SET
+                    sender_name=excluded.sender_name,
+                    content=excluded.content,
+                    timestamp=excluded.timestamp
+                """,
+                (msg_key, fc, sender_code, sender_name, is_self, content, ts_lbl, created_at),
+            )
+            self._conn.execute(
+                """
+                DELETE FROM watchparty_dm_messages
+                WHERE friend_code = ? AND msg_key NOT IN (
+                    SELECT msg_key FROM watchparty_dm_messages
+                    WHERE friend_code = ?
+                    ORDER BY created_at DESC
+                    LIMIT 150
+                )
+                """,
+                (fc, fc),
+            )
+
+    def list_watchparty_dm_messages(self, friend_code: str, limit: int = 100) -> list[dict]:
+        fc = str(friend_code or "").strip().upper()
+        if not fc:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT msg_key, friend_code, sender_code, sender_name, is_self, content, timestamp, created_at
+                FROM watchparty_dm_messages
+                WHERE friend_code = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (fc, max(1, int(limit))),
+            ).fetchall()
+            out: list[dict] = []
+            for r in reversed(rows):
+                mk = str(r["msg_key"])
+                raw_id = mk.split(":", 1)[1] if ":" in mk else mk
+                out.append(
+                    {
+                        "id": raw_id,
+                        "friend_code": str(r["friend_code"] or fc),
+                        "sender_code": str(r["sender_code"] or ""),
+                        "sender_name": str(r["sender_name"] or ""),
+                        "is_self": bool(r["is_self"]),
+                        "content": str(r["content"] or ""),
+                        "timestamp": str(r["timestamp"] or ""),
+                        "created_ts": float(r["created_at"] or 0.0),
+                    }
+                )
+            return out
+
+    def clear_watchparty_dm_messages(self, friend_code: str) -> None:
+        fc = str(friend_code or "").strip().upper()
+        if not fc:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM watchparty_dm_messages WHERE friend_code = ?",
+                (fc,),
+            )

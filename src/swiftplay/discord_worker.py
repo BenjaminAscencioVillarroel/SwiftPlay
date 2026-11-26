@@ -457,7 +457,7 @@ class _DeepFilterMicDsp:
         with self._lock:
             return self._ensure_ready_locked()
 
-    def start_warmup_async(self) -> None:
+    def start_warmup_async(self, *, trim_after: bool = True) -> None:
         """Precalienta DeepFilterNet3 y Silero VAD en segundo plano de forma idempotente."""
         if self._ready or self._failed or self._mode not in ("ai", "ai_max"):
             return
@@ -491,7 +491,7 @@ class _DeepFilterMicDsp:
                         if not need_more:
                             self._warming = False
                             break
-                if ok_any:
+                if ok_any and trim_after:
                     try:
                         from swiftplay.windows_os import trim_process_memory
 
@@ -610,7 +610,7 @@ class VoiceModifierDsp:
         self._ring_len = 4096
         self._ring: Any = None
         self._ring_w = 0
-        self._win_len = 1344  # ~28 ms Hann overlap
+        self._win_len = 960  # 20 ms Hann overlap (~10 ms de retardo medio)
         self._tap_phase = 0.0
         self._tone_lp = 0.0
         self._robot_phase = 0.0
@@ -792,7 +792,7 @@ class MicProcessor:
         enable_webrtc: bool = False,
         enable_dsp: bool | None = None,
         hangover_sec: float = 0.60,
-        preroll_frames: int = 4,
+        preroll_frames: int = 1,
     ) -> None:
         self._lock = threading.Lock()
         self._mic_gain = max(0, min(400, int(mic_gain_pct))) / 100.0
@@ -824,12 +824,12 @@ class MicProcessor:
         if df_dsp is not None and ns_mode in ("ai", "ai_max"):
             df_dsp.warmup()
 
-    def ensure_warmup_async(self) -> None:
+    def ensure_warmup_async(self, *, trim_after: bool = True) -> None:
         with self._lock:
             ns_mode = self._noise_suppression
             df_dsp = self._df_dsp
         if df_dsp is not None and ns_mode in ("ai", "ai_max"):
-            df_dsp.start_warmup_async()
+            df_dsp.start_warmup_async(trim_after=trim_after)
 
     def close(self) -> None:
         self.release_dsp()
@@ -935,16 +935,18 @@ class MicProcessor:
                             if speaking:
                                 voice_ok = (silero_prob >= 0.12) or (lsnr_db >= -1.0)
                             else:
-                                voice_ok = (silero_prob >= 0.30 and lsnr_db >= -6.0) or (lsnr_db >= 6.0)
+                                voice_ok = (silero_prob >= 0.30 and lsnr_db >= -6.0) or (lsnr_db >= 2.5)
                         else:
-                            voice_ok = lsnr_db >= (-1.0 if speaking else 3.0)
+                            voice_ok = lsnr_db >= (-1.0 if speaking else 2.5)
                     else:
                         if silero_prob is not None:
                             if speaking:
                                 voice_ok = (silero_prob >= 0.16) or (lsnr_db >= 2.0)
                             else:
-                                voice_ok = (silero_prob >= 0.45 and lsnr_db >= -4.0) or (
-                                    silero_prob >= 0.65
+                                voice_ok = (
+                                    (silero_prob >= 0.45 and lsnr_db >= -4.0)
+                                    or (silero_prob >= 0.65)
+                                    or (lsnr_db >= 5.0)
                                 )
                         else:
                             voice_ok = lsnr_db >= (0.0 if speaking else 5.0)
@@ -1257,27 +1259,39 @@ def _seq_diff(a: int, b: int) -> int:
 
 
 class UserJitterBuffer:
-    """Jitter buffer ordenado por secuencia RTP + PLC/FEC Opus para un participante."""
+    """Jitter buffer adaptativo por usuario ordenado por secuencia RTP + PLC/FEC Opus."""
 
     def __init__(
         self,
         decoder_factory: Callable[[], Any] | None = None,
-        prefill_frames: int = 3,
+        prefill_frames: int = 2,
         max_packets: int = 12,
     ) -> None:
         self._lock = threading.Lock()
         self._decoder_factory = decoder_factory
         self._decoder: Any = None
-        self._prefill = max(1, int(prefill_frames))
-        self._max_packets = max(4, int(max_packets))
+        self._base_prefill = max(1, int(prefill_frames))
+        self._prefill = self._base_prefill
+        self._max_packets = max(6, int(max_packets))
         self._packets: dict[int, bytes] = {}
         self._priming = True
         self._next_seq: int | None = None
         self._first_pkt_ts = 0.0
         self._consecutive_missing = 0
         self._consecutive_blasts = 0
+        self._excess_ticks = 0
+        self._jitter_ms = 0.0
+        self._adapt_boost = 0.0
+        self._last_pkt_ts = 0.0
+        self._last_pkt_seq: int | None = None
+        self._end_of_speech = False
         self.last_rx_ts = time.monotonic()
         self._pcm_overflow = bytearray()
+
+    def _effective_target_locked(self) -> int:
+        jitter_target = self._base_prefill + int(self._jitter_ms // 22.0)
+        boost_target = self._base_prefill + int(self._adapt_boost)
+        return max(self._base_prefill, min(6, max(jitter_target, boost_target)))
 
     def _ensure_decoder(self) -> Any:
         if self._decoder is None:
@@ -1294,8 +1308,27 @@ class UserJitterBuffer:
         seq_u16 = int(seq) & 0xFFFF
         with self._lock:
             self.last_rx_ts = ts
-            if not opus_bytes or opus_bytes == OPUS_SILENCE:
+            if not opus_bytes:
                 return
+            if opus_bytes == OPUS_SILENCE:
+                self._end_of_speech = True
+                if not self._packets and not self._pcm_overflow:
+                    self._priming = True
+                    self._next_seq = None
+                    self._consecutive_missing = 0
+                    self._excess_ticks = 0
+                return
+
+            self._end_of_speech = False
+            if self._last_pkt_seq is not None:
+                seq_delta = _seq_diff(seq_u16, self._last_pkt_seq)
+                if 0 < seq_delta <= 8:
+                    actual_dt_ms = max(0.0, (ts - self._last_pkt_ts) * 1000.0)
+                    transit_err = abs(actual_dt_ms - seq_delta * 20.0)
+                    self._jitter_ms += (min(transit_err, 250.0) - self._jitter_ms) / 16.0
+            self._last_pkt_ts = ts
+            self._last_pkt_seq = seq_u16
+
             if not self._priming and self._next_seq is not None:
                 diff = _seq_diff(seq_u16, self._next_seq)
                 if abs(diff) > 200:
@@ -1304,8 +1337,11 @@ class UserJitterBuffer:
                     self._priming = True
                     self._next_seq = None
                     self._consecutive_missing = 0
+                    self._excess_ticks = 0
                     self._first_pkt_ts = ts
                 elif diff < 0:
+                    if diff >= -10:
+                        self._adapt_boost = min(4.0, self._adapt_boost + 0.85)
                     return
             if self._priming and not self._packets:
                 self._first_pkt_ts = ts
@@ -1325,28 +1361,46 @@ class UserJitterBuffer:
                 del self._pcm_overflow[:PCM_FRAME_BYTES]
                 return out
 
+            eff_target = self._effective_target_locked()
+
             if self._priming:
                 if not self._packets:
                     return None
                 waited = cur - self._first_pkt_ts
-                if len(self._packets) < self._prefill and waited < 0.055:
+                wait_cap = min(0.12, 0.028 + 0.018 * (eff_target - self._base_prefill))
+                if len(self._packets) < eff_target and waited < wait_cap:
                     return None
                 anchor = next(iter(self._packets))
                 self._next_seq = min(self._packets.keys(), key=lambda s: _seq_diff(s, anchor))
                 self._priming = False
                 self._consecutive_missing = 0
+                self._excess_ticks = 0
 
             if self._next_seq is None:
                 self._priming = True
                 return None
 
-            # Limitar latencia máxima si se acumulan demasiados paquetes
-            while len(self._packets) > 7:
+            # Limitar latencia máxima según el nivel de jitter actual del usuario
+            hard_cap = max(5, eff_target + 3)
+            while len(self._packets) > hard_cap:
                 anchor = next(iter(self._packets))
                 oldest = min(self._packets.keys(), key=lambda s: _seq_diff(s, anchor))
                 self._packets.pop(oldest, None)
+                self._excess_ticks = 0
                 if self._next_seq is None or _seq_diff(oldest, self._next_seq) >= 0:
                     self._next_seq = (oldest + 1) & 0xFFFF
+
+            if len(self._packets) >= (eff_target + 2):
+                self._excess_ticks += 1
+                if self._excess_ticks >= 18:
+                    self._excess_ticks = 0
+                    anchor = next(iter(self._packets))
+                    oldest = min(self._packets.keys(), key=lambda s: _seq_diff(s, anchor))
+                    self._packets.pop(oldest, None)
+                    if self._next_seq is None or _seq_diff(oldest, self._next_seq) >= 0:
+                        self._next_seq = (oldest + 1) & 0xFFFF
+            else:
+                self._excess_ticks = 0
 
             dec = self._ensure_decoder()
             pcm: bytes | None = None
@@ -1354,11 +1408,22 @@ class UserJitterBuffer:
             if pkt is not None:
                 self._next_seq = (self._next_seq + 1) & 0xFFFF
                 self._consecutive_missing = 0
+                self._adapt_boost = max(0.0, self._adapt_boost - 0.008)
                 try:
                     pcm = dec.decode(pkt, fec=False)
                 except Exception:
                     pcm = None
             else:
+                if self._end_of_speech and not self._packets:
+                    self._priming = True
+                    self._next_seq = None
+                    self._consecutive_missing = 0
+                    self._excess_ticks = 0
+                    return None
+
+                if not self._end_of_speech:
+                    self._adapt_boost = min(4.0, self._adapt_boost + 0.60)
+
                 next2 = (self._next_seq + 1) & 0xFFFF
                 pkt2 = self._packets.get(next2)
                 if pkt2 is not None:
@@ -1371,21 +1436,40 @@ class UserJitterBuffer:
                             pcm = None
                     self._next_seq = next2
                     self._consecutive_missing += 1
-                elif self._consecutive_missing < 3:
-                    try:
-                        pcm = dec.decode(None, fec=False)
-                    except Exception:
-                        pcm = None
-                    self._next_seq = (self._next_seq + 1) & 0xFFFF
-                    self._consecutive_missing += 1
                 else:
-                    self._priming = True
-                    self._next_seq = None
-                    self._consecutive_missing = 0
-                    self._consecutive_blasts = 0
-                    self._packets.clear()
-                    self._pcm_overflow.clear()
-                    return None
+                    future = [
+                        s for s in self._packets if _seq_diff(s, self._next_seq) > 0
+                    ]
+                    if future and self._consecutive_missing >= 2:
+                        jump_seq = min(future, key=lambda s: _seq_diff(s, self._next_seq))
+                        jump_pkt = self._packets.pop(jump_seq, None)
+                        self._next_seq = (jump_seq + 1) & 0xFFFF
+                        self._consecutive_missing = 0
+                        if jump_pkt is not None:
+                            try:
+                                pcm = dec.decode(jump_pkt, fec=False)
+                            except Exception:
+                                pcm = None
+                    elif self._consecutive_missing < 3:
+                        try:
+                            pcm = dec.decode(None, fec=False)
+                        except Exception:
+                            pcm = None
+                        self._next_seq = (self._next_seq + 1) & 0xFFFF
+                        self._consecutive_missing += 1
+                        if pcm:
+                            if self._consecutive_missing == 2:
+                                pcm = _pcm_scale(pcm, 0.72)
+                            elif self._consecutive_missing >= 3:
+                                pcm = _pcm_scale(pcm, 0.40)
+                    else:
+                        self._priming = True
+                        self._next_seq = None
+                        self._consecutive_missing = 0
+                        self._consecutive_blasts = 0
+                        self._excess_ticks = 0
+                        self._pcm_overflow.clear()
+                        return None
 
             if not pcm:
                 return SILENCE_PCM
@@ -1411,6 +1495,12 @@ class UserJitterBuffer:
             self._next_seq = None
             self._consecutive_missing = 0
             self._consecutive_blasts = 0
+            self._excess_ticks = 0
+            self._jitter_ms = 0.0
+            self._adapt_boost = 0.0
+            self._last_pkt_ts = 0.0
+            self._last_pkt_seq = None
+            self._end_of_speech = False
 
     def close(self) -> None:
         with self._lock:
@@ -1420,6 +1510,12 @@ class UserJitterBuffer:
             self._priming = True
             self._next_seq = None
             self._consecutive_blasts = 0
+            self._excess_ticks = 0
+            self._jitter_ms = 0.0
+            self._adapt_boost = 0.0
+            self._last_pkt_ts = 0.0
+            self._last_pkt_seq = None
+            self._end_of_speech = False
 
 
 class VoiceAudioMixer:
@@ -1689,6 +1785,22 @@ def resolve_device_candidates(
     """Devuelve índices PortAudio candidatos por prioridad de HostAPI, terminando en None."""
     target = (device_name or "").strip().lower()
     if not target:
+        try:
+            import sounddevice as sd
+
+            apis = sd.query_hostapis()
+            ch_key = "max_input_channels" if kind == "input" else "max_output_channels"
+            def_key = "default_input_device" if kind == "input" else "default_output_device"
+            for api in apis:
+                if "wasapi" in str(api.get("name") or "").lower():
+                    raw_idx = api.get(def_key, -1)
+                    if raw_idx is not None and int(raw_idx) >= 0:
+                        idx = int(raw_idx)
+                        info = sd.query_devices(idx)
+                        if isinstance(info, dict) and int(info.get(ch_key) or 0) > 0:
+                            return [idx, None]
+        except Exception:
+            pass
         return [None]
 
     seen: set[int | None] = set()
@@ -1792,7 +1904,7 @@ class AudioEngine:
         self._in_rate_state: Any = None
         self._in_mono_buf = bytearray()
 
-        self._mic_queue: queue.Queue[bytes] = queue.Queue(maxsize=8)
+        self._mic_queue: queue.Queue[bytes] = queue.Queue(maxsize=4)
         self._mic_thread: threading.Thread | None = None
 
         self._muted = False
@@ -1853,7 +1965,7 @@ class AudioEngine:
             voice_fx=voice_fx,
         )
         if noise_suppression is not None and self._running:
-            self._mic_proc.ensure_warmup_async()
+            self._mic_proc.ensure_warmup_async(trim_after=False)
         if input_device_name is not None:
             new_in = str(input_device_name or "").strip()
             if new_in != self._input_device_name:
@@ -1877,7 +1989,7 @@ class AudioEngine:
 
     def warmup_async(self) -> None:
         """Precalienta DeepFilterNet3 y Silero VAD en segundo plano al entrar en voz."""
-        self._mic_proc.ensure_warmup_async()
+        self._mic_proc.ensure_warmup_async(trim_after=not self._running)
 
     def release_dsp_idle(self) -> None:
         """Libera buffers de DSP neuronal cuando no hay llamada de voz activa."""
@@ -1910,6 +2022,12 @@ class AudioEngine:
                 except queue.Empty:
                     break
 
+        try:
+            from swiftplay.windows_os import set_realtime_audio_process_priority
+
+            set_realtime_audio_process_priority(True)
+        except Exception:
+            pass
         self._open_output_stream()
         self._open_input_stream()
         self._mic_thread = threading.Thread(
@@ -2039,12 +2157,20 @@ class AudioEngine:
         except queue.Full:
             pass
 
-        for s in (in_s, out_s):
-            self._close_stream(s)
+        try:
+            for s in (in_s, out_s):
+                self._close_stream(s)
 
-        if self._mic_thread is not None and self._mic_thread.is_alive():
-            self._mic_thread.join(timeout=0.8)
-        self._mic_thread = None
+            if self._mic_thread is not None and self._mic_thread.is_alive():
+                self._mic_thread.join(timeout=0.8)
+            self._mic_thread = None
+        finally:
+            try:
+                from swiftplay.windows_os import set_realtime_audio_process_priority
+
+                set_realtime_audio_process_priority(False)
+            except Exception:
+                pass
 
     def close(self) -> None:
         self.stop()
@@ -2084,28 +2210,29 @@ class AudioEngine:
             if def_sr != SAMPLE_RATE:
                 rate_pairs.append((def_sr, ch))
             for sr, nch in rate_pairs:
-                try:
-                    self._out_sr = sr
-                    self._out_channels = nch
-                    self._out_rate_state = None
-                    self._out_buf.clear()
-                    stream = sd.RawOutputStream(
-                        samplerate=sr,
-                        blocksize=0,
-                        device=dev_idx,
-                        channels=nch,
-                        dtype="int16",
-                        latency=0.06,
-                        callback=self._output_callback,
-                    )
-                    stream.start()
-                    self._output_stream = stream
-                    if offset > 0 and n_cands > 0:
-                        self._out_candidate_skip = (skip + offset) % n_cands
-                    self._out_opened_at = time.monotonic()
-                    return
-                except Exception as exc:
-                    last_err = exc
+                for lat in (0.02, "low", 0.035):
+                    try:
+                        self._out_sr = sr
+                        self._out_channels = nch
+                        self._out_rate_state = None
+                        self._out_buf.clear()
+                        stream = sd.RawOutputStream(
+                            samplerate=sr,
+                            blocksize=0,
+                            device=dev_idx,
+                            channels=nch,
+                            dtype="int16",
+                            latency=lat,
+                            callback=self._output_callback,
+                        )
+                        stream.start()
+                        self._output_stream = stream
+                        if offset > 0 and n_cands > 0:
+                            self._out_candidate_skip = (skip + offset) % n_cands
+                        self._out_opened_at = time.monotonic()
+                        return
+                    except Exception as exc:
+                        last_err = exc
 
         if last_err is not None:
             self._on_warning(f"No se pudo abrir la salida de audio: {last_err}")
@@ -2143,28 +2270,29 @@ class AudioEngine:
                     rate_pairs.append((def_sr, 1))
 
             for sr, nch in rate_pairs:
-                try:
-                    self._in_sr = sr
-                    self._in_channels = nch
-                    self._in_rate_state = None
-                    self._in_mono_buf.clear()
-                    stream = sd.RawInputStream(
-                        samplerate=sr,
-                        blocksize=0,
-                        device=dev_idx,
-                        channels=nch,
-                        dtype="int16",
-                        latency=0.04,
-                        callback=self._input_callback,
-                    )
-                    stream.start()
-                    self._input_stream = stream
-                    if offset > 0 and n_cands > 0:
-                        self._in_candidate_skip = (skip + offset) % n_cands
-                    self._in_opened_at = time.monotonic()
-                    return
-                except Exception as exc:
-                    last_err = exc
+                for lat in (0.02, "low", 0.03):
+                    try:
+                        self._in_sr = sr
+                        self._in_channels = nch
+                        self._in_rate_state = None
+                        self._in_mono_buf.clear()
+                        stream = sd.RawInputStream(
+                            samplerate=sr,
+                            blocksize=0,
+                            device=dev_idx,
+                            channels=nch,
+                            dtype="int16",
+                            latency=lat,
+                            callback=self._input_callback,
+                        )
+                        stream.start()
+                        self._input_stream = stream
+                        if offset > 0 and n_cands > 0:
+                            self._in_candidate_skip = (skip + offset) % n_cands
+                        self._in_opened_at = time.monotonic()
+                        return
+                    except Exception as exc:
+                        last_err = exc
 
         if last_err is not None:
             self._on_warning(f"Sin micrófono disponible (modo solo escucha): {last_err}")
@@ -2230,68 +2358,105 @@ class AudioEngine:
 
     def _mic_sender_loop(self) -> None:
         aop = _get_audioop()
-        while self._running:
-            try:
-                wait_s = 0.08 if self._local_speaking else 0.25
-                raw = self._mic_queue.get(timeout=wait_s)
-            except queue.Empty:
-                now = time.monotonic()
-                if self._mic_proc.check_hangover(now) and self._local_speaking:
-                    self._local_speaking = False
-                    self._on_speaking_state(False)
-                    self._on_mic_level(0, False)
-                continue
+        mmcss_handle = 0
+        try:
+            from swiftplay.windows_os import (
+                register_mmcss_audio_thread,
+                revert_mmcss_audio_thread,
+            )
 
-            if not self._running:
-                break
-            if not raw or (self._muted and not self._loopback):
-                continue
+            mmcss_handle = register_mmcss_audio_thread("Pro Audio", high_priority=True)
+        except Exception:
+            mmcss_handle = 0
 
-            mono = _pcm_to_mono(raw, self._in_channels) if self._in_channels > 1 else raw
-            if self._in_sr != SAMPLE_RATE and aop is not None:
+        try:
+            while self._running:
                 try:
-                    mono, self._in_rate_state = aop.ratecv(
-                        mono, 2, 1, self._in_sr, SAMPLE_RATE, self._in_rate_state
-                    )
-                except Exception:
-                    continue
-
-            self._in_mono_buf.extend(mono)
-            while len(self._in_mono_buf) >= MONO_FRAME_BYTES and self._running:
-                frame = bytes(self._in_mono_buf[:MONO_FRAME_BYTES])
-                del self._in_mono_buf[:MONO_FRAME_BYTES]
-
-                if self._muted and not self._loopback:
-                    continue
-
-                now = time.monotonic()
-                tx_frames, level, should_tx = self._mic_proc.process_frame(frame, now)
-
-                if (now - self._last_vu_emit) >= 0.09:
-                    self._last_vu_emit = now
-                    try:
-                        self._on_mic_level(level, should_tx)
-                    except Exception:
-                        pass
-
-                if self._loopback:
-                    if self._local_speaking:
+                    wait_s = 0.08 if self._local_speaking else 0.25
+                    raw = self._mic_queue.get(timeout=wait_s)
+                except queue.Empty:
+                    now = time.monotonic()
+                    if self._mic_proc.check_hangover(now) and self._local_speaking:
                         self._local_speaking = False
                         self._on_speaking_state(False)
-                    if should_tx:
-                        with self._loopback_lock:
-                            for mono_out in tx_frames:
-                                self._loopback_queue.append(_pcm_mono_to_stereo(mono_out))
-                elif should_tx:
-                    if not self._local_speaking:
-                        self._local_speaking = True
-                        self._on_speaking_state(True)
-                    for mono_out in tx_frames:
-                        self._on_send_pcm(_pcm_mono_to_stereo(mono_out))
-                elif self._local_speaking:
-                    self._local_speaking = False
-                    self._on_speaking_state(False)
-                    self._on_mic_level(level, False)
+                        self._on_mic_level(0, False)
+                    continue
+
+                if not self._running:
+                    break
+                # Si el sistema sufrió un micro-cuelgue de CPU/disco, descartar backlog viejo de captura
+                if self._mic_queue.qsize() >= 3:
+                    latest = raw
+                    while True:
+                        try:
+                            nxt = self._mic_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if not nxt:
+                            latest = nxt
+                            break
+                        latest = nxt
+                    raw = latest
+                    max_in_backlog = MONO_FRAME_BYTES * 2
+                    if len(self._in_mono_buf) > max_in_backlog:
+                        del self._in_mono_buf[:-MONO_FRAME_BYTES]
+
+                if not raw or (self._muted and not self._loopback):
+                    continue
+
+                mono = _pcm_to_mono(raw, self._in_channels) if self._in_channels > 1 else raw
+                if self._in_sr != SAMPLE_RATE and aop is not None:
+                    try:
+                        mono, self._in_rate_state = aop.ratecv(
+                            mono, 2, 1, self._in_sr, SAMPLE_RATE, self._in_rate_state
+                        )
+                    except Exception:
+                        continue
+
+                self._in_mono_buf.extend(mono)
+                while len(self._in_mono_buf) >= MONO_FRAME_BYTES and self._running:
+                    frame = bytes(self._in_mono_buf[:MONO_FRAME_BYTES])
+                    del self._in_mono_buf[:MONO_FRAME_BYTES]
+
+                    if self._muted and not self._loopback:
+                        continue
+
+                    now = time.monotonic()
+                    tx_frames, level, should_tx = self._mic_proc.process_frame(frame, now)
+
+                    if (now - self._last_vu_emit) >= 0.09:
+                        self._last_vu_emit = now
+                        try:
+                            self._on_mic_level(level, should_tx)
+                        except Exception:
+                            pass
+
+                    if self._loopback:
+                        if self._local_speaking:
+                            self._local_speaking = False
+                            self._on_speaking_state(False)
+                        if should_tx:
+                            with self._loopback_lock:
+                                for mono_out in tx_frames:
+                                    self._loopback_queue.append(_pcm_mono_to_stereo(mono_out))
+                    elif should_tx:
+                        if not self._local_speaking:
+                            self._local_speaking = True
+                            self._on_speaking_state(True)
+                        for mono_out in tx_frames:
+                            self._on_send_pcm(_pcm_mono_to_stereo(mono_out))
+                    elif self._local_speaking:
+                        self._local_speaking = False
+                        self._on_speaking_state(False)
+                        self._on_mic_level(level, False)
+        finally:
+            if mmcss_handle:
+                try:
+                    from swiftplay.windows_os import revert_mmcss_audio_thread
+
+                    revert_mmcss_audio_thread(mmcss_handle)
+                except Exception:
+                    pass
 
 
 def _make_voice_client_cls(on_init: Callable[[Any], None] | None = None):
@@ -2513,6 +2678,15 @@ def _make_voice_client_cls(on_init: Callable[[Any], None] | None = None):
             if not self._listener_registered:
                 self._connection.add_socket_listener(self._on_udp_packet)
                 self._listener_registered = True
+            try:
+                import socket
+
+                sock = getattr(self._connection, "socket", None)
+                if sock is not None:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+            except Exception:
+                pass
             try:
                 sr = getattr(self._connection, "_socket_reader", None)
                 if sr is not None:
@@ -5110,8 +5284,8 @@ class DiscordWorkerApp:
             in_call = self._vc is not None and self._vc.is_connected()
             if (now - trim_tick) >= 60.0:
                 trim_tick = now
-                if not in_call or ws > 65.0:
-                    trim_process_memory(collect_gc=not in_call)
+                if not in_call:
+                    trim_process_memory(collect_gc=True)
 
     async def handle_command(self, req: dict[str, Any]) -> None:
         req_id = req.get("id")

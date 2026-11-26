@@ -3215,7 +3215,7 @@ class DiscordVoicePanel(QWidget):
         for ns_label, ns_key in (
             ("IA Máxima (estilo Krisp)", "ai_max"),
             ("IA (DeepFilterNet3)", "ai"),
-            ("Estándar (WebRTC)", "webrtc"),
+            ("Baja latencia (WebRTC)", "webrtc"),
             ("Desactivada", "off"),
         ):
             self.ns_combo.addItem(ns_label, ns_key)
@@ -3223,7 +3223,7 @@ class DiscordVoicePanel(QWidget):
         if ns_idx >= 0:
             self.ns_combo.setCurrentIndex(ns_idx)
         self.ns_combo.setToolTip(
-            "Los modos IA usan DeepFilterNet3 + Silero VAD v6 para eliminar teclado, mouse, ventiladores y ruido ambiente como Krisp en Discord."
+            "Los modos IA usan DeepFilterNet3 (~40 ms de lookahead) para eliminar teclado y ruido ambiente. Usa 'Baja latencia (WebRTC)' para respuesta instantánea."
         )
         self.ns_combo.currentIndexChanged.connect(self._on_ns_changed)
         ns_row.addWidget(self.ns_combo, 1)

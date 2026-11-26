@@ -455,5 +455,33 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
         p.drawEllipse(QPointF(s * 0.57, s * 0.43), s * 0.06, s * 0.06)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
+    elif name == "chat":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        chat_path = QPainterPath()
+        chat_path.moveTo(s * 0.16, s * 0.22)
+        chat_path.lineTo(s * 0.84, s * 0.22)
+        chat_path.quadTo(s * 0.88, s * 0.22, s * 0.88, s * 0.26)
+        chat_path.lineTo(s * 0.88, s * 0.66)
+        chat_path.quadTo(s * 0.88, s * 0.70, s * 0.84, s * 0.70)
+        chat_path.lineTo(s * 0.40, s * 0.70)
+        chat_path.lineTo(s * 0.20, s * 0.84)
+        chat_path.lineTo(s * 0.22, s * 0.70)
+        chat_path.lineTo(s * 0.16, s * 0.70)
+        chat_path.quadTo(s * 0.12, s * 0.70, s * 0.12, s * 0.66)
+        chat_path.lineTo(s * 0.12, s * 0.26)
+        chat_path.quadTo(s * 0.12, s * 0.22, s * 0.16, s * 0.22)
+        p.drawPath(chat_path)
+
+    elif name == "send":
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        send_path = QPainterPath()
+        send_path.moveTo(s * 0.14, s * 0.20)
+        send_path.lineTo(s * 0.88, s * 0.50)
+        send_path.lineTo(s * 0.14, s * 0.80)
+        send_path.lineTo(s * 0.28, s * 0.50)
+        send_path.closeSubpath()
+        p.drawPath(send_path)
+        p.drawLine(QPointF(s * 0.28, s * 0.50), QPointF(s * 0.62, s * 0.50))
+
     p.end()
     return QIcon(pm)

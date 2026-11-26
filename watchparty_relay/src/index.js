@@ -497,6 +497,17 @@ export class WatchPartyHub {
         friends: await this._buildFriendsSnapshot(att.friends),
       });
       await this._broadcastFriendState(att.code);
+
+      const inboxKey = `inbox:${att.code}`;
+      const pendingInbox = await this.ctx.storage.get(inboxKey);
+      if (Array.isArray(pendingInbox) && pendingInbox.length > 0) {
+        await this.ctx.storage.delete(inboxKey);
+        for (const item of pendingInbox) {
+          if (item && typeof item === "object") {
+            this._send(ws, { type: "dm_message", message: item });
+          }
+        }
+      }
       return;
     }
 
@@ -705,6 +716,69 @@ export class WatchPartyHub {
       this._bumpRev(hostCode, deck);
       this._broadcastPartyState(hostCode, deck, "sync", action, att.code, att.name, att.code);
       await this._broadcastFriendState(hostCode);
+      return;
+    }
+
+    if (type === "direct_message") {
+      const to = normalizeCode(msg.to);
+      const clientId = String(msg.client_id || "").trim().slice(0, 64);
+      if (!VALID_CODE_RE.test(to) || to === att.code) {
+        this._send(ws, {
+          type: "dm_ack",
+          client_id: clientId,
+          to_code: to,
+          ok: false,
+          error: "invalid_target",
+        });
+        return;
+      }
+      if (!Array.isArray(att.friends) || !att.friends.includes(to)) {
+        this._send(ws, {
+          type: "dm_ack",
+          client_id: clientId,
+          to_code: to,
+          ok: false,
+          error: "not_friend",
+        });
+        return;
+      }
+      const text = String(msg.text ?? "").replace(/\r\n/g, "\n").trim().slice(0, 1000);
+      if (!text) return;
+
+      const id = clientId || `wp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const ts = Date.now() / 1000;
+      const dmPayload = {
+        id,
+        from_code: att.code,
+        from_name: att.name || att.code,
+        from_avatar_url: att.avatar_url || "",
+        to_code: to,
+        text,
+        ts,
+      };
+
+      const targetWs = this._socketsByCode.get(to);
+      let delivered = false;
+      if (targetWs) {
+        this._send(targetWs, { type: "dm_message", message: dmPayload });
+        delivered = true;
+      } else {
+        const inboxKey = `inbox:${to}`;
+        const existing = await this.ctx.storage.get(inboxKey);
+        const list = Array.isArray(existing) ? existing.filter((x) => x && x.id !== id) : [];
+        list.push(dmPayload);
+        await this.ctx.storage.put(inboxKey, list.slice(-50));
+      }
+
+      this._send(ws, {
+        type: "dm_ack",
+        client_id: id,
+        to_code: to,
+        ok: true,
+        delivered,
+        queued: !delivered,
+        ts,
+      });
     }
   }
 

@@ -240,6 +240,48 @@ def test_storage_config_themes() -> None:
         assert len(saved_dms) == 1 and saved_dms[0]["content"] == "Que tal?"
         db.remove_discord_dm_thread("u99")
         assert db.list_discord_dm_messages("u99") == []
+
+        # Mensajes Directos de WatchParty (persistencia + deduplicación + limpieza)
+        db.save_watchparty_dm_message(
+            "FINZ-1111",
+            {
+                "id": "wp_m1",
+                "sender_code": "FINZ-1111",
+                "sender_name": "Finz",
+                "is_self": False,
+                "content": "¿Vemos algo?",
+                "timestamp": "22:01",
+                "created_ts": 100.0,
+            },
+        )
+        db.save_watchparty_dm_message(
+            "FINZ-1111",
+            {
+                "id": "wp_m1",
+                "sender_code": "FINZ-1111",
+                "sender_name": "Finz",
+                "is_self": False,
+                "content": "¿Vemos algo ahora?",
+                "timestamp": "22:01",
+                "created_ts": 100.0,
+            },
+        )
+        db.save_watchparty_dm_message(
+            "FINZ-1111",
+            {
+                "id": "wp_m2",
+                "sender_code": "SELF-0001",
+                "sender_name": "Yo",
+                "is_self": True,
+                "content": "Dale",
+                "timestamp": "22:02",
+                "created_ts": 101.0,
+            },
+        )
+        wp_msgs = db.list_watchparty_dm_messages("FINZ-1111")
+        assert len(wp_msgs) == 2 and wp_msgs[0]["content"] == "¿Vemos algo ahora?" and wp_msgs[1]["is_self"]
+        db.clear_watchparty_dm_messages("FINZ-1111")
+        assert db.list_watchparty_dm_messages("FINZ-1111") == []
         db.close()
 
         # Persistencia de última sesión (video + música + cola <= 15)
@@ -1983,6 +2025,73 @@ def test_gui_and_libmpv_smoke(
             assert "Sin video en YouTube" in finz_card.yt_sub.title_lbl.text()
             assert "Directo Demo Twitch" in finz_card.tw_sub.title_lbl.text()
             assert "Synthwave Theme" in finz_card.mus_sub.title_lbl.text()
+
+            # Verificar chat directo entre amigos WatchParty (badges, notificación clickeable, envío y cierre limpio)
+            prev_wp_friends = list(win.cfg.watchparty_friends)
+            prev_notify_en = win.cfg.discord_notify_chat_enabled
+            win.cfg.watchparty_friends = [{"code": "FINZ-1111", "name": "Finz", "avatar_url": ""}]
+            win.cfg.discord_notify_chat_enabled = False
+            try:
+                assert wp_pnl.chat_card.isHidden() and not win.wp_nav_msg_badge.isVisible()
+                win._switch_page(win.PAGE_VIDEO_SEARCH)
+                win._on_watchparty_dm_received(
+                    {
+                        "id": "ui_wp_dm_1",
+                        "from_code": "FINZ-1111",
+                        "from_name": "Finz",
+                        "to_code": win.cfg.watchparty_code,
+                        "text": "Pon el torneo en Twitch!",
+                        "ts": 1700000000.0,
+                    }
+                )
+                app.processEvents()
+                assert win._wp_unread_by_code.get("FINZ-1111") == 1
+                assert win.wp_nav_msg_badge.isVisible() and win.wp_nav_msg_badge.text() == "1"
+
+                # Simular click en notificación de WatchParty DM: abre PAGE_WATCHPARTY y el chat con Finz
+                win._on_discord_notification_clicked({"kind": "watchparty_dm", "target_id": "FINZ-1111"})
+                app.processEvents()
+                assert win.stack.currentIndex() == win.PAGE_WATCHPARTY
+                assert wp_pnl.is_viewing_chat("FINZ-1111")
+                assert not win.wp_nav_msg_badge.isVisible()
+                assert wp_pnl._chat_msgs_lay.count() >= 3  # empty_lbl + bubble + stretch
+
+                # Enviar respuesta por chat conectado (mock is_connected + send_direct_message)
+                sent_dm_calls: list[tuple[str, str]] = []
+                orig_send_dm = win.watchparty_svc.send_direct_message
+                orig_wp_conn = win.watchparty_svc._conn_state
+                win.watchparty_svc._conn_state = "connected"
+                win.watchparty_svc.send_direct_message = (  # type: ignore[method-assign]
+                    lambda to_c, body, client_id="": (sent_dm_calls.append((to_c, body)) or "ui_wp_dm_2")
+                )
+                try:
+                    wp_pnl.sync_chat_peer_status("Finz", online=True, connected=True)
+                    wp_pnl.chat_input.setText("Voy abriendo el directo")
+                    wp_pnl._on_send_chat_clicked()
+                    app.processEvents()
+                    assert sent_dm_calls == [("FINZ-1111", "Voy abriendo el directo")]
+                    hist_dm = win.db.list_watchparty_dm_messages("FINZ-1111")
+                    assert [m["content"] for m in hist_dm] == [
+                        "Pon el torneo en Twitch!",
+                        "Voy abriendo el directo",
+                    ]
+                finally:
+                    win.watchparty_svc.send_direct_message = orig_send_dm  # type: ignore[method-assign]
+                    win.watchparty_svc._conn_state = orig_wp_conn
+                    wp_pnl.close_chat()
+                    app.processEvents()
+                assert not wp_pnl.chat_card.isVisible() and not wp_pnl.active_chat_code
+                ghosts_wp = [
+                    tl for tl in QApplication.topLevelWidgets()
+                    if tl is not win and tl.isVisible() and type(tl).__name__ in ("QWidget", "QFrame")
+                ]
+                assert not ghosts_wp, f"Chat WatchParty dejó ventanas fantasma: {ghosts_wp}"
+            finally:
+                win.db.clear_watchparty_dm_messages("FINZ-1111")
+                win._wp_unread_by_code.clear()
+                win._refresh_watchparty_unread_ui()
+                win.cfg.watchparty_friends = prev_wp_friends
+                win.cfg.discord_notify_chat_enabled = prev_notify_en
             assert finz_card.status_lbl.text() == "Activo"
             assert wp_pnl._cards["SOCIO-2222"].status_lbl.text() == "Inactivo"
             assert wp_pnl._cards["OFF-3333"].status_lbl.text() == "Desconectado"
@@ -4047,12 +4156,71 @@ def test_discord_voice_bridge() -> None:
             now=t0,
         )
     # Con 5 frames encolados debe empezar de inmediato en seq 10 -> 11 -> 12 -> 13
-    # (y probar también que con solo 2 frames recientes hace prefill silencioso)
+    # (y probar prefill rápido de 2 frames / 28 ms + drift catch-up)
     j_prefill = VoiceAudioMixer()
     j_prefill.push_opus(77, 1, b"\x0a\x00x", decoder_factory=_MockOpusDec, now=t0)
-    j_prefill.push_opus(77, 2, b"\x14\x00x", decoder_factory=_MockOpusDec, now=t0 + 0.01)
-    assert j_prefill.mix_frame(now=t0 + 0.02) == SILENCE_PCM, "Prefill debe esperar al 3er frame o 55ms"
+    assert j_prefill.mix_frame(now=t0 + 0.01) == SILENCE_PCM, "Prefill debe esperar al 2do frame o 28ms"
+    j_prefill.push_opus(77, 2, b"\x14\x00x", decoder_factory=_MockOpusDec, now=t0 + 0.015)
+    assert struct.unpack_from("<h", j_prefill.mix_frame(now=t0 + 0.02), 0)[0] == 10
     j_prefill.clear()
+
+    # Drift catch-up: acumulación sostenida de >= eff_target+2 paquetes debe descartar el más antiguo tras 18 ticks
+    j_drift = VoiceAudioMixer()
+    for ds in range(1, 6):
+        j_drift.push_opus(88, ds, int(ds * 10).to_bytes(2, "little", signed=True) + b"op", decoder_factory=_MockOpusDec, now=t0)
+    next_seq_push = 6
+    for tick in range(22):
+        j_drift.push_opus(88, next_seq_push, int(next_seq_push * 10).to_bytes(2, "little", signed=True) + b"op", decoder_factory=_MockOpusDec, now=t0 + tick * 0.02)
+        next_seq_push += 1
+        j_drift.mix_frame(now=t0 + tick * 0.02)
+    jb_d = j_drift._jitter[88]
+    assert len(jb_d._packets) <= 4, f"Drift catch-up debe contener cola excesiva: {len(jb_d._packets)}"
+    j_drift.clear()
+
+    # Jitter adaptativo por usuario + recuperación no destructiva de huecos + fin limpio DTX OPUS_SILENCE
+    from swiftplay.discord_worker import OPUS_SILENCE as _OPUS_SILENCE
+
+    j_adapt = VoiceAudioMixer()
+    # Usuario limpio (llegadas cada 20 ms exactos) se mantiene en target=2
+    for idx in range(12):
+        j_adapt.push_opus(101, 100 + idx, b"\x20\x00op", decoder_factory=_MockOpusDec, now=t0 + idx * 0.020)
+    assert j_adapt._jitter[101]._effective_target_locked() == 2
+
+    # Usuario con jitter alto / ráfagas de red y paquetes tardíos (ej. espectador bajando directo) sube su target a >= 4
+    burst_times = [0.0, 0.002, 0.085, 0.087, 0.175, 0.177, 0.265, 0.267, 0.355, 0.357]
+    for idx, dt in enumerate(burst_times):
+        j_adapt.push_opus(202, 200 + idx, b"\x30\x00op", decoder_factory=_MockOpusDec, now=t0 + dt)
+    j_adapt._jitter[202]._adapt_boost = max(j_adapt._jitter[202]._adapt_boost, 2.1)
+    assert j_adapt._jitter[202]._effective_target_locked() >= 4
+    assert j_adapt._jitter[101]._effective_target_locked() == 2, "Adaptación debe aislarse por usuario"
+
+    # Recuperación no destructiva: 4 paquetes perdidos mientras esperan 306 y 307 debe saltar a 306 sin vaciar
+    j_gap = VoiceAudioMixer()
+    j_gap.push_opus(303, 300, b"\x64\x00op", decoder_factory=_MockOpusDec, now=t0)
+    j_gap.push_opus(303, 301, b"\x6e\x00op", decoder_factory=_MockOpusDec, now=t0 + 0.02)
+    j_gap.push_opus(303, 306, b"\x96\x00op", decoder_factory=_MockOpusDec, now=t0 + 0.04)
+    j_gap.push_opus(303, 307, b"\xa0\x00op", decoder_factory=_MockOpusDec, now=t0 + 0.06)
+    gap_vals = [
+        struct.unpack_from("<h", j_gap.mix_frame(now=t0 + k * 0.02), 0)[0]
+        for k in range(6)
+    ]
+    assert 150 in gap_vals and 160 in gap_vals, f"Debe recuperar paquetes futuros tras hueco sin vaciarlos: {gap_vals}"
+
+    # OPUS_SILENCE debe terminar limpiamente sin sintetizar PLC robótico después del último paquete
+    j_dtx = VoiceAudioMixer()
+    j_dtx.push_opus(404, 400, b"\x50\x00op", decoder_factory=_MockOpusDec, now=t0)
+    j_dtx.push_opus(404, 401, b"\x5a\x00op", decoder_factory=_MockOpusDec, now=t0 + 0.02)
+    j_dtx.push_opus(404, 402, _OPUS_SILENCE, decoder_factory=_MockOpusDec, now=t0 + 0.04)
+    dtx_f1 = struct.unpack_from("<h", j_dtx.mix_frame(now=t0 + 0.02), 0)[0]
+    dtx_f2 = struct.unpack_from("<h", j_dtx.mix_frame(now=t0 + 0.04), 0)[0]
+    dtx_f3 = j_dtx.mix_frame(now=t0 + 0.06)
+    assert (dtx_f1, dtx_f2) == (80, 90) and dtx_f3 == SILENCE_PCM, (
+        "Al recibir OPUS_SILENCE no debe sintetizar PLC robótico tras vaciar la cola"
+    )
+    j_adapt.clear()
+    j_gap.clear()
+    j_dtx.clear()
+    decoded_order.clear()
 
     out_vals = []
     for step in range(5):
@@ -4608,12 +4776,14 @@ from types import ModuleType as _ModType
 from swiftplay.discord_worker import AudioEngine, VoiceAudioMixer, resolve_device_candidates
 
 _FakeStreamLog = []
+_FakeLatencyLog = []
 
 class _FakeAudioStream:
-    def __init__(self, device=None, **_kwargs):
+    def __init__(self, device=None, **kwargs):
         self.device = device
         self.active = True
         _FakeStreamLog.append(device)
+        _FakeLatencyLog.append(kwargs.get("latency"))
     def start(self):
         return None
     def stop(self):
@@ -4648,7 +4818,23 @@ try:
     assert in_cands == [3, 2, 1, None], f"Prioridad HostAPI inesperada: {in_cands}"
     assert resolve_device_candidates("", "input") == [None]
 
+    # Verificar que si WASAPI reporta dispositivo predeterminado, "" prioriza WASAPI antes que MME
+    _prev_apis_fn = _fake_sd.query_hostapis
+    try:
+        _fake_sd.query_hostapis = lambda: [
+            {"name": "MME", "default_input_device": 2, "default_output_device": 4},
+            {"name": "Windows WASAPI", "default_input_device": 3, "default_output_device": 5},
+        ]
+        assert resolve_device_candidates("", "input") == [3, None]
+        assert resolve_device_candidates("", "output") == [5, None]
+    finally:
+        _fake_sd.query_hostapis = _prev_apis_fn
+
+    from swiftplay.discord_worker import MicProcessor as _LowLatMicProc
+    assert _LowLatMicProc()._preroll.maxlen == 1, "MicProcessor debe usar preroll=1 para evitar ráfagas TX"
+
     _FakeStreamLog.clear()
+    _FakeLatencyLog.clear()
     eng_test = AudioEngine(
         mixer=VoiceAudioMixer(),
         on_send_pcm=lambda _b: None,
@@ -4668,6 +4854,7 @@ try:
     assert eng_test.check_and_recover_streams(now=10.5) == (False, False)
     rec_in, rec_out = eng_test.check_and_recover_streams(now=11.5)
     assert rec_in is True and rec_out is True, f"Debe recuperar streams sin callbacks: {(rec_in, rec_out)}"
+    assert 0.02 in _FakeLatencyLog, f"AudioEngine debe intentar abrir con latency=0.02 (30ms WASAPI): {_FakeLatencyLog}"
     assert eng_test._in_candidate_skip == 1 and eng_test._out_candidate_skip == 1
     assert 2 in _FakeStreamLog and 4 in _FakeStreamLog, f"Debe caer a MME en recuperación: {_FakeStreamLog}"
 
@@ -4690,6 +4877,33 @@ try:
         "Recuperación a mitad de llamada no debe rotar de dispositivo funcional"
     )
     eng_test.close()
+
+    # Verificar protección real-time de proceso/hilo Windows contra carga pesada de juegos/apps
+    if _sys.platform == "win32":
+        import ctypes as _rt_ct
+        from ctypes import wintypes as _rt_wt
+        from swiftplay.windows_os import (
+            register_mmcss_audio_thread as _reg_mmcss,
+            revert_mmcss_audio_thread as _rev_mmcss,
+            set_realtime_audio_process_priority as _set_rt_prio,
+        )
+
+        _k32 = _rt_ct.windll.kernel32
+        _k32.GetCurrentProcess.restype = _rt_wt.HANDLE
+        _k32.GetPriorityClass.argtypes = [_rt_wt.HANDLE]
+        _k32.GetPriorityClass.restype = _rt_wt.DWORD
+        _hproc = _k32.GetCurrentProcess()
+        try:
+            assert _set_rt_prio(True) is True
+            assert _k32.GetPriorityClass(_hproc) == 0x00000080
+            assert _sys.getswitchinterval() <= 0.0025
+            _mh = _reg_mmcss("Pro Audio", high_priority=True)
+            assert _mh != 0, "AvSetMmThreadCharacteristicsW('Pro Audio') debe registrar el hilo"
+            _rev_mmcss(_mh)
+        finally:
+            _set_rt_prio(False)
+            assert _k32.GetPriorityClass(_hproc) == 0x00000020
+            assert _sys.getswitchinterval() >= 0.0045
 finally:
     if _prev_sd is None:
         _sys.modules.pop("sounddevice", None)
@@ -5127,6 +5341,7 @@ print("SCREEN_SHARE_RELAY_OK")
 
     _wp_clients: dict[str, tuple[object, dict[str, object]]] = {}
     _wp_rooms: dict[tuple[str, str], set[str]] = {}
+    _wp_inbox: dict[str, list[dict[str, object]]] = {}
     _wp_ready = _wp_threading.Event()
     _wp_port_box = [0]
     _wp_srv_stop: _wp_asyncio.Event | None = None
@@ -5176,6 +5391,8 @@ print("SCREEN_SHARE_RELAY_OK")
                     for oc, (ows, oi) in list(_wp_clients.items()):
                         if oc != code and code in oi["friends"]:
                             await ows.send(json.dumps({"type": "friend_state", "friend": _snap(code)}))
+                    for queued_dm in _wp_inbox.pop(code, []):
+                        await ws.send(json.dumps({"type": "dm_message", "message": queued_dm}))
                 elif t in ("set_friends", "refresh_friends"):
                     if t == "set_friends":
                         info["friends"] = list(msg.get("friends") or [])
@@ -5235,6 +5452,30 @@ print("SCREEN_SHARE_RELAY_OK")
                             "allow_guest_control": hi["allow_guest_control"],
                             "members": [{"code": m} for m in sorted(room)],
                         }))
+                elif t == "direct_message":
+                    to = str(msg.get("to") or "").upper()
+                    cid = str(msg.get("client_id") or "")
+                    text = str(msg.get("text") or "").strip()
+                    if to not in info["friends"]:
+                        await ws.send(json.dumps({"type": "dm_ack", "client_id": cid, "to_code": to, "ok": False, "error": "not_friend"}))
+                        continue
+                    dm_payload = {
+                        "id": cid or "dm_1",
+                        "from_code": code,
+                        "from_name": info["name"],
+                        "from_avatar_url": "",
+                        "to_code": to,
+                        "text": text,
+                        "ts": _wp_time.time(),
+                    }
+                    delivered = False
+                    if to in _wp_clients:
+                        tws, _ = _wp_clients[to]
+                        await tws.send(json.dumps({"type": "dm_message", "message": dm_payload}))
+                        delivered = True
+                    else:
+                        _wp_inbox.setdefault(to, []).append(dm_payload)
+                    await ws.send(json.dumps({"type": "dm_ack", "client_id": dm_payload["id"], "to_code": to, "ok": True, "delivered": delivered, "queued": not delivered}))
         finally:
             _wp_clients.pop(code, None)
             for oc, (ows, oi) in list(_wp_clients.items()):
@@ -5374,6 +5615,63 @@ print("SCREEN_SHARE_RELAY_OK")
                 app.processEvents()
             _wp_time.sleep(0.05)
         assert b_snaps, "request_refresh() debe obtener un friends_snapshot actualizado"
+
+        # Mensajería directa WatchParty E2E (online + not_friend + buzón offline al reconectar)
+        a_acks: list[dict] = []
+        b_dms: list[dict] = []
+        wp_a.direct_message_ack.connect(a_acks.append)
+        wp_b.direct_message_received.connect(b_dms.append)
+        cid_live = wp_a.send_direct_message("BETA-2222", "Hola en vivo!")
+        assert cid_live
+        deadline = _wp_time.monotonic() + 3.0
+        while _wp_time.monotonic() < deadline and (not b_dms or not a_acks):
+            if app is not None:
+                app.processEvents()
+            _wp_time.sleep(0.05)
+        assert b_dms and b_dms[-1]["text"] == "Hola en vivo!" and b_dms[-1]["from_code"] == "ALFA-1111"
+        assert a_acks and a_acks[-1]["ok"] and a_acks[-1]["delivered"] is True
+
+        # Rechazo si no es amigo agregado
+        wp_a.send_direct_message("NOPE-9999", "No amigo")
+        deadline = _wp_time.monotonic() + 3.0
+        while _wp_time.monotonic() < deadline and len(a_acks) < 2:
+            if app is not None:
+                app.processEvents()
+            _wp_time.sleep(0.05)
+        assert len(a_acks) >= 2 and not a_acks[-1]["ok"] and a_acks[-1]["error"] == "not_friend"
+
+        # Entrega diferida por buzón offline cuando wp_b se desconecta y reconecta
+        wp_b.stop()
+        _wp_time.sleep(0.1)
+        wp_a.send_direct_message("BETA-2222", "Mensaje mientras estabas offline")
+        deadline = _wp_time.monotonic() + 3.0
+        while _wp_time.monotonic() < deadline and len(a_acks) < 3:
+            if app is not None:
+                app.processEvents()
+            _wp_time.sleep(0.05)
+        assert a_acks[-1]["ok"] and a_acks[-1]["queued"] is True
+
+        wp_b2 = WatchPartyService()
+        b2_dms: list[dict] = []
+        wp_b2.direct_message_received.connect(b2_dms.append)
+        try:
+            wp_b2.configure_and_start(
+                enabled=True,
+                relay_url=relay_url,
+                code="BETA-2222",
+                secret="fedcba9876543210fedcba9876543210",
+                display_name="Finz",
+                friend_codes=["ALFA-1111"],
+                allow_guest_control=True,
+            )
+            deadline = _wp_time.monotonic() + 4.0
+            while _wp_time.monotonic() < deadline and not b2_dms:
+                if app is not None:
+                    app.processEvents()
+                _wp_time.sleep(0.05)
+            assert b2_dms and b2_dms[0]["text"] == "Mensaje mientras estabas offline"
+        finally:
+            wp_b2.stop()
     finally:
         wp_b.stop()
         wp_a.stop()

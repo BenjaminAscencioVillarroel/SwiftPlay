@@ -316,6 +316,7 @@ class MainWindow(QMainWindow):
         self._wp_guest_decks: set[str] = set()
         self._wp_restore_pending: dict[str, dict[str, Any]] = {}
         self._wp_restore_active_deck: Literal["video", "music"] | None = None
+        self._wp_unread_by_code: dict[str, int] = {}
         self._last_discord_speak_ts: float = 0.0
         QPixmapCache.setCacheLimit(1024)
         self.thumb_cache = ThumbnailCache(max_items=24, parent=self)
@@ -760,8 +761,17 @@ class MainWindow(QMainWindow):
         )
         wp_nav_lay = QHBoxLayout(self.nav_watchparty)
         wp_nav_lay.setContentsMargins(0, 0, 8, 0)
-        wp_nav_lay.setSpacing(0)
+        wp_nav_lay.setSpacing(4)
         wp_nav_lay.addStretch(1)
+
+        self.wp_nav_msg_badge = QLabel("0")
+        self.wp_nav_msg_badge.setObjectName("WatchPartyUnreadBadge")
+        self.wp_nav_msg_badge.setFixedHeight(18)
+        self.wp_nav_msg_badge.setMinimumWidth(18)
+        self.wp_nav_msg_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.wp_nav_msg_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.wp_nav_msg_badge.setVisible(False)
+        wp_nav_lay.addWidget(self.wp_nav_msg_badge, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.wp_nav_eye_badge = QFrame(self.nav_watchparty)
         self.wp_nav_eye_badge.setObjectName("WatchPartyEyeBadge")
@@ -3041,6 +3051,12 @@ class MainWindow(QMainWindow):
 
     def _on_discord_notification_clicked(self, payload: dict) -> None:
         self.restore_window()
+        if isinstance(payload, dict) and payload.get("kind") == "watchparty_dm":
+            self._switch_page(self.PAGE_WATCHPARTY)
+            fc = str(payload.get("target_id") or "").strip().upper()
+            if fc:
+                self._on_watchparty_chat_opened(fc)
+            return
         self._switch_page(self.PAGE_DISCORD)
         if payload:
             self.discord_panel.open_notification_target(payload)
@@ -3453,6 +3469,10 @@ class MainWindow(QMainWindow):
                 self.search_input.setPlaceholderText("Buscar videos en YouTube... [Ctrl+L]")
                 self.watchparty_panel.refresh_from_config(self.watchparty_svc.connection_state)
                 self.watchparty_svc.request_refresh()
+                active_chat = self.watchparty_panel.active_chat_code
+                if active_chat and self._wp_unread_by_code.pop(active_chat, 0) > 0:
+                    self._refresh_watchparty_unread_ui()
+                self._sync_active_wp_chat_status()
             elif page_idx == self.PAGE_TWITCH or is_twitch_player:
                 self._search_mode = "twitch"
                 self.search_input.setPlaceholderText(
@@ -6268,6 +6288,8 @@ class MainWindow(QMainWindow):
         svc.party_members_updated.connect(self._on_watchparty_members_updated)
         svc.party_notice.connect(self.show_toast)
         svc.lookup_result.connect(self._on_watchparty_lookup_result)
+        svc.direct_message_received.connect(self._on_watchparty_dm_received)
+        svc.direct_message_ack.connect(self._on_watchparty_dm_ack)
 
         pnl.join_party_requested.connect(self._on_watchparty_join_requested)
         pnl.leave_party_requested.connect(self._leave_watchparty_deck)
@@ -6275,6 +6297,8 @@ class MainWindow(QMainWindow):
         pnl.remove_friend_requested.connect(self._on_watchparty_remove_friend_requested)
         pnl.refresh_requested.connect(self._on_watchparty_refresh_requested)
         pnl.config_changed.connect(self._on_watchparty_config_changed)
+        pnl.chat_opened.connect(self._on_watchparty_chat_opened)
+        pnl.send_message_requested.connect(self._on_watchparty_send_message)
         pnl.overlay_settings_changed.connect(self._sync_discord_overlay)
         pnl.overlay_preview_requested.connect(
             lambda op: self.discord_overlay.preview(op, overlay_mode=self.cfg.discord_overlay_mode)
@@ -6338,6 +6362,7 @@ class MainWindow(QMainWindow):
     def _on_watchparty_connection_changed(self, state: str, detail: str) -> None:
         if hasattr(self, "watchparty_panel"):
             self.watchparty_panel.set_connection_state(state, detail)
+            self._sync_active_wp_chat_status()
         if state == "connected":
             self._on_watchparty_presence_tick(force=True)
         elif state in ("disconnected", "error"):
@@ -6368,6 +6393,7 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "watchparty_panel"):
             self.watchparty_panel.set_friends_data(friends)
+            self._sync_active_wp_chat_status()
         self._sync_watchparty_bar()
 
     def _on_watchparty_add_friend_requested(self, raw_code: str) -> None:
@@ -6424,8 +6450,196 @@ class MainWindow(QMainWindow):
         self.watchparty_svc.set_friends(
             [str(f.get("code") or "").upper() for f in self.cfg.watchparty_friends]
         )
+        self._wp_unread_by_code.pop(code, None)
+        if hasattr(self, "watchparty_panel") and self.watchparty_panel.active_chat_code == code:
+            self.watchparty_panel.close_chat()
+        self._refresh_watchparty_unread_ui()
         self.watchparty_panel.set_friends_data(self.watchparty_svc.friends_snapshot)
         self._sync_watchparty_bar()
+
+    # ------------------------------------------------------------------
+    # WatchParty Direct Messaging (chat entre amigos agregados)
+    # ------------------------------------------------------------------
+
+    def _wp_friend_online_and_name(self, friend_code: str) -> tuple[str, bool, str]:
+        fc = str(friend_code or "").strip().upper()
+        name = fc
+        online = False
+        avatar_url = ""
+        for f in self.watchparty_svc.friends_snapshot:
+            if str(f.get("code") or "").strip().upper() == fc:
+                nm = str(f.get("name") or "").strip()
+                if nm:
+                    name = nm
+                st = str(f.get("status") or "offline").lower()
+                online = st != "offline"
+                avatar_url = str(f.get("avatar_url") or "").strip()
+                break
+        if name == fc or not avatar_url:
+            for entry in self.cfg.watchparty_friends or []:
+                if isinstance(entry, dict) and str(entry.get("code") or "").strip().upper() == fc:
+                    if name == fc:
+                        nm = str(entry.get("name") or "").strip()
+                        if nm:
+                            name = nm
+                    if not avatar_url:
+                        avatar_url = str(entry.get("avatar_url") or "").strip()
+                    break
+        return name, online, avatar_url
+
+    def _refresh_watchparty_unread_ui(self) -> None:
+        clean = {
+            str(k).upper(): int(v)
+            for k, v in self._wp_unread_by_code.items()
+            if int(v or 0) > 0
+        }
+        self._wp_unread_by_code = clean
+        if hasattr(self, "watchparty_panel"):
+            self.watchparty_panel.set_unread_counts(clean)
+        total = sum(clean.values())
+        if hasattr(self, "wp_nav_msg_badge"):
+            self.wp_nav_msg_badge.setText("99+" if total > 99 else str(total))
+            self.wp_nav_msg_badge.setVisible(total > 0)
+
+    def _sync_active_wp_chat_status(self) -> None:
+        if not hasattr(self, "watchparty_panel"):
+            return
+        fc = self.watchparty_panel.active_chat_code
+        if not fc:
+            return
+        name, online, _ = self._wp_friend_online_and_name(fc)
+        self.watchparty_panel.sync_chat_peer_status(
+            name,
+            online=online,
+            connected=self.watchparty_svc.is_connected,
+        )
+
+    def _on_watchparty_chat_opened(self, friend_code: str) -> None:
+        fc = str(friend_code or "").strip().upper()
+        if not fc:
+            return
+        self._wp_unread_by_code.pop(fc, None)
+        self._refresh_watchparty_unread_ui()
+        msgs = self.db.list_watchparty_dm_messages(fc, limit=100)
+        name, online, _ = self._wp_friend_online_and_name(fc)
+        self.watchparty_panel.open_chat_for(
+            fc,
+            msgs,
+            friend_name=name,
+            online=online,
+            connected=self.watchparty_svc.is_connected,
+        )
+
+    def _on_watchparty_send_message(self, friend_code: str, text: str) -> None:
+        fc = str(friend_code or "").strip().upper()
+        body = str(text or "").strip()
+        if not fc or not body:
+            return
+        known = {
+            str(f.get("code") or "").strip().upper()
+            for f in (self.cfg.watchparty_friends or [])
+            if isinstance(f, dict) and f.get("code")
+        }
+        if fc not in known:
+            self.show_toast("Solo puedes enviar mensajes a amigos agregados en WatchParty.")
+            return
+        if not self.watchparty_svc.is_connected:
+            self.show_toast("Conecta el servidor WatchParty para enviar mensajes.")
+            return
+
+        cid = self.watchparty_svc.send_direct_message(fc, body)
+        if not cid:
+            return
+        my_code = str(self.cfg.watchparty_code or "").strip().upper()
+        my_name, _ = self._watchparty_identity()
+        now_ts = time.time()
+        msg = {
+            "id": cid,
+            "friend_code": fc,
+            "sender_code": my_code,
+            "sender_name": my_name or my_code,
+            "is_self": True,
+            "content": body,
+            "timestamp": time.strftime("%H:%M", time.localtime(now_ts)),
+            "created_ts": now_ts,
+        }
+        self.db.save_watchparty_dm_message(fc, msg)
+        self.watchparty_panel.append_chat_message(fc, msg)
+
+    def _on_watchparty_dm_received(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+        from_code = str(data.get("from_code") or "").strip().upper()
+        body = str(data.get("text") or "").strip()
+        my_code = str(self.cfg.watchparty_code or "").strip().upper()
+        if not from_code or not body or from_code == my_code:
+            return
+        try:
+            ts_val = float(data.get("ts") or time.time())
+        except (TypeError, ValueError):
+            ts_val = time.time()
+
+        known_name, _, known_av = self._wp_friend_online_and_name(from_code)
+        sender_name = str(data.get("from_name") or "").strip() or known_name or from_code
+        av_url = str(data.get("from_avatar_url") or "").strip() or known_av
+        msg = {
+            "id": str(data.get("id") or "").strip(),
+            "friend_code": from_code,
+            "sender_code": from_code,
+            "sender_name": sender_name,
+            "is_self": False,
+            "content": body,
+            "timestamp": time.strftime("%H:%M", time.localtime(ts_val)),
+            "created_ts": ts_val,
+        }
+        self.db.save_watchparty_dm_message(from_code, msg)
+
+        if self.watchparty_panel.is_viewing_chat(from_code):
+            self.watchparty_panel.append_chat_message(from_code, msg)
+
+        viewing_on_screen = (
+            self.isVisible()
+            and not self.isMinimized()
+            and self.isActiveWindow()
+            and self.stack.currentIndex() == self.PAGE_WATCHPARTY
+            and self.watchparty_panel.is_viewing_chat(from_code)
+        )
+        if not viewing_on_screen:
+            if not (
+                self.stack.currentIndex() == self.PAGE_WATCHPARTY
+                and self.watchparty_panel.is_viewing_chat(from_code)
+            ):
+                self._wp_unread_by_code[from_code] = (
+                    int(self._wp_unread_by_code.get(from_code, 0)) + 1
+                )
+                self._refresh_watchparty_unread_ui()
+            if self.cfg.discord_notify_chat_enabled:
+                self.play_discord_sound("message")
+                if self.isVisible():
+                    flash_window_taskbar(int(self.winId()), count=3)
+                if hasattr(self, "discord_notif_toast"):
+                    self.discord_notif_toast.show_notification(
+                        sender_name,
+                        body,
+                        header_text=f"{APP_NAME} · WatchParty",
+                        avatar_url=av_url,
+                        payload={
+                            "kind": "watchparty_dm",
+                            "target_id": from_code,
+                            "title": sender_name,
+                            "avatar_url": av_url,
+                        },
+                    )
+
+    def _on_watchparty_dm_ack(self, ack: dict) -> None:
+        if not isinstance(ack, dict):
+            return
+        if not ack.get("ok", True):
+            err = str(ack.get("error") or "")
+            if err == "not_friend":
+                self.show_toast("Solo puedes enviar mensajes a amigos que tengas agregados.")
+            elif err == "invalid_target":
+                self.show_toast("Destinatario de WatchParty inválido.")
 
     def _on_watchparty_join_requested(self, host_code: str, deck: str) -> None:
         if not self.watchparty_svc.is_connected:

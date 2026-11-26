@@ -14,6 +14,39 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-26 (2) — Mensajería Directa 1-a-1 entre Amigos de WatchParty
+- **Files:** `watchparty_relay/src/index.js`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/storage.py`, `src/swiftplay/ui/icons.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/watchparty_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Relay WatchParty + Buzón Offline (`watchparty_relay/src/index.js`):** Añadido soporte `direct_message` validando que el destinatario pertenezca a `att.friends`; entrega instantánea `dm_message` si está conectado o almacenamiento acotado en `inbox:<code>` (`ctx.storage`, últimos 50 mensajes) que se vacía al reconectar en `hello`, con confirmación `dm_ack` al remitente.
+  - **Servicio y Persistencia (`watchparty_service.py`, `storage.py`):** Agregadas señales `direct_message_received` / `direct_message_ack` y `send_direct_message(...)`, junto con la tabla SQLite `watchparty_dm_messages` en `library.db` (deduplicación por `msg_key` e historial acotado a 150 mensajes por amigo).
+  - **UI de Chat y Notificaciones (`watchparty_panel.py`, `main_window.py`, `themes.py`, `icons.py`):** Botón **Chat** (con contador de no leídos) en cada tarjeta de amigo, panel lateral colapsable de conversación con estado en línea y aviso de entrega offline, badge rojo en `nav_watchparty` y notificación flotante clickeable que abre directamente el chat del amigo.
+- **Verified:** `node --check watchparty_relay/src/index.js`, `py_compile`, `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+## 2026-11-26 — Protección Real-Time de Voz Discord ante Picos Pesados de CPU/RAM/Disco
+- **Files:** `src/swiftplay/windows_os.py`, `src/swiftplay/discord_worker.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Causa del audio robótico al abrir juegos pesados o Antigravity:** Durante llamadas activas (`in_call=True`), `_housekeeping_loop` seguía ejecutando `trim_process_memory` cada 60 s (`ws > 65.0`) expulsando las páginas de DeepFilterNet3 + Silero + Opus a memoria paginada (`138 MB`), mientras el proceso corría en prioridad normal sujeto a EcoQoS y sin MMCSS `"Pro Audio"`, provocando hard page faults y starve de callbacks bajo carga pesada de CPU/RAM/disco.
+  - **Scheduling real-time Windows (`windows_os.py`):** Añadidos `set_realtime_audio_process_priority` (`HIGH_PRIORITY_CLASS`, desactivación de Windows 11 EcoQoS vía `SetProcessInformation`, `timeBeginPeriod(1)`, `sys.setswitchinterval(0.002)`) y `register_mmcss_audio_thread("Pro Audio")` / `revert_mmcss_audio_thread`.
+  - **Protección en llamada y recuperación de backlog (`discord_worker.py`):** Desactivado `trim_process_memory` mientras haya llamada activa (`_housekeeping_loop` y `warmup`), agregado margen WASAPI equilibrado de `0.02` (30 ms reales con caída a `"low"` / `0.03–0.035`), y drenaje automático de backlog viejo de captura tras micro-cuelgues del SO en `_mic_sender_loop`.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+## 2026-11-25 (3) — Jitter Buffer Adaptativo por Usuario para Voz Cortada/Robótica en Espectadores
+- **Files:** `src/swiftplay/discord_worker.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Causa del audio cortado/robótico en usuarios específicos (ej. espectadores de tu directo):** Con el tope rígido previo (`prefill=2`, descarte tras 3 paquetes faltantes que hacía `_packets.clear()`, y `SO_RCVBUF` UDP por defecto bajo carga paralela de `cloudflared`), los usuarios cuya red sufre ráfagas/jitter al descargar el video compartían exactamente el mismo margen mínimo de `40 ms`, provocando underruns encadenados, PLC robótico y vaciado repetido de paquetes futuros ya recibidos.
+  - **Jitter buffer adaptativo aislado por `UserJitterBuffer`:** Medición de jitter EWMA (RFC 3550) y refuerzo dinámico ante llegadas tardías/underruns (`target = 2..6` frames) solo para ese participante — amigos sin jitter siguen en `2` frames (`28 ms`), mientras espectadores con jitter suben suavemente a `80–120 ms` con tope duro/drift adaptativo (`hard_cap = eff_target + 3`).
+  - **Recuperación no destructiva + fin limpio DTX + buffers UDP:** Al perderse 2–3 paquetes habiendo paquetes futuros en cola, `pop_pcm` salta al siguiente paquete válido sin ejecutar `self._packets.clear()`; `OPUS_SILENCE` cierra limpiamente sin PLC robótico; PLC consecutivo atenúa suavemente (`0.72` / `0.40`); y `SwiftVoiceClient.connect` amplía `SO_RCVBUF` a `256 KiB` / `SO_SNDBUF` a `128 KiB`.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
+## 2026-11-25 (2) — Reducción de Latencia / Delay en Voz de Discord
+- **Files:** `src/swiftplay/discord_worker.py`, `src/swiftplay/ui/discord_panel.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **WASAPI baja latencia por defecto y en apertura de streams (`discord_worker.py`):** `resolve_device_candidates("", kind)` ahora prioriza el dispositivo predeterminado de **Windows WASAPI** antes que MME `[None]` cuando está disponible, y `AudioEngine` abre `RawInputStream` / `RawOutputStream` con `latency="low"` (22 ms reales entrada/salida con 0 xruns en WASAPI vs 50 ms + 70 ms anteriores, con respaldo numérico 30–35 ms) y `_mic_queue(maxsize=4)`.
+  - **Eliminación de ráfaga TX en `MicProcessor`:** `preroll_frames` reducido de `4` (80 ms) a `1` (20 ms) y apertura anticipada en `ai`/`ai_max` por `lsnr_db` para evitar enviar 5 paquetes juntos al inicio de cada frase (que desplazaba la conversación e inflaba el jitter buffer remoto). Ventana `VoiceModifierDsp._win_len` reducida de `1344` a `960` muestras (20 ms).
+  - **Jitter Buffer RX rápido con compensación de deriva (`UserJitterBuffer`):** `prefill_frames` reducido de `3` (55 ms) a `2` (28 ms), límite máximo ajustado y drenaje automático suave ante acumulación sostenida (`>= 3` paquetes durante 12 ticks).
+  - **UI (`discord_panel.py`):** Renombrado `"Estándar (WebRTC)"` a `"Baja latencia (WebRTC)"` con tooltip explicativo.
+- **Verified:** `py_compile` + `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
 ## 2026-11-25 — Perfil de Artista en YT Music, Sync de Cola WatchParty Music y Fallback `android` en `yt-dlp`
 - **Files:** `src/swiftplay/ytdlp_worker.py`, `src/swiftplay/models.py`, `src/swiftplay/youtube_service.py`, `src/swiftplay/ui/widgets.py`, `src/swiftplay/ui/music_player_panel.py`, `src/swiftplay/ui/main_window.py`, `watchparty_relay/src/index.js`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**
