@@ -1370,8 +1370,8 @@ def build_stylesheet(theme_key: str = "matte_silver", notify_color: str = "purpl
     }}
 
     QLabel#WatchPartyUnreadBadge {{
-        background-color: #EF4444;
-        color: #FFFFFF;
+        background-color: {p.accent};
+        color: {p.accent_text};
         border: none;
         border-radius: 9px;
         padding: 0px 5px;

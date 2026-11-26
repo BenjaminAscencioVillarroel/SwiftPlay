@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 APP_NAME = "SwiftPlay"
+RESTART_EXIT_CODE = 88
 
 
 def parse_profile_name(

@@ -86,6 +86,7 @@ class DiscordMessageToast(QWidget):
         self._author_name: str = ""
         self._payload: dict[str, Any] = {}
         self._fading_out: bool = False
+        self._use_theme_accent: bool = False
         self._target_pos = QPoint(0, 0)
 
         if self._thumb_cache is not None:
@@ -177,8 +178,9 @@ class DiscordMessageToast(QWidget):
 
     def _apply_colors(self) -> None:
         nc = self._notify_spec
+        hdr_color = self._palette.accent if self._use_theme_accent else self._palette.text
         self.header_lbl.setStyleSheet(
-            f"background-color: transparent; color: {self._palette.text}; font-size: 12px; font-weight: 600;"
+            f"background-color: transparent; color: {hdr_color}; font-size: 12px; font-weight: 600;"
         )
         self.author_lbl.setStyleSheet(
             f"background-color: transparent; color: {self._palette.text}; font-size: 14px; font-weight: 700;"
@@ -263,6 +265,14 @@ class DiscordMessageToast(QWidget):
                 return
         self.avatar_lbl.setPixmap(QPixmap())
         initial = (self._author_name.strip()[:1] or "D").upper()
+        if self._use_theme_accent:
+            self.avatar_lbl.setText(initial)
+            self.avatar_lbl.setStyleSheet(
+                f"background-color: {self._palette.active_bg}; color: {self._palette.text}; "
+                f"border: 1.5px solid {self._palette.accent}; border-radius: 24px; "
+                "font-size: 18px; font-weight: 700;"
+            )
+            return
         tint = _initial_tint(self._author_name)
         self.avatar_lbl.setText(initial)
         self.avatar_lbl.setStyleSheet(
@@ -291,10 +301,14 @@ class DiscordMessageToast(QWidget):
         avatar_url: str = "",
         payload: dict[str, Any] | None = None,
         duration_ms: int = 5000,
+        use_theme_accent: bool = False,
     ) -> None:
         clean_author = str(author_name or APP_NAME).strip() or APP_NAME
         clean_preview = str(preview or "").replace("\r", " ").replace("\n", " ").strip() or "Nuevo mensaje"
         clean_hdr = str(header_text or APP_NAME).strip() or APP_NAME
+
+        self._use_theme_accent = bool(use_theme_accent)
+        self._apply_colors()
 
         self._author_name = clean_author
         self._avatar_url = str(avatar_url or "").strip()
@@ -421,14 +435,18 @@ class DiscordMessageToast(QWidget):
         bg.setAlpha(246)
         painter.setBrush(bg)
 
-        border = QColor(self._palette.border_bright)
-        painter.setPen(QPen(border, 1.2))
+        border = QColor(self._palette.accent if self._use_theme_accent else self._palette.border_bright)
+        if self._use_theme_accent:
+            border.setAlpha(205)
+        painter.setPen(QPen(border, 1.5 if self._use_theme_accent else 1.2))
         painter.drawRoundedRect(rect, 12.0, 12.0)
 
-        # Sutil franja superior del color de notificación elegido
-        accent = QColor(self._notify_spec.border)
-        accent.setAlpha(150)
+        # Franja superior con acento del tema (para Chats) o color de notificación Discord
+        accent = QColor(self._palette.accent if self._use_theme_accent else self._notify_spec.border)
+        accent.setAlpha(235 if self._use_theme_accent else 150)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(accent)
-        painter.drawRoundedRect(QRectF(14.0, 1.5, 44.0, 2.2), 1.1, 1.1)
+        bar_w = 68.0 if self._use_theme_accent else 44.0
+        bar_h = 3.0 if self._use_theme_accent else 2.2
+        painter.drawRoundedRect(QRectF(14.0, 1.5, bar_w, bar_h), 1.5, 1.5)
         painter.end()

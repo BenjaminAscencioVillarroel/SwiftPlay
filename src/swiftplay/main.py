@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+from collections.abc import Sequence
+from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, Qt
 from PySide6.QtGui import QIcon, QPixmapCache
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
-from swiftplay.paths import APP_NAME, ICON_ICO_PATH, IS_ISOLATED_PROFILE, PROFILE_NAME
+from swiftplay.paths import (
+    APP_NAME,
+    APP_ROOT,
+    ICON_ICO_PATH,
+    IS_ISOLATED_PROFILE,
+    LAUNCH_SCRIPT_PATH,
+    PROFILE_NAME,
+    RESTART_EXIT_CODE,
+)
 from swiftplay.ui.main_window import MainWindow
 from swiftplay.windows_os import (
     allow_set_foreground_window,
@@ -21,6 +33,36 @@ IPC_SERVER_NAME = (
     if IS_ISOLATED_PROFILE
     else "SwiftPlaySingleInstanceIPC"
 )
+
+
+def build_restart_command(argv: Sequence[str] | None = None) -> list[str]:
+    """Construye el comando para relanzar SwiftPlay preservando perfil y modo sin consola."""
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    kept_args: list[str] = []
+    skip_next = False
+    for idx, arg in enumerate(raw_args):
+        if skip_next:
+            skip_next = False
+            continue
+        s = str(arg or "").strip()
+        if s == "--quit":
+            continue
+        if s == "--profile" and idx + 1 < len(raw_args):
+            kept_args.extend([s, str(raw_args[idx + 1])])
+            skip_next = True
+            continue
+        if s.startswith("--profile="):
+            kept_args.append(s)
+
+    exe_path = Path(sys.executable)
+    if sys.platform == "win32" and exe_path.name.lower() == "python.exe":
+        cand = exe_path.with_name("pythonw.exe")
+        if cand.exists():
+            exe_path = cand
+
+    if LAUNCH_SCRIPT_PATH.exists():
+        return [str(exe_path), str(LAUNCH_SCRIPT_PATH), *kept_args]
+    return [str(exe_path), "-m", "swiftplay.main", *kept_args]
 
 
 def _parse_initial_page(argv: list[str]) -> int | None:
@@ -99,6 +141,27 @@ def main() -> int:
     win.show()
     exit_code = app.exec()
     ipc_server.close()
+    QLocalServer.removeServer(IPC_SERVER_NAME)
+
+    if exit_code == RESTART_EXIT_CODE:
+        cmd = build_restart_command(sys.argv[1:])
+        flags = 0
+        if sys.platform == "win32":
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+            )
+        try:
+            subprocess.Popen(
+                cmd,
+                cwd=str(APP_ROOT),
+                creationflags=flags,
+                close_fds=True,
+                env=os.environ.copy(),
+            )
+        except Exception:
+            return 1
+        return 0
+
     return exit_code
 
 

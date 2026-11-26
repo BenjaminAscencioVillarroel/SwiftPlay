@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -100,7 +101,8 @@ class LocalLibrary:
                     is_self INTEGER NOT NULL DEFAULT 0,
                     content TEXT NOT NULL DEFAULT '',
                     timestamp TEXT NOT NULL DEFAULT '',
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    attachment_json TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_wp_dm_friend_created
                     ON watchparty_dm_messages (friend_code, created_at DESC);
@@ -110,6 +112,7 @@ class LocalLibrary:
             for sql in (
                 "ALTER TABLE watch_later ADD COLUMN channel_avatar_url TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE play_history ADD COLUMN last_position REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE watchparty_dm_messages ADD COLUMN attachment_json TEXT NOT NULL DEFAULT ''",
             ):
                 try:
                     self._conn.execute(sql)
@@ -813,11 +816,21 @@ class LocalLibrary:
         if not fc or not isinstance(msg, dict):
             return
         content = str(msg.get("content") or msg.get("text") or "").strip()
-        if not content:
+        raw_att = msg.get("attachment")
+        att_clean: dict | None = None
+        if isinstance(raw_att, dict) and str(raw_att.get("name") or "").strip():
+            att_clean = {
+                "name": str(raw_att.get("name") or "").strip(),
+                "mime": str(raw_att.get("mime") or "application/octet-stream").strip(),
+                "size": int(raw_att.get("size") or 0),
+                "local_path": str(raw_att.get("local_path") or "").strip(),
+            }
+        att_json = json.dumps(att_clean, ensure_ascii=False) if att_clean else ""
+        if not content and not att_json:
             return
         raw_id = str(msg.get("id") or "").strip()
         if not raw_id:
-            raw_id = f"local_{fc}_{int(time.time() * 1000)}_{hash(content) & 0xFFFF}"
+            raw_id = f"local_{fc}_{int(time.time() * 1000)}_{hash(content or att_json) & 0xFFFF}"
         msg_key = f"{fc}:{raw_id}"
         sender_code = str(msg.get("sender_code") or msg.get("from_code") or fc).strip().upper()
         sender_name = str(msg.get("sender_name") or msg.get("from_name") or sender_code).strip()
@@ -832,15 +845,19 @@ class LocalLibrary:
                 """
                 INSERT INTO watchparty_dm_messages (
                     msg_key, friend_code, sender_code, sender_name,
-                    is_self, content, timestamp, created_at
+                    is_self, content, timestamp, created_at, attachment_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(msg_key) DO UPDATE SET
                     sender_name=excluded.sender_name,
                     content=excluded.content,
-                    timestamp=excluded.timestamp
+                    timestamp=excluded.timestamp,
+                    attachment_json=CASE
+                        WHEN excluded.attachment_json != '' THEN excluded.attachment_json
+                        ELSE watchparty_dm_messages.attachment_json
+                    END
                 """,
-                (msg_key, fc, sender_code, sender_name, is_self, content, ts_lbl, created_at),
+                (msg_key, fc, sender_code, sender_name, is_self, content, ts_lbl, created_at, att_json),
             )
             self._conn.execute(
                 """
@@ -862,7 +879,8 @@ class LocalLibrary:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT msg_key, friend_code, sender_code, sender_name, is_self, content, timestamp, created_at
+                SELECT msg_key, friend_code, sender_code, sender_name, is_self,
+                       content, timestamp, created_at, attachment_json
                 FROM watchparty_dm_messages
                 WHERE friend_code = ?
                 ORDER BY created_at DESC
@@ -874,6 +892,15 @@ class LocalLibrary:
             for r in reversed(rows):
                 mk = str(r["msg_key"])
                 raw_id = mk.split(":", 1)[1] if ":" in mk else mk
+                att_obj: dict | None = None
+                raw_aj = str(r["attachment_json"] or "").strip()
+                if raw_aj:
+                    try:
+                        parsed = json.loads(raw_aj)
+                        if isinstance(parsed, dict):
+                            att_obj = parsed
+                    except Exception:
+                        att_obj = None
                 out.append(
                     {
                         "id": raw_id,
@@ -882,6 +909,7 @@ class LocalLibrary:
                         "sender_name": str(r["sender_name"] or ""),
                         "is_self": bool(r["is_self"]),
                         "content": str(r["content"] or ""),
+                        "attachment": att_obj,
                         "timestamp": str(r["timestamp"] or ""),
                         "created_ts": float(r["created_at"] or 0.0),
                     }
@@ -892,7 +920,7 @@ class LocalLibrary:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT m.friend_code, m.content, m.timestamp, m.created_at, m.is_self
+                SELECT m.friend_code, m.content, m.timestamp, m.created_at, m.is_self, m.attachment_json
                 FROM watchparty_dm_messages m
                 INNER JOIN (
                     SELECT friend_code, MAX(created_at) AS max_ts
@@ -907,8 +935,18 @@ class LocalLibrary:
                 fc = str(r["friend_code"] or "").strip().upper()
                 if not fc:
                     continue
+                att_name = ""
+                raw_aj = str(r["attachment_json"] or "").strip()
+                if raw_aj:
+                    try:
+                        parsed = json.loads(raw_aj)
+                        if isinstance(parsed, dict):
+                            att_name = str(parsed.get("name") or "").strip()
+                    except Exception:
+                        att_name = ""
                 out[fc] = {
                     "content": str(r["content"] or ""),
+                    "attachment_name": att_name,
                     "timestamp": str(r["timestamp"] or ""),
                     "created_ts": float(r["created_at"] or 0.0),
                     "is_self": bool(r["is_self"]),

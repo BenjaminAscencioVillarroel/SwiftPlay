@@ -80,6 +80,7 @@ from swiftplay.paths import (
     IS_ISOLATED_PROFILE,
     PROFILE_NAME,
     RAM_LOG_PATH,
+    RESTART_EXIT_CODE,
     SESSION_STATE_PATH,
 )
 from swiftplay.player import MediaPlayer
@@ -835,6 +836,15 @@ class MainWindow(QMainWindow):
         self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.settings_btn.clicked.connect(lambda: self.open_settings(account_tab=False))
         nav_lay.addWidget(self.settings_btn)
+
+        self.restart_btn = QPushButton(" Reiniciar")
+        self.restart_btn.setObjectName("NavBtn")
+        self.restart_btn.setToolTip(
+            "Reiniciar SwiftPlay limpiamente (sin tener que cerrar y abrir Actualizar_Ruta)"
+        )
+        self.restart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.restart_btn.clicked.connect(self.restart_app)
+        nav_lay.addWidget(self.restart_btn)
 
         self.sidebar_scroll.setWidget(nav_container)
         self._sidebar_indicator = _SidebarActiveIndicator(nav_container)
@@ -2445,6 +2455,8 @@ class MainWindow(QMainWindow):
         self.minibar_btn.setIcon(render_icon("mini_bar", p.text2, 16))
         self.shortcuts_btn.setIcon(render_icon("help", p.text2, 16))
         self.settings_btn.setIcon(render_icon("settings", p.text2, 16))
+        if hasattr(self, "restart_btn"):
+            self.restart_btn.setIcon(render_icon("refresh", p.text2, 16))
         self.search_btn.setIcon(render_icon("search", p.text, 16))
         self.back_to_video_btn.setIcon(render_icon("video", p.text, 15))
         self.close_media_btn.setIcon(render_icon("close", "#F87171", 13))
@@ -6658,10 +6670,13 @@ class MainWindow(QMainWindow):
             connected=self.watchparty_svc.is_connected,
         )
 
-    def _on_watchparty_send_message(self, friend_code: str, text: str) -> None:
+    def _on_watchparty_send_message(
+        self, friend_code: str, text: str, attachment_path: str = ""
+    ) -> None:
         fc = str(friend_code or "").strip().upper()
         body = str(text or "").strip()
-        if not fc or not body:
+        att_path = str(attachment_path or "").strip()
+        if not fc or (not body and not att_path):
             return
         known = {
             str(f.get("code") or "").strip().upper()
@@ -6675,9 +6690,17 @@ class MainWindow(QMainWindow):
             self.show_toast("Conecta el servidor WatchParty para enviar mensajes.")
             return
 
-        cid = self.watchparty_svc.send_direct_message(fc, body)
-        if not cid:
-            return
+        att_meta: dict[str, Any] | None = None
+        if att_path:
+            cid, att_meta, err_msg = self.watchparty_svc.send_direct_file_message(fc, att_path, body)
+            if err_msg or not cid:
+                self.show_toast(err_msg or "No se pudo preparar el archivo para enviar.")
+                return
+        else:
+            cid = self.watchparty_svc.send_direct_message(fc, body)
+            if not cid:
+                return
+
         my_code = str(self.cfg.watchparty_code or "").strip().upper()
         my_name, _ = self._watchparty_identity()
         now_ts = time.time()
@@ -6688,6 +6711,7 @@ class MainWindow(QMainWindow):
             "sender_name": my_name or my_code,
             "is_self": True,
             "content": body,
+            "attachment": att_meta,
             "timestamp": time.strftime("%H:%M", time.localtime(now_ts)),
             "created_ts": now_ts,
         }
@@ -6695,7 +6719,7 @@ class MainWindow(QMainWindow):
         self.watchparty_chat_panel.append_chat_message(fc, msg, delivery_status="Enviando...")
         self.watchparty_chat_panel.set_previews(self.db.get_watchparty_dm_previews())
         self._wp_pending_dm_acks[cid] = fc
-        QTimer.singleShot(4500, lambda c=cid: self._on_watchparty_dm_timeout(c))
+        QTimer.singleShot(8000 if att_meta else 4500, lambda c=cid: self._on_watchparty_dm_timeout(c))
 
     def _on_watchparty_dm_timeout(self, client_id: str) -> None:
         if client_id not in self._wp_pending_dm_acks:
@@ -6723,8 +6747,9 @@ class MainWindow(QMainWindow):
             return
         from_code = str(data.get("from_code") or "").strip().upper()
         body = str(data.get("text") or "").strip()
+        att = data.get("attachment") if isinstance(data.get("attachment"), dict) else None
         my_code = str(self.cfg.watchparty_code or "").strip().upper()
-        if not from_code or not body or from_code == my_code:
+        if not from_code or (not body and not att) or from_code == my_code:
             return
         known = {
             str(f.get("code") or "").strip().upper()
@@ -6748,6 +6773,7 @@ class MainWindow(QMainWindow):
             "sender_name": sender_name,
             "is_self": False,
             "content": body,
+            "attachment": att,
             "timestamp": time.strftime("%H:%M", time.localtime(ts_val)),
             "created_ts": ts_val,
         }
@@ -6781,9 +6807,13 @@ class MainWindow(QMainWindow):
                 if self.isVisible():
                     flash_window_taskbar(int(self.winId()), count=3)
                 if hasattr(self, "discord_notif_toast"):
+                    att_name = str((att or {}).get("name") or "").strip()
+                    toast_preview = body or (f"📎 {att_name}" if att_name else "Nuevo mensaje")
+                    if body and att_name:
+                        toast_preview = f"📎 {att_name} · {body}"
                     self.discord_notif_toast.show_notification(
                         sender_name,
-                        body,
+                        toast_preview,
                         header_text=f"{APP_NAME} · Chats",
                         avatar_url=av_url,
                         payload={
@@ -6792,6 +6822,7 @@ class MainWindow(QMainWindow):
                             "title": sender_name,
                             "avatar_url": av_url,
                         },
+                        use_theme_accent=True,
                     )
 
     def _on_watchparty_dm_ack(self, ack: dict) -> None:
@@ -6811,6 +6842,12 @@ class MainWindow(QMainWindow):
             self.show_toast("Solo puedes enviar mensajes a amigos que tengas agregados.")
         elif err == "invalid_target":
             self.show_toast("Destinatario de WatchParty inválido.")
+        elif err == "invalid_file":
+            self.show_toast("El archivo adjunto es inválido o supera el límite de 8 MB.")
+        elif err == "peer_offline_large_file":
+            self.show_toast(
+                "Tu amigo está desconectado: archivos de más de 80 KB solo se envían cuando esté en línea."
+            )
 
     def _on_watchparty_join_requested(self, host_code: str, deck: str) -> None:
         if not self.watchparty_svc.is_connected:
@@ -8639,6 +8676,19 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.quit()
+
+    def restart_app(self) -> None:
+        """Guarda el estado actual y reinicia SwiftPlay limpiamente."""
+        self.persist_session_state(force=True)
+        try:
+            save_config(self.cfg)
+        except Exception:
+            pass
+        self._force_quit = True
+        self._cleanup_before_exit()
+        app = QApplication.instance()
+        if app is not None:
+            app.exit(RESTART_EXIT_CODE)
 
     def nativeEvent(self, eventType, message):
         if is_win32_disabled_parent_click(message):

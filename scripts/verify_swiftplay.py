@@ -274,14 +274,17 @@ def test_storage_config_themes() -> None:
                 "sender_name": "Yo",
                 "is_self": True,
                 "content": "Dale",
+                "attachment": {"name": "clip.png", "mime": "image/png", "size": 2048, "local_path": "C:/temp/clip.png"},
                 "timestamp": "22:02",
                 "created_ts": 101.0,
             },
         )
         wp_msgs = db.list_watchparty_dm_messages("FINZ-1111")
         assert len(wp_msgs) == 2 and wp_msgs[0]["content"] == "¿Vemos algo ahora?" and wp_msgs[1]["is_self"]
+        assert wp_msgs[1].get("attachment") and wp_msgs[1]["attachment"]["name"] == "clip.png"
         wp_prevs = db.get_watchparty_dm_previews()
         assert wp_prevs.get("FINZ-1111", {}).get("content") == "Dale"
+        assert wp_prevs.get("FINZ-1111", {}).get("attachment_name") == "clip.png"
         assert wp_prevs.get("FINZ-1111", {}).get("is_self") is True
         db.clear_watchparty_dm_messages("FINZ-1111")
         assert db.list_watchparty_dm_messages("FINZ-1111") == []
@@ -2109,6 +2112,49 @@ def test_gui_and_libmpv_smoke(
                         "Pon el torneo en Twitch!",
                         "Voy abriendo el directo",
                     ]
+
+                    # Adjunto de archivo en UI + botón Reiniciar debajo de Ajustes + notificación con color de tema
+                    from swiftplay.main import build_restart_command
+
+                    nav_lay = win.nav_chats.parentWidget().layout()
+                    assert nav_lay.indexOf(win.restart_btn) > nav_lay.indexOf(win.settings_btn)
+                    assert nav_lay.indexOf(win.settings_btn) > nav_lay.indexOf(win.shortcuts_btn)
+                    rcmd = build_restart_command(["--profile", "demo", "--quit"])
+                    assert "launch_swiftplay.pyw" in rcmd[1] and "--quit" not in rcmd and "--profile" in rcmd
+
+                    win.discord_notif_toast.show_notification(
+                        "Finz",
+                        "Adjunto",
+                        header_text="SwiftPlay · Chats",
+                        use_theme_accent=True,
+                        duration_ms=1500,
+                    )
+                    assert win.discord_notif_toast._use_theme_accent is True
+                    assert win.palette.accent.lower() in win.discord_notif_toast.header_lbl.styleSheet().lower()
+                    win.discord_notif_toast.hide()
+
+                    with tempfile.TemporaryDirectory() as ftmp:
+                        sample_f = Path(ftmp) / "nota.txt"
+                        sample_f.write_bytes(b"Hola SwiftPlay adjunto")
+                        assert chat_pnl.set_pending_file(str(sample_f)) is True
+                        assert chat_pnl.pending_file_bar.isVisible()
+                        orig_send_file = win.watchparty_svc.send_direct_file_message
+                        win.watchparty_svc.send_direct_file_message = (  # type: ignore[method-assign]
+                            lambda to_c, fp, txt="", cid="": (
+                                "ui_wp_file_1",
+                                {"name": Path(fp).name, "mime": "text/plain", "size": 22, "local_path": fp},
+                                "",
+                            )
+                        )
+                        try:
+                            chat_pnl._on_send_clicked()
+                            app.processEvents()
+                            assert not chat_pnl.pending_file_bar.isVisible()
+                            assert chat_pnl._msg_status_labels["ui_wp_file_1"].text() == "Enviando..."
+                            hist_att = win.db.list_watchparty_dm_messages("FINZ-1111")
+                            assert hist_att[-1].get("attachment") and hist_att[-1]["attachment"]["name"] == "nota.txt"
+                        finally:
+                            win.watchparty_svc.send_direct_file_message = orig_send_file  # type: ignore[method-assign]
                 finally:
                     win.watchparty_svc.send_direct_message = orig_send_dm  # type: ignore[method-assign]
                     win.watchparty_svc._conn_state = orig_wp_conn
@@ -5423,7 +5469,7 @@ print("SCREEN_SHARE_RELAY_OK")
                     info["friends"] = list(msg.get("friends") or [])
                     info["video"] = msg.get("video")
                     info["music"] = msg.get("music")
-                    await ws.send(json.dumps({"type": "welcome", "code": code, "name": info["name"], "dm_supported": True}))
+                    await ws.send(json.dumps({"type": "welcome", "code": code, "name": info["name"], "dm_supported": True, "file_supported": True}))
                     await ws.send(json.dumps({"type": "friends_snapshot", "friends": [_snap(f) for f in info["friends"]]}))
                     for oc, (ows, oi) in list(_wp_clients.items()):
                         if oc != code and code in oi["friends"]:
@@ -5489,10 +5535,23 @@ print("SCREEN_SHARE_RELAY_OK")
                             "allow_guest_control": hi["allow_guest_control"],
                             "members": [{"code": m} for m in sorted(room)],
                         }))
+                elif t == "dm_file_chunk":
+                    to = str(msg.get("to") or "").upper()
+                    if to in info["friends"] and to in _wp_clients:
+                        tws, _ = _wp_clients[to]
+                        await tws.send(json.dumps({
+                            "type": "dm_file_chunk",
+                            "from_code": code,
+                            "file_id": str(msg.get("file_id") or ""),
+                            "chunk_index": int(msg.get("chunk_index", 0)),
+                            "total_chunks": int(msg.get("total_chunks", 0)),
+                            "data_b64": str(msg.get("data_b64") or ""),
+                        }))
                 elif t == "direct_message":
                     to = str(msg.get("to") or "").upper()
                     cid = str(msg.get("client_id") or "")
                     text = str(msg.get("text") or "").strip()
+                    att = msg.get("attachment")
                     if to not in info["friends"]:
                         await ws.send(json.dumps({"type": "dm_ack", "client_id": cid, "to_code": to, "ok": False, "error": "not_friend"}))
                         continue
@@ -5505,6 +5564,8 @@ print("SCREEN_SHARE_RELAY_OK")
                         "text": text,
                         "ts": _wp_time.time(),
                     }
+                    if att:
+                        dm_payload["attachment"] = att
                     delivered = False
                     if to in _wp_clients:
                         tws, _ = _wp_clients[to]
@@ -5669,25 +5730,51 @@ print("SCREEN_SHARE_RELAY_OK")
         assert b_dms and b_dms[-1]["text"] == "Hola en vivo!" and b_dms[-1]["from_code"] == "ALFA-1111"
         assert a_acks and a_acks[-1]["ok"] and a_acks[-1]["delivered"] is True
 
+        # Envío de archivo chunked (> 240 KB) E2E entre wp_a -> wp_b verificando integridad exacta de bytes
+        big_payload = (b"SWIFTPLAY-FILE-E2E-" * 18000)[:310_000]
+        with tempfile.TemporaryDirectory() as ftmp_ws:
+            big_file = Path(ftmp_ws) / "prueba_grande.bin"
+            big_file.write_bytes(big_payload)
+            prev_len_b = len(b_dms)
+            prev_len_ack = len(a_acks)
+            cid_file, meta_file, ferr = wp_a.send_direct_file_message("BETA-2222", str(big_file), "Van 300KB")
+            assert not ferr and cid_file and meta_file and meta_file["size"] == len(big_payload)
+            deadline = _wp_time.monotonic() + 5.0
+            while _wp_time.monotonic() < deadline and (len(b_dms) <= prev_len_b or len(a_acks) <= prev_len_ack):
+                if app is not None:
+                    app.processEvents()
+                _wp_time.sleep(0.05)
+            assert len(b_dms) > prev_len_b and len(a_acks) > prev_len_ack
+            rec_att = b_dms[-1].get("attachment")
+            assert rec_att and rec_att["name"] == "prueba_grande.bin" and rec_att["size"] == len(big_payload)
+            rec_path = Path(rec_att["local_path"])
+            assert rec_path.is_file() and rec_path.read_bytes() == big_payload
+            try:
+                rec_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         # Rechazo si no es amigo agregado
+        prev_len_ack = len(a_acks)
         wp_a.send_direct_message("NOPE-9999", "No amigo")
         deadline = _wp_time.monotonic() + 3.0
-        while _wp_time.monotonic() < deadline and len(a_acks) < 2:
+        while _wp_time.monotonic() < deadline and len(a_acks) <= prev_len_ack:
             if app is not None:
                 app.processEvents()
             _wp_time.sleep(0.05)
-        assert len(a_acks) >= 2 and not a_acks[-1]["ok"] and a_acks[-1]["error"] == "not_friend"
+        assert len(a_acks) > prev_len_ack and not a_acks[-1]["ok"] and a_acks[-1]["error"] == "not_friend"
 
         # Entrega diferida por buzón offline cuando wp_b se desconecta y reconecta
         wp_b.stop()
         _wp_time.sleep(0.1)
+        prev_len_ack = len(a_acks)
         wp_a.send_direct_message("BETA-2222", "Mensaje mientras estabas offline")
         deadline = _wp_time.monotonic() + 3.0
-        while _wp_time.monotonic() < deadline and len(a_acks) < 3:
+        while _wp_time.monotonic() < deadline and len(a_acks) <= prev_len_ack:
             if app is not None:
                 app.processEvents()
             _wp_time.sleep(0.05)
-        assert a_acks[-1]["ok"] and a_acks[-1]["queued"] is True
+        assert len(a_acks) > prev_len_ack and a_acks[-1]["ok"] and a_acks[-1]["queued"] is True
 
         wp_b2 = WatchPartyService()
         b2_dms: list[dict] = []

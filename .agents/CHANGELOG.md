@@ -14,6 +14,14 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-26 (3) — Adjuntos en Chats, Botón Reiniciar App y Notificaciones con Color del Tema
+- **Files:** `watchparty_relay/src/index.js`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/storage.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/discord_notification.py`, `src/swiftplay/ui/watchparty_chat_panel.py`, `src/swiftplay/paths.py`, `src/swiftplay/main.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+- **Changes / Decisions:**
+  - **Archivos adjuntos en Chats (`watchparty_relay/src/index.js`, `watchparty_service.py`, `watchparty_chat_panel.py`, `storage.py`):** Botón clip (`paperclip`), barra de archivo pendiente, previsualización inline de imágenes, botones **Abrir** / **Carpeta**, soporte de envío hasta `8 MB` en línea mediante fragmentos `dm_file_chunk` (`240 KB`) y hasta `80 KB` offline en buzón separado (`inbox_file:<code>`), persistiendo metadatos/rutas locales en `%LOCALAPPDATA%\SwiftPlay\watchparty_files` y `attachment_json` en SQLite.
+  - **Botón Reiniciar en Barra Lateral (`paths.py`, `main.py`, `main_window.py`):** Añadido botón `Reiniciar` debajo de `Ajustes` que guarda sesión/configuración, libera recursos y `QLocalServer` y relanza limpiamente la app preservando perfil y sin consola (`RESTART_EXIT_CODE = 88`, `build_restart_command`).
+  - **Notificaciones con Color del Tema (`themes.py`, `discord_notification.py`, `main_window.py`):** `WatchPartyUnreadBadge` ahora usa `p.accent`/`p.accent_text` y `DiscordMessageToast` recibe `use_theme_accent=True` para pintar borde, franja superior, encabezado y avatar de inicial con el tema configurado por cada usuario.
+- **Verified:** `node --check watchparty_relay/src/index.js`, `py_compile`, `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
+
 ## 2026-11-26 (2) — Pestaña Separada de Chats Privados (Amigos WatchParty) + Confirmación/Estado de Entrega
 - **Files:** `watchparty_relay/src/index.js`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/storage.py`, `src/swiftplay/ui/icons.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/watchparty_panel.py`, `src/swiftplay/ui/watchparty_chat_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

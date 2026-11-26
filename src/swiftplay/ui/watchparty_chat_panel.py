@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPixmap
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -22,6 +26,18 @@ from swiftplay.themes import ThemePalette
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.ui.icons import render_icon
 from swiftplay.ui.watchparty_panel import _clear_layout_safe, _rounded_pixmap
+from swiftplay.watchparty_service import MAX_WP_FILE_BYTES
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
+def _format_file_size(num_bytes: int) -> str:
+    n = max(0, int(num_bytes or 0))
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024.0:.1f} KB"
+    return f"{n / (1024.0 * 1024.0):.2f} MB"
 
 _STATUS_SORT_ORDER = {"active": 0, "idle": 1, "offline": 2}
 _STATUS_DOT_COLOR = {
@@ -169,13 +185,16 @@ class _ChatFriendRow(QFrame):
 
         prev_txt = ""
         ts_txt = ""
-        if isinstance(preview, dict) and str(preview.get("content") or "").strip():
+        if isinstance(preview, dict):
             raw_c = str(preview.get("content") or "").strip().replace("\n", " ")
-            prefix = "Tú: " if preview.get("is_self") else ""
-            full = f"{prefix}{raw_c}"
-            prev_txt = (full[:34] + "…") if len(full) > 35 else full
-            ts_txt = str(preview.get("timestamp") or "").strip()
-        else:
+            att_name = str(preview.get("attachment_name") or "").strip()
+            body_desc = raw_c or (f"📎 {att_name}" if att_name else "")
+            if body_desc:
+                prefix = "Tú: " if preview.get("is_self") else ""
+                full = f"{prefix}{body_desc}"
+                prev_txt = (full[:34] + "…") if len(full) > 35 else full
+                ts_txt = str(preview.get("timestamp") or "").strip()
+        if not prev_txt:
             prev_txt = "En línea" if status != "offline" else "Desconectado"
         self.preview_lbl.setText(prev_txt)
         self.time_lbl.setText(ts_txt)
@@ -210,7 +229,7 @@ class WatchPartyChatPanel(QWidget):
     """Pestaña separada exclusiva para mensajes directos con amigos de WatchParty."""
 
     chat_opened = Signal(str)  # friend_code
-    send_message_requested = Signal(str, str)  # friend_code, text
+    send_message_requested = Signal(str, str, str)  # friend_code, text, attachment_path
     open_watchparty_requested = Signal()
     reconnect_requested = Signal()
     copy_relay_code_requested = Signal()
@@ -234,6 +253,7 @@ class WatchPartyChatPanel(QWidget):
         self._unread_counts: dict[str, int] = {}
         self._rows: dict[str, _ChatFriendRow] = {}
         self._active_chat_code: str = ""
+        self._pending_file_path: str = ""
         self._chat_rendered_ids: set[str] = set()
         self._msg_status_labels: dict[str, QLabel] = {}
         self._conn_state: str = "disconnected"
@@ -454,15 +474,41 @@ class WatchPartyChatPanel(QWidget):
         self.chat_scroll.setWidget(msgs_box)
         cc_lay.addWidget(self.chat_scroll, 1)
 
+        self.pending_file_bar = QFrame()
+        self.pending_file_bar.setObjectName("WatchPartySubCard")
+        self.pending_file_bar.setVisible(False)
+        pf_lay = QHBoxLayout(self.pending_file_bar)
+        pf_lay.setContentsMargins(10, 6, 10, 6)
+        pf_lay.setSpacing(8)
+        self.pending_file_lbl = QLabel("")
+        self.pending_file_lbl.setStyleSheet("font-size: 12px; background: transparent;")
+        pf_lay.addWidget(self.pending_file_lbl, 1)
+        self.pending_file_clear_btn = QPushButton()
+        self.pending_file_clear_btn.setObjectName("IconBtn")
+        self.pending_file_clear_btn.setFixedSize(22, 22)
+        self.pending_file_clear_btn.setToolTip("Quitar archivo adjunto")
+        self.pending_file_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pending_file_clear_btn.clicked.connect(self._clear_pending_file)
+        pf_lay.addWidget(self.pending_file_clear_btn)
+        cc_lay.addWidget(self.pending_file_bar)
+
         input_wrap = QWidget()
         input_wrap.setObjectName("TransparentBox")
         in_lay = QHBoxLayout(input_wrap)
         in_lay.setContentsMargins(12, 8, 12, 12)
         in_lay.setSpacing(8)
 
+        self.chat_attach_btn = QPushButton()
+        self.chat_attach_btn.setObjectName("IconBtn")
+        self.chat_attach_btn.setFixedSize(32, 32)
+        self.chat_attach_btn.setToolTip("Adjuntar archivo (hasta 8 MB; máx. 80 KB si está desconectado)")
+        self.chat_attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chat_attach_btn.clicked.connect(self._on_attach_clicked)
+        in_lay.addWidget(self.chat_attach_btn)
+
         self.chat_input = QLineEdit()
         self.chat_input.setObjectName("DiscordChatInput")
-        self.chat_input.setPlaceholderText("Escribe un mensaje...")
+        self.chat_input.setPlaceholderText("Escribe un mensaje o adjunta un archivo...")
         self.chat_input.setMaxLength(1000)
         self.chat_input.returnPressed.connect(self._on_send_clicked)
         in_lay.addWidget(self.chat_input, 1)
@@ -729,11 +775,72 @@ class WatchPartyChatPanel(QWidget):
             meta_lay.addWidget(ts_lbl)
         bubble_lay.addLayout(meta_lay)
 
-        body_lbl = QLabel(content)
-        body_lbl.setWordWrap(True)
-        body_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        body_lbl.setStyleSheet("font-size: 12.5px; background: transparent;")
-        bubble_lay.addWidget(body_lbl)
+        att = msg.get("attachment") if isinstance(msg.get("attachment"), dict) else None
+        if att and str(att.get("name") or "").strip():
+            att_name = str(att.get("name") or "archivo").strip()
+            att_size = int(att.get("size") or 0)
+            local_path = str(att.get("local_path") or "").strip()
+            lp_obj = Path(local_path) if local_path else None
+            exists_disk = bool(lp_obj is not None and lp_obj.is_file())
+
+            if exists_disk and lp_obj is not None and lp_obj.suffix.lower() in _IMAGE_EXTS:
+                pm = QPixmap(str(lp_obj))
+                if not pm.isNull():
+                    scaled = pm.scaled(
+                        240,
+                        160,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    img_lbl = QLabel()
+                    img_lbl.setPixmap(scaled)
+                    img_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+                    img_lbl.setStyleSheet("background: transparent;")
+                    bubble_lay.addWidget(img_lbl)
+
+            att_box = QFrame()
+            att_box.setObjectName("WatchPartySubCard")
+            att_lay = QHBoxLayout(att_box)
+            att_lay.setContentsMargins(8, 6, 8, 6)
+            att_lay.setSpacing(8)
+
+            att_meta = QVBoxLayout()
+            att_meta.setContentsMargins(0, 0, 0, 0)
+            att_meta.setSpacing(1)
+            att_title = QLabel(att_name)
+            att_title.setStyleSheet("font-size: 12px; font-weight: 600; background: transparent;")
+            att_meta.addWidget(att_title)
+            sub_txt = _format_file_size(att_size)
+            if not exists_disk:
+                sub_txt = f"{sub_txt} · no disponible en este equipo" if att_size > 0 else "No disponible en disco"
+            att_sub = QLabel(sub_txt)
+            att_sub.setObjectName("MutedLabel")
+            att_sub.setStyleSheet("font-size: 10.5px; background: transparent;")
+            att_meta.addWidget(att_sub)
+            att_lay.addLayout(att_meta, 1)
+
+            open_btn = QPushButton("Abrir")
+            open_btn.setObjectName("PillBtn")
+            open_btn.setEnabled(exists_disk)
+            open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            open_btn.clicked.connect(lambda _c=False, p_str=local_path: self._open_local_file(p_str))
+            att_lay.addWidget(open_btn)
+
+            if exists_disk:
+                dir_btn = QPushButton("Carpeta")
+                dir_btn.setObjectName("PillBtn")
+                dir_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                dir_btn.clicked.connect(lambda _c=False, p_str=local_path: self._reveal_local_file(p_str))
+                att_lay.addWidget(dir_btn)
+
+            bubble_lay.addWidget(att_box)
+
+        if content:
+            body_lbl = QLabel(content)
+            body_lbl.setWordWrap(True)
+            body_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            body_lbl.setStyleSheet("font-size: 12.5px; background: transparent;")
+            bubble_lay.addWidget(body_lbl)
 
         status_lbl: QLabel | None = None
         if is_self:
@@ -748,6 +855,25 @@ class WatchPartyChatPanel(QWidget):
         if not is_self:
             row_lay.addStretch(1)
         return row, status_lbl
+
+    @staticmethod
+    def _open_local_file(file_path: str) -> None:
+        p = Path(str(file_path or "").strip())
+        if p.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+
+    @staticmethod
+    def _reveal_local_file(file_path: str) -> None:
+        p = Path(str(file_path or "").strip())
+        if not p.exists():
+            return
+        if sys.platform == "win32":
+            try:
+                subprocess.Popen(["explorer", "/select,", str(p)])
+                return
+            except Exception:
+                pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.parent)))
 
     def sync_chat_peer_status(self, friend_name: str, online: bool, connected: bool) -> None:
         if not self._active_chat_code:
@@ -779,7 +905,9 @@ class WatchPartyChatPanel(QWidget):
             self.chat_hint_lbl.setVisible(True)
         else:
             self.chat_hint_lbl.setVisible(False)
+        self.chat_hint_lbl.setVisible(self.chat_hint_lbl.isVisible())
         self.chat_send_btn.setEnabled(bool(connected))
+        self.chat_attach_btn.setEnabled(bool(connected))
 
     def open_chat_for(
         self,
@@ -794,6 +922,7 @@ class WatchPartyChatPanel(QWidget):
         if not fc:
             return
         self._active_chat_code = fc
+        self._clear_pending_file()
         self._clear_chat_bubbles()
         for c, row in self._rows.items():
             row.set_active(c == fc)
@@ -855,26 +984,68 @@ class WatchPartyChatPanel(QWidget):
 
     def close_chat(self) -> None:
         self._active_chat_code = ""
+        self._clear_pending_file()
         self._clear_chat_bubbles()
         self.chat_content_box.setVisible(False)
         self.select_friend_lbl.setVisible(True)
         for row in self._rows.values():
             row.set_active(False)
 
+    def _clear_pending_file(self) -> None:
+        self._pending_file_path = ""
+        self.pending_file_lbl.setText("")
+        self.pending_file_bar.setVisible(False)
+
+    def set_pending_file(self, file_path: str) -> bool:
+        p = Path(str(file_path or "").strip())
+        if not p.is_file():
+            self.toast_requested.emit("El archivo seleccionado no existe.")
+            return False
+        try:
+            size = int(p.stat().st_size)
+        except Exception:
+            size = 0
+        if size <= 0:
+            self.toast_requested.emit("El archivo está vacío.")
+            return False
+        if size > MAX_WP_FILE_BYTES:
+            self.toast_requested.emit("El archivo supera el límite permitido de 8 MB.")
+            return False
+        self._pending_file_path = str(p)
+        self.pending_file_lbl.setText(f"📎 {p.name} ({_format_file_size(size)})")
+        self.pending_file_bar.setVisible(True)
+        return True
+
+    def _on_attach_clicked(self) -> None:
+        if not self._active_chat_code:
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seleccionar archivo para enviar (máx. 8 MB)",
+            "",
+            "Todos los archivos (*.*)",
+        )
+        if file_path and self.set_pending_file(file_path):
+            self.chat_input.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def _on_send_clicked(self) -> None:
         if not self._active_chat_code:
             return
         txt = str(self.chat_input.text() or "").strip()
-        if not txt:
+        att_path = str(self._pending_file_path or "").strip()
+        if not txt and not att_path:
             return
         self.chat_input.clear()
-        self.send_message_requested.emit(self._active_chat_code, txt)
+        self._clear_pending_file()
+        self.send_message_requested.emit(self._active_chat_code, txt, att_path)
 
     def update_theme(self, palette: ThemePalette) -> None:
         self.palette = palette
         self.refresh_btn.setIcon(render_icon("refresh", palette.text, 14))
         self.chat_close_btn.setIcon(render_icon("close", palette.text2, 13))
         self.chat_send_btn.setIcon(render_icon("send", palette.text, 14))
+        self.chat_attach_btn.setIcon(render_icon("paperclip", palette.text, 15))
+        self.pending_file_clear_btn.setIcon(render_icon("close", palette.text2, 12))
         for row in self._rows.values():
             row.update_theme(palette)
         self.set_connection_state(

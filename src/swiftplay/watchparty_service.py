@@ -3,16 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import mimetypes
+import re
 import secrets
 import threading
 import time
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode, urlparse, urlunparse
 
 from PySide6.QtCore import QObject, Signal
 
+from swiftplay.paths import USER_DATA_DIR
+
 VALID_WP_STATUSES: tuple[str, ...] = ("active", "idle", "offline")
+MAX_WP_FILE_BYTES: int = 8 * 1024 * 1024
+WP_FILE_CHUNK_BYTES: int = 240 * 1024
+
+
+def _safe_attachment_filename(raw_name: str) -> str:
+    clean = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(raw_name or "").strip())
+    clean = Path(clean).name.strip(" .")[:120]
+    return clean or "archivo.bin"
 
 
 def normalize_relay_ws_url(raw: str) -> str:
@@ -213,6 +227,7 @@ class WatchPartyService(QObject):
 
         self._friends_by_code: dict[str, dict[str, Any]] = {}
         self._active_parties: dict[str, dict[str, Any]] = {}  # deck -> {host_code, members, allow_guest_control}
+        self._incoming_file_chunks: dict[tuple[str, str], dict[str, Any]] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -364,6 +379,82 @@ class WatchPartyService(QObject):
             }
         )
         return cid
+
+    def send_direct_file_message(
+        self,
+        to_code: str,
+        file_path: str,
+        text: str = "",
+        client_id: str = "",
+    ) -> tuple[str, dict[str, Any] | None, str]:
+        """Envía un archivo (hasta 8 MB, inline o por chunks) a un amigo de WatchParty."""
+        to = str(to_code or "").strip().upper()
+        body = str(text or "").replace("\r\n", "\n").strip()[:1000]
+        p = Path(str(file_path or "").strip())
+        if not to or not p.is_file():
+            return "", None, "El archivo seleccionado no existe."
+        try:
+            raw_bytes = p.read_bytes()
+        except Exception as exc:
+            return "", None, f"No se pudo leer el archivo: {exc}"
+        size = len(raw_bytes)
+        if size <= 0:
+            return "", None, "El archivo está vacío."
+        if size > MAX_WP_FILE_BYTES:
+            return "", None, "El archivo supera el límite de 8 MB."
+
+        safe_name = _safe_attachment_filename(p.name)
+        mime, _ = mimetypes.guess_type(safe_name)
+        mime = mime or "application/octet-stream"
+        cid = str(client_id or "").strip()[:64] or f"wp_{int(time.time() * 1000)}_{secrets.token_hex(3)}"
+
+        att_payload: dict[str, Any]
+        if size <= WP_FILE_CHUNK_BYTES:
+            att_payload = {
+                "name": safe_name,
+                "mime": mime,
+                "size": size,
+                "data_b64": base64.b64encode(raw_bytes).decode("ascii"),
+            }
+        else:
+            file_id = f"f_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+            total_chunks = (size + WP_FILE_CHUNK_BYTES - 1) // WP_FILE_CHUNK_BYTES
+            for idx in range(total_chunks):
+                chunk = raw_bytes[idx * WP_FILE_CHUNK_BYTES : (idx + 1) * WP_FILE_CHUNK_BYTES]
+                self._enqueue(
+                    {
+                        "type": "dm_file_chunk",
+                        "to": to,
+                        "file_id": file_id,
+                        "chunk_index": idx,
+                        "total_chunks": total_chunks,
+                        "data_b64": base64.b64encode(chunk).decode("ascii"),
+                    }
+                )
+            att_payload = {
+                "file_id": file_id,
+                "name": safe_name,
+                "mime": mime,
+                "size": size,
+                "total_chunks": total_chunks,
+            }
+
+        self._enqueue(
+            {
+                "type": "direct_message",
+                "to": to,
+                "text": body,
+                "client_id": cid,
+                "attachment": att_payload,
+            }
+        )
+        local_meta = {
+            "name": safe_name,
+            "mime": mime,
+            "size": size,
+            "local_path": str(p),
+        }
+        return cid, local_meta, ""
 
     def _compute_presence_fp_locked(self) -> str:
         vid = self._video_state if self._share_enabled else None
@@ -590,21 +681,21 @@ class WatchPartyService(QObject):
                     open_timeout=10,
                     close_timeout=2,
                     ping_interval=None,
-                    max_size=512 * 1024,
+                    max_size=2 * 1024 * 1024,
                 ) as ws:
                     backoff = 2.0
-                    # Conservar mensajes directos pendientes si hubo reconexión rápida y descartar presencias viejas
+                    # Conservar mensajes directos y chunks pendientes si hubo reconexión rápida
                     kept_dms: list[dict[str, Any]] = []
                     while not queue.empty():
                         try:
                             item = queue.get_nowait()
                             if item.get("_cmd") == "stop":
                                 return
-                            if item.get("type") == "direct_message":
+                            if item.get("type") in ("direct_message", "dm_file_chunk"):
                                 kept_dms.append(item)
                         except asyncio.QueueEmpty:
                             break
-                    for dm_cmd in kept_dms[-20:]:
+                    for dm_cmd in kept_dms[-64:]:
                         queue.put_nowait(dm_cmd)
 
                     with self._lock:
@@ -831,6 +922,37 @@ class WatchPartyService(QObject):
             if txt:
                 self.party_notice.emit(txt)
             return
+        if mtype == "dm_file_chunk":
+            from_code = str(msg.get("from_code") or "").strip().upper()
+            file_id = str(msg.get("file_id") or "").strip()
+            data_b64 = str(msg.get("data_b64") or "")
+            try:
+                idx = int(msg.get("chunk_index", -1))
+                total = int(msg.get("total_chunks", 0))
+            except (TypeError, ValueError):
+                return
+            if not from_code or not file_id or not data_b64 or total < 1 or total > 64 or not (0 <= idx < total):
+                return
+            try:
+                raw_chunk = base64.b64decode(data_b64.encode("ascii"), validate=True)
+            except Exception:
+                return
+            now_m = time.monotonic()
+            with self._lock:
+                stale_keys = [
+                    k for k, v in self._incoming_file_chunks.items()
+                    if (now_m - float(v.get("ts") or 0.0)) > 120.0
+                ]
+                for sk in stale_keys:
+                    self._incoming_file_chunks.pop(sk, None)
+                entry = self._incoming_file_chunks.setdefault(
+                    (from_code, file_id),
+                    {"total": total, "parts": {}, "ts": now_m},
+                )
+                entry["total"] = total
+                entry["ts"] = now_m
+                entry["parts"][idx] = raw_chunk
+            return
         if mtype == "dm_message":
             with self._lock:
                 dm_changed = self._server_supports_dm is not True
@@ -841,19 +963,25 @@ class WatchPartyService(QObject):
             if isinstance(raw_msg, dict):
                 from_code = str(raw_msg.get("from_code") or "").strip().upper()
                 text = str(raw_msg.get("text") or "").strip()
-                if from_code and text:
+                msg_id = str(raw_msg.get("id") or "").strip()
+                att_out: dict[str, Any] | None = None
+                raw_att = raw_msg.get("attachment")
+                if isinstance(raw_att, dict) and from_code:
+                    att_out = self._materialize_incoming_attachment(from_code, msg_id, raw_att)
+                if from_code and (text or att_out is not None):
                     try:
                         ts = float(raw_msg.get("ts") or time.time())
                     except (TypeError, ValueError):
                         ts = time.time()
                     self.direct_message_received.emit(
                         {
-                            "id": str(raw_msg.get("id") or "").strip(),
+                            "id": msg_id,
                             "from_code": from_code,
                             "from_name": str(raw_msg.get("from_name") or from_code).strip(),
                             "from_avatar_url": str(raw_msg.get("from_avatar_url") or "").strip(),
                             "to_code": str(raw_msg.get("to_code") or "").strip().upper(),
                             "text": text,
+                            "attachment": att_out,
                             "ts": ts,
                         }
                     )
@@ -879,3 +1007,56 @@ class WatchPartyService(QObject):
                     "ts": ts,
                 }
             )
+
+    def _materialize_incoming_attachment(
+        self,
+        from_code: str,
+        msg_id: str,
+        raw_att: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        safe_name = _safe_attachment_filename(str(raw_att.get("name") or "archivo.bin"))
+        mime = str(raw_att.get("mime") or "application/octet-stream").strip()
+        try:
+            declared_size = max(0, int(raw_att.get("size") or 0))
+        except (TypeError, ValueError):
+            declared_size = 0
+
+        raw_bytes: bytes | None = None
+        inline_b64 = str(raw_att.get("data_b64") or "")
+        file_id = str(raw_att.get("file_id") or "").strip()
+        try:
+            total_chunks = int(raw_att.get("total_chunks") or 0)
+        except (TypeError, ValueError):
+            total_chunks = 0
+
+        if inline_b64:
+            try:
+                raw_bytes = base64.b64decode(inline_b64.encode("ascii"), validate=True)
+            except Exception:
+                raw_bytes = None
+        elif file_id and total_chunks > 0:
+            with self._lock:
+                entry = self._incoming_file_chunks.pop((from_code, file_id), None)
+            if entry is not None:
+                parts = entry.get("parts") or {}
+                if len(parts) == total_chunks and all(i in parts for i in range(total_chunks)):
+                    raw_bytes = b"".join(parts[i] for i in range(total_chunks))
+
+        if not raw_bytes or len(raw_bytes) > MAX_WP_FILE_BYTES:
+            return None
+
+        dest_dir = USER_DATA_DIR / "watchparty_files" / _safe_attachment_filename(from_code)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        safe_prefix = re.sub(r"[^A-Za-z0-9_-]", "", msg_id or file_id)[:24] or str(int(time.time() * 1000))
+        dest_path = dest_dir / f"{safe_prefix}_{safe_name}"
+        try:
+            dest_path.write_bytes(raw_bytes)
+        except Exception:
+            return None
+
+        return {
+            "name": safe_name,
+            "mime": mime,
+            "size": len(raw_bytes) if len(raw_bytes) > 0 else declared_size,
+            "local_path": str(dest_path),
+        }

@@ -7,6 +7,32 @@ const VALID_CODE_RE = /^[A-Z0-9_-]{4,24}$/;
 const VALID_DECKS = new Set(["video", "music"]);
 const STALE_SOCKET_MS = 75_000;
 const ALARM_INTERVAL_MS = 60_000;
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_OFFLINE_FILE_BYTES = 80 * 1024;
+
+function sanitizeAttachment(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const rawName = String(raw.name || "").trim().slice(0, 120);
+  const cleanName = rawName.replace(/[\\/:*?"<>|\x00-\x1F]/g, "_").trim();
+  if (!cleanName) return null;
+  const sizeNum = Math.round(Number(raw.size || 0) || 0);
+  if (sizeNum <= 0 || sizeNum > MAX_FILE_BYTES) return null;
+  const mime = String(raw.mime || "application/octet-stream").trim().slice(0, 100) || "application/octet-stream";
+  const fileId = String(raw.file_id || "").trim().slice(0, 64);
+  const totalChunks = Math.max(0, Math.min(64, Math.trunc(Number(raw.total_chunks || 0) || 0)));
+  const dataB64 = String(raw.data_b64 || "");
+  if (dataB64.length > 420_000) return null;
+  if (!dataB64 && (!fileId || totalChunks <= 0)) return null;
+  const out = {
+    name: cleanName,
+    mime,
+    size: sizeNum,
+  };
+  if (fileId) out.file_id = fileId;
+  if (totalChunks > 0) out.total_chunks = totalChunks;
+  if (dataB64) out.data_b64 = dataB64;
+  return out;
+}
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -384,6 +410,7 @@ export class WatchPartyHub {
         service: "swiftplay-watchparty",
         online: this._socketsByCode.size,
         dm_supported: true,
+        file_supported: true,
       });
     }
 
@@ -492,7 +519,7 @@ export class WatchPartyHub {
         last_seen: Date.now() / 1000,
       });
 
-      this._send(ws, { type: "welcome", code: att.code, name: att.name, dm_supported: true });
+      this._send(ws, { type: "welcome", code: att.code, name: att.name, dm_supported: true, file_supported: true });
       this._send(ws, {
         type: "friends_snapshot",
         friends: await this._buildFriendsSnapshot(att.friends),
@@ -505,7 +532,21 @@ export class WatchPartyHub {
         await this.ctx.storage.delete(inboxKey);
         for (const item of pendingInbox) {
           if (item && typeof item === "object") {
-            this._send(ws, { type: "dm_message", message: item });
+            const outItem = { ...item };
+            if (outItem.attachment && outItem.attachment._stored_file && outItem.id) {
+              const fileKey = `inbox_file:${att.code}:${outItem.id}`;
+              const b64 = await this.ctx.storage.get(fileKey);
+              await this.ctx.storage.delete(fileKey);
+              const attCopy = { ...outItem.attachment };
+              delete attCopy._stored_file;
+              if (typeof b64 === "string" && b64.length > 0) {
+                attCopy.data_b64 = b64;
+                outItem.attachment = attCopy;
+              } else {
+                outItem.attachment = null;
+              }
+            }
+            this._send(ws, { type: "dm_message", message: outItem });
           }
         }
       }
@@ -720,6 +761,33 @@ export class WatchPartyHub {
       return;
     }
 
+    if (type === "dm_file_chunk") {
+      const to = normalizeCode(msg.to);
+      if (!VALID_CODE_RE.test(to) || to === att.code) return;
+      if (!Array.isArray(att.friends) || !att.friends.includes(to)) return;
+      const fileId = String(msg.file_id || "").trim().slice(0, 64);
+      const totalChunks = Math.trunc(Number(msg.total_chunks || 0) || 0);
+      const chunkIndex = Math.trunc(Number(msg.chunk_index ?? -1));
+      const dataB64 = String(msg.data_b64 || "");
+      if (!fileId || totalChunks < 1 || totalChunks > 64 || chunkIndex < 0 || chunkIndex >= totalChunks) {
+        return;
+      }
+      if (!dataB64 || dataB64.length > 420_000) return;
+
+      const targetWs = this._socketsByCode.get(to);
+      if (targetWs && (targetWs.readyState === undefined || targetWs.readyState === 1)) {
+        this._send(targetWs, {
+          type: "dm_file_chunk",
+          from_code: att.code,
+          file_id: fileId,
+          chunk_index: chunkIndex,
+          total_chunks: totalChunks,
+          data_b64: dataB64,
+        });
+      }
+      return;
+    }
+
     if (type === "direct_message") {
       const to = normalizeCode(msg.to);
       const clientId = String(msg.client_id || "").trim().slice(0, 64);
@@ -744,7 +812,18 @@ export class WatchPartyHub {
         return;
       }
       const text = String(msg.text ?? "").replace(/\r\n/g, "\n").trim().slice(0, 1000);
-      if (!text) return;
+      const attachment = msg.attachment ? sanitizeAttachment(msg.attachment) : null;
+      if (msg.attachment && !attachment) {
+        this._send(ws, {
+          type: "dm_ack",
+          client_id: clientId,
+          to_code: to,
+          ok: false,
+          error: "invalid_file",
+        });
+        return;
+      }
+      if (!text && !attachment) return;
 
       const id = clientId || `wp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const ts = Date.now() / 1000;
@@ -757,6 +836,9 @@ export class WatchPartyHub {
         text,
         ts,
       };
+      if (attachment) {
+        dmPayload.attachment = attachment;
+      }
 
       const targetWs = this._socketsByCode.get(to);
       let delivered = false;
@@ -764,6 +846,30 @@ export class WatchPartyHub {
         delivered = this._send(targetWs, { type: "dm_message", message: dmPayload });
       }
       if (!delivered) {
+        if (attachment) {
+          const tooBigOffline =
+            Number(attachment.total_chunks || 0) > 0 ||
+            Number(attachment.size || 0) > MAX_OFFLINE_FILE_BYTES ||
+            String(attachment.data_b64 || "").length > 112_000;
+          if (tooBigOffline) {
+            this._send(ws, {
+              type: "dm_ack",
+              client_id: id,
+              to_code: to,
+              ok: false,
+              error: "peer_offline_large_file",
+            });
+            return;
+          }
+          const fileKey = `inbox_file:${to}:${id}`;
+          await this.ctx.storage.put(fileKey, String(attachment.data_b64 || ""));
+          dmPayload.attachment = {
+            name: attachment.name,
+            mime: attachment.mime,
+            size: attachment.size,
+            _stored_file: true,
+          };
+        }
         const inboxKey = `inbox:${to}`;
         const existing = await this.ctx.storage.get(inboxKey);
         const list = Array.isArray(existing) ? existing.filter((x) => x && x.id !== id) : [];
