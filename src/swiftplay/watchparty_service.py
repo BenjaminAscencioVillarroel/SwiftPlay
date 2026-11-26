@@ -181,6 +181,7 @@ class WatchPartyService(QObject):
     lookup_result = Signal(dict)
     direct_message_received = Signal(dict)
     direct_message_ack = Signal(dict)
+    server_dm_support_changed = Signal(bool)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -193,6 +194,7 @@ class WatchPartyService(QObject):
 
         self._conn_state: str = "disconnected"
         self._conn_detail: str = ""
+        self._server_supports_dm: bool | None = None
 
         self._enabled: bool = True
         self._relay_url: str = ""
@@ -221,6 +223,11 @@ class WatchPartyService(QObject):
     def connection_state(self) -> tuple[str, str]:
         with self._lock:
             return self._conn_state, self._conn_detail
+
+    @property
+    def server_supports_dm(self) -> bool | None:
+        with self._lock:
+            return self._server_supports_dm
 
     @property
     def friends_snapshot(self) -> list[dict[str, Any]]:
@@ -568,9 +575,13 @@ class WatchPartyService(QObject):
                 code = self._code
                 secret = self._secret
             if not enabled or not relay_url or not code or len(secret) < 16:
+                with self._lock:
+                    self._server_supports_dm = None
                 self._set_connection_state("disconnected", "")
                 break
 
+            with self._lock:
+                self._server_supports_dm = None
             ws_url = build_relay_connect_url(relay_url, code, secret)
             self._set_connection_state("connecting", "")
             try:
@@ -582,14 +593,19 @@ class WatchPartyService(QObject):
                     max_size=512 * 1024,
                 ) as ws:
                     backoff = 2.0
-                    # Drain stale queued commands before sending fresh hello
+                    # Conservar mensajes directos pendientes si hubo reconexión rápida y descartar presencias viejas
+                    kept_dms: list[dict[str, Any]] = []
                     while not queue.empty():
                         try:
                             item = queue.get_nowait()
                             if item.get("_cmd") == "stop":
                                 return
+                            if item.get("type") == "direct_message":
+                                kept_dms.append(item)
                         except asyncio.QueueEmpty:
                             break
+                    for dm_cmd in kept_dms[-20:]:
+                        queue.put_nowait(dm_cmd)
 
                     with self._lock:
                         hello_msg = {
@@ -746,7 +762,13 @@ class WatchPartyService(QObject):
 
     def _handle_incoming_message(self, msg: dict[str, Any]) -> None:
         mtype = str(msg.get("type") or "").strip()
-        if mtype in ("pong", "welcome"):
+        if mtype == "pong":
+            return
+        if mtype == "welcome":
+            supported = bool(msg.get("dm_supported", False))
+            with self._lock:
+                self._server_supports_dm = supported
+            self.server_dm_support_changed.emit(supported)
             return
         if mtype == "friends_snapshot":
             friends = msg.get("friends") or []
@@ -810,6 +832,11 @@ class WatchPartyService(QObject):
                 self.party_notice.emit(txt)
             return
         if mtype == "dm_message":
+            with self._lock:
+                dm_changed = self._server_supports_dm is not True
+                self._server_supports_dm = True
+            if dm_changed:
+                self.server_dm_support_changed.emit(True)
             raw_msg = msg.get("message")
             if isinstance(raw_msg, dict):
                 from_code = str(raw_msg.get("from_code") or "").strip().upper()
@@ -832,6 +859,11 @@ class WatchPartyService(QObject):
                     )
             return
         if mtype == "dm_ack":
+            with self._lock:
+                dm_changed = self._server_supports_dm is not True
+                self._server_supports_dm = True
+            if dm_changed:
+                self.server_dm_support_changed.emit(True)
             try:
                 ts = float(msg.get("ts") or time.time())
             except (TypeError, ValueError):

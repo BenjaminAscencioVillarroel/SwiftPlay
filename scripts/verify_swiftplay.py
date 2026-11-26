@@ -280,6 +280,9 @@ def test_storage_config_themes() -> None:
         )
         wp_msgs = db.list_watchparty_dm_messages("FINZ-1111")
         assert len(wp_msgs) == 2 and wp_msgs[0]["content"] == "¿Vemos algo ahora?" and wp_msgs[1]["is_self"]
+        wp_prevs = db.get_watchparty_dm_previews()
+        assert wp_prevs.get("FINZ-1111", {}).get("content") == "Dale"
+        assert wp_prevs.get("FINZ-1111", {}).get("is_self") is True
         db.clear_watchparty_dm_messages("FINZ-1111")
         assert db.list_watchparty_dm_messages("FINZ-1111") == []
         db.close()
@@ -2026,14 +2029,30 @@ def test_gui_and_libmpv_smoke(
             assert "Directo Demo Twitch" in finz_card.tw_sub.title_lbl.text()
             assert "Synthwave Theme" in finz_card.mus_sub.title_lbl.text()
 
-            # Verificar chat directo entre amigos WatchParty (badges, notificación clickeable, envío y cierre limpio)
+            # Verificar separación de Chats privados en PAGE_WATCHPARTY_CHAT (solo amigos agregados en WatchParty)
+            assert not hasattr(wp_pnl, "chat_card"), "WatchPartyPanel debe quedar limpio sin chat incrustado"
+            chat_pnl = win.watchparty_chat_panel
             prev_wp_friends = list(win.cfg.watchparty_friends)
             prev_notify_en = win.cfg.discord_notify_chat_enabled
             win.cfg.watchparty_friends = [{"code": "FINZ-1111", "name": "Finz", "avatar_url": ""}]
             win.cfg.discord_notify_chat_enabled = False
             try:
-                assert wp_pnl.chat_card.isHidden() and not win.wp_nav_msg_badge.isVisible()
+                assert chat_pnl.chat_content_box.isHidden() and not win.wp_nav_msg_badge.isVisible()
                 win._switch_page(win.PAGE_VIDEO_SEARCH)
+
+                # Mensaje de desconocido (no agregado en WatchParty) debe ser ignorado
+                win._on_watchparty_dm_received(
+                    {
+                        "id": "ui_wp_stranger",
+                        "from_code": "STRANGER-99",
+                        "from_name": "Extraño",
+                        "to_code": win.cfg.watchparty_code,
+                        "text": "Spam",
+                        "ts": 1700000000.0,
+                    }
+                )
+                assert not win.wp_nav_msg_badge.isVisible()
+
                 win._on_watchparty_dm_received(
                     {
                         "id": "ui_wp_dm_1",
@@ -2048,15 +2067,24 @@ def test_gui_and_libmpv_smoke(
                 assert win._wp_unread_by_code.get("FINZ-1111") == 1
                 assert win.wp_nav_msg_badge.isVisible() and win.wp_nav_msg_badge.text() == "1"
 
-                # Simular click en notificación de WatchParty DM: abre PAGE_WATCHPARTY y el chat con Finz
+                # Simular click en notificación de chat: abre PAGE_WATCHPARTY_CHAT y el chat con Finz
                 win._on_discord_notification_clicked({"kind": "watchparty_dm", "target_id": "FINZ-1111"})
                 app.processEvents()
-                assert win.stack.currentIndex() == win.PAGE_WATCHPARTY
-                assert wp_pnl.is_viewing_chat("FINZ-1111")
+                assert win.stack.currentIndex() == win.PAGE_WATCHPARTY_CHAT
+                assert chat_pnl.is_viewing_chat("FINZ-1111")
                 assert not win.wp_nav_msg_badge.isVisible()
-                assert wp_pnl._chat_msgs_lay.count() >= 3  # empty_lbl + bubble + stretch
+                assert chat_pnl._chat_msgs_lay.count() >= 3  # empty_lbl + bubble + stretch
+                assert list(chat_pnl._rows.keys()) == ["FINZ-1111"]
 
-                # Enviar respuesta por chat conectado (mock is_connected + send_direct_message)
+                # Banner de advertencia cuando el Worker remoto está desactualizado
+                chat_pnl.set_connection_state("connected", "", server_supports_dm=False)
+                app.processEvents()
+                assert chat_pnl.relay_warn_card.isVisible()
+                chat_pnl.set_connection_state("connected", "", server_supports_dm=True)
+                app.processEvents()
+                assert not chat_pnl.relay_warn_card.isVisible()
+
+                # Enviar respuesta por chat conectado (mock is_connected + send_direct_message + dm_ack)
                 sent_dm_calls: list[tuple[str, str]] = []
                 orig_send_dm = win.watchparty_svc.send_direct_message
                 orig_wp_conn = win.watchparty_svc._conn_state
@@ -2065,11 +2093,17 @@ def test_gui_and_libmpv_smoke(
                     lambda to_c, body, client_id="": (sent_dm_calls.append((to_c, body)) or "ui_wp_dm_2")
                 )
                 try:
-                    wp_pnl.sync_chat_peer_status("Finz", online=True, connected=True)
-                    wp_pnl.chat_input.setText("Voy abriendo el directo")
-                    wp_pnl._on_send_chat_clicked()
+                    chat_pnl.sync_chat_peer_status("Finz", online=True, connected=True)
+                    chat_pnl.chat_input.setText("Voy abriendo el directo")
+                    chat_pnl._on_send_clicked()
                     app.processEvents()
                     assert sent_dm_calls == [("FINZ-1111", "Voy abriendo el directo")]
+                    assert chat_pnl._msg_status_labels["ui_wp_dm_2"].text() == "Enviando..."
+                    win._on_watchparty_dm_ack(
+                        {"client_id": "ui_wp_dm_2", "to_code": "FINZ-1111", "ok": True, "delivered": True, "queued": False}
+                    )
+                    app.processEvents()
+                    assert chat_pnl._msg_status_labels["ui_wp_dm_2"].text() == "✓ Entregado"
                     hist_dm = win.db.list_watchparty_dm_messages("FINZ-1111")
                     assert [m["content"] for m in hist_dm] == [
                         "Pon el torneo en Twitch!",
@@ -2078,20 +2112,22 @@ def test_gui_and_libmpv_smoke(
                 finally:
                     win.watchparty_svc.send_direct_message = orig_send_dm  # type: ignore[method-assign]
                     win.watchparty_svc._conn_state = orig_wp_conn
-                    wp_pnl.close_chat()
+                    chat_pnl.close_chat()
                     app.processEvents()
-                assert not wp_pnl.chat_card.isVisible() and not wp_pnl.active_chat_code
+                assert not chat_pnl.chat_content_box.isVisible() and not chat_pnl.active_chat_code
                 ghosts_wp = [
                     tl for tl in QApplication.topLevelWidgets()
                     if tl is not win and tl.isVisible() and type(tl).__name__ in ("QWidget", "QFrame")
                 ]
-                assert not ghosts_wp, f"Chat WatchParty dejó ventanas fantasma: {ghosts_wp}"
+                assert not ghosts_wp, f"Chats WatchParty dejó ventanas fantasma: {ghosts_wp}"
             finally:
                 win.db.clear_watchparty_dm_messages("FINZ-1111")
                 win._wp_unread_by_code.clear()
+                win._wp_pending_dm_acks.clear()
                 win._refresh_watchparty_unread_ui()
                 win.cfg.watchparty_friends = prev_wp_friends
                 win.cfg.discord_notify_chat_enabled = prev_notify_en
+                win._switch_page(win.PAGE_WATCHPARTY)
             assert finz_card.status_lbl.text() == "Activo"
             assert wp_pnl._cards["SOCIO-2222"].status_lbl.text() == "Inactivo"
             assert wp_pnl._cards["OFF-3333"].status_lbl.text() == "Desconectado"
@@ -5387,6 +5423,7 @@ print("SCREEN_SHARE_RELAY_OK")
                     info["friends"] = list(msg.get("friends") or [])
                     info["video"] = msg.get("video")
                     info["music"] = msg.get("music")
+                    await ws.send(json.dumps({"type": "welcome", "code": code, "name": info["name"], "dm_supported": True}))
                     await ws.send(json.dumps({"type": "friends_snapshot", "friends": [_snap(f) for f in info["friends"]]}))
                     for oc, (ows, oi) in list(_wp_clients.items()):
                         if oc != code and code in oi["friends"]:
@@ -5535,11 +5572,12 @@ print("SCREEN_SHARE_RELAY_OK")
             allow_guest_control=True,
         )
         deadline = _wp_time.monotonic() + 5.0
-        while _wp_time.monotonic() < deadline and not (wp_a.is_connected and wp_b.is_connected):
+        while _wp_time.monotonic() < deadline and not (wp_a.is_connected and wp_b.is_connected and wp_a.server_supports_dm is True):
             if app is not None:
                 app.processEvents()
             _wp_time.sleep(0.05)
         assert wp_a.is_connected and wp_b.is_connected
+        assert wp_a.server_supports_dm is True and wp_b.server_supports_dm is True
 
         wp_a.update_local_presence(
             status="active",

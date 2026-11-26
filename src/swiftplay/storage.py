@@ -888,6 +888,33 @@ class LocalLibrary:
                 )
             return out
 
+    def get_watchparty_dm_previews(self) -> dict[str, dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT m.friend_code, m.content, m.timestamp, m.created_at, m.is_self
+                FROM watchparty_dm_messages m
+                INNER JOIN (
+                    SELECT friend_code, MAX(created_at) AS max_ts
+                    FROM watchparty_dm_messages
+                    GROUP BY friend_code
+                ) latest
+                ON m.friend_code = latest.friend_code AND m.created_at = latest.max_ts
+                """
+            ).fetchall()
+            out: dict[str, dict] = {}
+            for r in rows:
+                fc = str(r["friend_code"] or "").strip().upper()
+                if not fc:
+                    continue
+                out[fc] = {
+                    "content": str(r["content"] or ""),
+                    "timestamp": str(r["timestamp"] or ""),
+                    "created_ts": float(r["created_at"] or 0.0),
+                    "is_self": bool(r["is_self"]),
+                }
+            return out
+
     def clear_watchparty_dm_messages(self, friend_code: str) -> None:
         fc = str(friend_code or "").strip().upper()
         if not fc:

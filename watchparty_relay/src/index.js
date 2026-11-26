@@ -383,6 +383,7 @@ export class WatchPartyHub {
         ok: true,
         service: "swiftplay-watchparty",
         online: this._socketsByCode.size,
+        dm_supported: true,
       });
     }
 
@@ -491,7 +492,7 @@ export class WatchPartyHub {
         last_seen: Date.now() / 1000,
       });
 
-      this._send(ws, { type: "welcome", code: att.code, name: att.name });
+      this._send(ws, { type: "welcome", code: att.code, name: att.name, dm_supported: true });
       this._send(ws, {
         type: "friends_snapshot",
         friends: await this._buildFriendsSnapshot(att.friends),
@@ -759,10 +760,10 @@ export class WatchPartyHub {
 
       const targetWs = this._socketsByCode.get(to);
       let delivered = false;
-      if (targetWs) {
-        this._send(targetWs, { type: "dm_message", message: dmPayload });
-        delivered = true;
-      } else {
+      if (targetWs && (targetWs.readyState === undefined || targetWs.readyState === 1)) {
+        delivered = this._send(targetWs, { type: "dm_message", message: dmPayload });
+      }
+      if (!delivered) {
         const inboxKey = `inbox:${to}`;
         const existing = await this.ctx.storage.get(inboxKey);
         const list = Array.isArray(existing) ? existing.filter((x) => x && x.id !== id) : [];

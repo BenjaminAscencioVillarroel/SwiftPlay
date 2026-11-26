@@ -14,12 +14,11 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
-## 2026-11-26 (2) — Mensajería Directa 1-a-1 entre Amigos de WatchParty
-- **Files:** `watchparty_relay/src/index.js`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/storage.py`, `src/swiftplay/ui/icons.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/watchparty_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
+## 2026-11-26 (2) — Pestaña Separada de Chats Privados (Amigos WatchParty) + Confirmación/Estado de Entrega
+- **Files:** `watchparty_relay/src/index.js`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/storage.py`, `src/swiftplay/ui/icons.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/watchparty_panel.py`, `src/swiftplay/ui/watchparty_chat_panel.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**
-  - **Relay WatchParty + Buzón Offline (`watchparty_relay/src/index.js`):** Añadido soporte `direct_message` validando que el destinatario pertenezca a `att.friends`; entrega instantánea `dm_message` si está conectado o almacenamiento acotado en `inbox:<code>` (`ctx.storage`, últimos 50 mensajes) que se vacía al reconectar en `hello`, con confirmación `dm_ack` al remitente.
-  - **Servicio y Persistencia (`watchparty_service.py`, `storage.py`):** Agregadas señales `direct_message_received` / `direct_message_ack` y `send_direct_message(...)`, junto con la tabla SQLite `watchparty_dm_messages` en `library.db` (deduplicación por `msg_key` e historial acotado a 150 mensajes por amigo).
-  - **UI de Chat y Notificaciones (`watchparty_panel.py`, `main_window.py`, `themes.py`, `icons.py`):** Botón **Chat** (con contador de no leídos) en cada tarjeta de amigo, panel lateral colapsable de conversación con estado en línea y aviso de entrega offline, badge rojo en `nav_watchparty` y notificación flotante clickeable que abre directamente el chat del amigo.
+  - **Separación completa del WatchParty (`watchparty_chat_panel.py`, `PAGE_WATCHPARTY_CHAT = 13`):** `WatchPartyPanel` vuelve a ser exclusivo para salas/actividad, y se crea la pestaña dedicada **Chats** en el menú lateral (`nav_chats` con badge `wp_nav_msg_badge`), filtrada estrictamente a amigos agregados en `cfg.watchparty_friends` con buscador, previews del último mensaje (`get_watchparty_dm_previews`) y notificaciones clickeables hacia esa conversación.
+  - **Detección de Worker desactualizado y entrega fiable (`watchparty_relay/src/index.js`, `watchparty_service.py`, `main_window.py`):** El relay ahora anuncia `dm_supported: true` en `/health` y `welcome`, y verifica `readyState`/`_send` antes de marcar entrega live vs buzón `inbox:<code>`. El cliente conserva mensajes directos ante reconexión rápida, muestra estado real por mensaje (`Enviando...` -> `✓ Entregado` / `✓ En buzón (offline)` / `⚠ Sin confirmación`), y si el Cloudflare Worker remoto corre la versión previa sin `direct_message`, muestra un banner con botón para copiar el código de `watchparty_relay/src/index.js` o reconectar.
 - **Verified:** `node --check watchparty_relay/src/index.js`, `py_compile`, `scripts/verify_swiftplay.py` `[1/6]`–`[6/6]`.
 
 ## 2026-11-26 — Protección Real-Time de Voz Discord ante Picos Pesados de CPU/RAM/Disco
