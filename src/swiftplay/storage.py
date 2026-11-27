@@ -72,6 +72,12 @@ class LocalLibrary:
                     avatar_url TEXT NOT NULL DEFAULT '',
                     added_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS kick_favorites (
+                    slug TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    avatar_url TEXT NOT NULL DEFAULT '',
+                    added_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS discord_dm_threads (
                     user_id TEXT PRIMARY KEY,
                     user_name TEXT NOT NULL,
@@ -557,6 +563,80 @@ class LocalLibrary:
     def count_twitch_favorites(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) FROM twitch_favorites").fetchone()
+            return int(row[0]) if row else 0
+
+    # --- Favoritos locales de Kick ---
+
+    def add_kick_favorite(self, item: MediaItem) -> None:
+        slug = (item.video_id or "").strip().lower()
+        if not slug:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO kick_favorites (slug, display_name, avatar_url, added_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    avatar_url=CASE
+                        WHEN excluded.avatar_url != '' THEN excluded.avatar_url
+                        ELSE kick_favorites.avatar_url
+                    END
+                """,
+                (
+                    slug,
+                    item.author or slug,
+                    item.channel_avatar_url or "",
+                    time.time(),
+                ),
+            )
+
+    def remove_kick_favorite(self, slug: str) -> None:
+        clean = (slug or "").strip().lower()
+        if not clean:
+            return
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM kick_favorites WHERE slug = ?", (clean,))
+
+    def is_kick_favorite(self, slug: str) -> bool:
+        clean = (slug or "").strip().lower()
+        if not clean:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM kick_favorites WHERE slug = ?", (clean,)
+            ).fetchone()
+            return row is not None
+
+    def list_kick_favorite_ids(self) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT slug FROM kick_favorites").fetchall()
+            return {str(r[0]).strip().lower() for r in rows if r[0]}
+
+    def list_kick_favorites(self) -> list[MediaItem]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT slug, display_name, avatar_url FROM kick_favorites ORDER BY added_at DESC"
+            ).fetchall()
+            return [
+                MediaItem(
+                    video_id=r["slug"],
+                    title=f"{r['display_name']} (Favorito)",
+                    author=r["display_name"],
+                    duration="",
+                    duration_sec=0,
+                    thumb_url=r["avatar_url"] or "",
+                    kind="kick",
+                    channel_avatar_url=r["avatar_url"] or "",
+                    published_text="Cargando estado...",
+                    is_live=False,
+                )
+                for r in rows
+            ]
+
+    def count_kick_favorites(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM kick_favorites").fetchone()
             return int(row[0]) if row else 0
 
     def count_video_history(self) -> int:

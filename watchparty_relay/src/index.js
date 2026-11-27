@@ -55,7 +55,13 @@ function sanitizeDeckState(raw, deck) {
   const kindRaw = String(raw.kind || (deck === "music" ? "music" : "video"))
     .trim()
     .toLowerCase();
-  const kind = deck === "music" ? "music" : kindRaw === "twitch" ? "twitch" : "video";
+  const kind = deck === "music"
+    ? "music"
+    : kindRaw === "twitch"
+      ? "twitch"
+      : kindRaw === "kick"
+        ? "kick"
+        : "video";
   const videoId = String(raw.video_id || raw.id || "").trim().slice(0, 128);
   const title = String(raw.title || "").trim().slice(0, 180);
   if (!videoId && !title) {
@@ -72,7 +78,7 @@ function sanitizeDeckState(raw, deck) {
     channel_id: String(raw.channel_id || "").trim().slice(0, 64),
     thumb_url: String(raw.thumb_url || "").trim().slice(0, 512),
     kind,
-    is_live: Boolean(raw.is_live) || kind === "twitch",
+    is_live: Boolean(raw.is_live) || kind === "twitch" || kind === "kick",
     paused: Boolean(raw.paused),
     pos: Number.isFinite(posNum) && posNum >= 0 ? Math.round(posNum * 100) / 100 : 0,
     duration_sec: Number.isFinite(durNum) && durNum >= 0 ? Math.round(durNum) : 0,

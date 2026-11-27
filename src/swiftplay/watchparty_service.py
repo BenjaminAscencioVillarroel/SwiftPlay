@@ -70,7 +70,7 @@ def compute_live_position(state: dict[str, Any] | None, now: float | None = None
         base_pos = max(0.0, float(state.get("pos") or 0.0))
     except (TypeError, ValueError):
         base_pos = 0.0
-    if bool(state.get("is_live")) or state.get("kind") == "twitch":
+    if bool(state.get("is_live")) or state.get("kind") in ("twitch", "kick"):
         return 0.0
     if bool(state.get("paused")):
         return base_pos

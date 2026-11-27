@@ -1111,6 +1111,8 @@ class DiscordStatusOverlay(QWidget):
                     wp_pm = render_icon("video", "#F87171", 13).pixmap(QSize(13, 13))
                 elif wk == "twitch":
                     wp_pm = render_icon("live", "#C084FC", 13).pixmap(QSize(13, 13))
+                elif wk == "kick":
+                    wp_pm = render_icon("kick", "#53FC18", 13).pixmap(QSize(13, 13))
                 else:
                     wp_pm = render_icon("music", self._palette.accent, 13).pixmap(QSize(13, 13))
                 painter.drawPixmap(icon_x, icon_y, wp_pm)

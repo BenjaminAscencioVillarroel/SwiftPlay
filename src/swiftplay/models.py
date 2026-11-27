@@ -54,7 +54,7 @@ class MediaItem:
     duration: str = ""
     duration_sec: int = 0
     thumb_url: str = ""
-    kind: Literal["video", "music", "twitch"] = "video"
+    kind: Literal["video", "music", "twitch", "kick"] = "video"
     channel_avatar_url: str = ""
     resume_pos: float = 0.0
     published_text: str = ""
@@ -68,6 +68,8 @@ class MediaItem:
             return self.thumb_url
         if self.kind == "twitch" and self.video_id:
             return f"https://static-cdn.jtvnw.net/previews-ttv/live_user_{self.video_id.lower()}-440x248.jpg"
+        if self.kind == "kick":
+            return ""
         if self.video_id:
             return f"https://i.ytimg.com/vi/{self.video_id}/hqdefault.jpg"
         return ""
@@ -96,9 +98,11 @@ class MediaItem:
             return cls(video_id="", title="")
         raw_kind = str(data.get("kind") or "video")
         if raw_kind == "music":
-            kind: Literal["video", "music", "twitch"] = "music"
+            kind: Literal["video", "music", "twitch", "kick"] = "music"
         elif raw_kind == "twitch":
             kind = "twitch"
+        elif raw_kind == "kick":
+            kind = "kick"
         else:
             kind = "video"
         try:

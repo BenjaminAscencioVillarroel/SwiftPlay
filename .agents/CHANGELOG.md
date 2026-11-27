@@ -14,6 +14,15 @@ Chronological log of major milestones and design changes for AI context continui
 
 ---
 
+## 2026-11-26 (4) — Integración de Kick en Directos (debajo de Twitch)
+
+- **Servicio y modelos (`src/swiftplay/kick_service.py`, `src/swiftplay/models.py`):** Se añadió `KickService` (solo `requests`, 100% aislado de `yt_dlp` y del reproductor cuando no está en uso) reutilizando los helpers HLS y formato de `twitch_service.py`. Consulta feeds públicos (`web.kick.com/api/v1/livestreams` con respaldo `featured-livestreams`), busca canales (`kick.com/api/search` enriquecido en paralelo), resuelve URLs directas `kick.com/<slug>` y playlists `.m3u8` con selección de calidad (`auto`, `1080p`, `720p`, `480p`, `360p`, `audio_only`). `MediaItem.kind` incorpora `"kick"`.
+- **Favoritos persistentes (`src/swiftplay/storage.py`):** Nueva tabla SQLite `kick_favorites` en `%LOCALAPPDATA%\SwiftPlay\library.db` con `add_kick_favorite`, `remove_kick_favorite`, `is_kick_favorite`, `list_kick_favorite_ids`, `list_kick_favorites` y `count_kick_favorites`.
+- **UI en Directos y Reproductor (`src/swiftplay/ui/main_window.py`, `icons.py`, `widgets.py`):** Nuevo botón `nav_kick` (`PAGE_KICK = 14`) dentro de la sección **DIRECTOS** justo debajo de **Twitch**, con pestañas `Español`, `Global` y `Favoritos`, buscador dedicado, tarjetas sin previsualización hover, reproductor HLS compartido en vivo (`_play_live_platform_stream`), cambio de calidad y modo solo audio, y atajos/barra inferior unificados.
+- **WatchParty y Overlay (`watchparty_relay/src/index.js`, `watchparty_service.py`, `watchparty_panel.py`, `discord_overlay.py`):** Soporte completo de `kind == "kick"` en estado compartido de WatchParty, subtarjeta adaptable Twitch/Kick, píldora verde `#53FC18` e icono Kick en el overlay de Discord.
+
+---
+
 ## 2026-11-26 (3) — Adjuntos en Chats, Botón Reiniciar App y Notificaciones con Color del Tema
 - **Files:** `watchparty_relay/src/index.js`, `src/swiftplay/watchparty_service.py`, `src/swiftplay/storage.py`, `src/swiftplay/themes.py`, `src/swiftplay/ui/discord_notification.py`, `src/swiftplay/ui/watchparty_chat_panel.py`, `src/swiftplay/paths.py`, `src/swiftplay/main.py`, `src/swiftplay/ui/main_window.py`, `scripts/verify_swiftplay.py`
 - **Changes / Decisions:**

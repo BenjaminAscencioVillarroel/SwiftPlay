@@ -483,5 +483,14 @@ def render_icon(name: str, color: str = "#EFEFF1", size: int = 20) -> QIcon:
         p.drawPath(send_path)
         p.drawLine(QPointF(s * 0.28, s * 0.50), QPointF(s * 0.62, s * 0.50))
 
+    elif name == "kick":
+        pen.setWidthF(max(1.8, size / 10.5))
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(s * 0.14, s * 0.14, s * 0.72, s * 0.72), s * 0.14, s * 0.14)
+        p.drawLine(QPointF(s * 0.36, s * 0.30), QPointF(s * 0.36, s * 0.70))
+        p.drawLine(QPointF(s * 0.36, s * 0.50), QPointF(s * 0.64, s * 0.30))
+        p.drawLine(QPointF(s * 0.44, s * 0.46), QPointF(s * 0.66, s * 0.70))
+
     p.end()
     return QIcon(pm)

@@ -204,12 +204,23 @@ class _WatchPartySubCard(QFrame):
             self._state.get("video_id") or self._state.get("title")
         )
 
-        self.live_lbl.setVisible(self.slot_kind == "twitch" and has_media)
+        self.live_lbl.setVisible(self.slot_kind in ("twitch", "kick") and has_media)
+
+        if self.slot_kind in ("twitch", "kick") and isinstance(self._state, dict):
+            eff_kind = "kick" if self._state.get("kind") == "kick" else "twitch"
+            self.badge_lbl.setText("Kick" if eff_kind == "kick" else "Twitch")
+            ico_n = "kick" if eff_kind == "kick" else "live"
+            ico_c = "#53FC18" if eff_kind == "kick" else "#A855F7"
+            self.ico_lbl.setPixmap(render_icon(ico_n, ico_c, 15).pixmap(15, 15))
+        elif self.slot_kind == "twitch":
+            self.badge_lbl.setText("Twitch")
+            self.ico_lbl.setPixmap(render_icon("live", "#A855F7", 15).pixmap(15, 15))
 
         if not has_media:
             empty_msg = {
                 "youtube": "Sin video en YouTube",
-                "twitch": "Sin directo en Twitch",
+                "twitch": "Sin directo en Twitch / Kick",
+                "kick": "Sin directo en Kick",
                 "music": "Sin música sonando",
             }[self.slot_kind]
             self.title_lbl.setText(empty_msg)
@@ -230,8 +241,9 @@ class _WatchPartySubCard(QFrame):
         author = str(self._state.get("author") or "")
         game = str(self._state.get("game_name") or "")
         self.title_lbl.setText(title)
-        if self.slot_kind == "twitch":
-            sub = f"{author} · {game}" if game and author else (author or game or "Directo en Twitch")
+        if self.slot_kind in ("twitch", "kick"):
+            plat = "Kick" if self._state.get("kind") == "kick" else "Twitch"
+            sub = f"{author} · {game}" if game and author else (author or game or f"Directo en {plat}")
         else:
             sub = author or ("YouTube" if self.slot_kind == "youtube" else "YT Music")
         self.sub_lbl.setText(sub)
@@ -382,6 +394,10 @@ class _WatchPartyFriendCard(QFrame):
         self.tw_pill.setObjectName("DeckTag")
         hdr.addWidget(self.tw_pill)
 
+        self.kick_pill = QLabel("Kick")
+        self.kick_pill.setObjectName("DeckTag")
+        hdr.addWidget(self.kick_pill)
+
         self.mus_pill = QLabel("Music")
         self.mus_pill.setObjectName("DeckTag")
         hdr.addWidget(self.mus_pill)
@@ -461,7 +477,7 @@ class _WatchPartyFriendCard(QFrame):
             return
         if self._joined_video_host == self.friend_code:
             vid = self._friend.get("video") or {}
-            cur_kind = "twitch" if vid.get("kind") == "twitch" else "youtube"
+            cur_kind = "twitch" if vid.get("kind") in ("twitch", "kick") else "youtube"
             if cur_kind == slot_kind or not vid:
                 self.leave_requested.emit("video")
                 return
@@ -544,16 +560,23 @@ class _WatchPartyFriendCard(QFrame):
         mus = friend.get("music") if isinstance(friend.get("music"), dict) else None
         online = status != "offline"
 
-        is_yt = bool(online and vid and vid.get("kind") != "twitch" and (vid.get("video_id") or vid.get("title")))
-        is_tw = bool(online and vid and vid.get("kind") == "twitch" and (vid.get("video_id") or vid.get("title")))
+        vid_kind = str(vid.get("kind") or "") if isinstance(vid, dict) else ""
+        has_vid = bool(online and vid and (vid.get("video_id") or vid.get("title")))
+        is_yt = bool(has_vid and vid_kind not in ("twitch", "kick"))
+        is_tw = bool(has_vid and vid_kind == "twitch")
+        is_kick = bool(has_vid and vid_kind == "kick")
+        is_live_stream = is_tw or is_kick
         is_mus = bool(online and mus and (mus.get("video_id") or mus.get("title")))
 
         self.yt_pill.setVisible(is_yt)
         self.tw_pill.setVisible(is_tw)
+        self.kick_pill.setVisible(is_kick)
         self.mus_pill.setVisible(is_mus)
 
         parts: list[str] = []
-        if is_tw and vid:
+        if is_kick and vid:
+            parts.append(f"Kick: {vid.get('author') or vid.get('title')}")
+        elif is_tw and vid:
             parts.append(f"Twitch: {vid.get('author') or vid.get('title')}")
         elif is_yt and vid:
             parts.append(f"YouTube: {vid.get('title')}")
@@ -579,8 +602,8 @@ class _WatchPartyFriendCard(QFrame):
         )
         self.tw_sub.set_data(
             friend_online=online,
-            state=vid if is_tw else None,
-            joined_this_deck=vid_joined and is_tw,
+            state=vid if is_live_stream else None,
+            joined_this_deck=vid_joined and is_live_stream,
         )
         self.mus_sub.set_data(
             friend_online=online,

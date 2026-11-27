@@ -47,6 +47,10 @@ from swiftplay.session_state import SessionState, load_session_state, save_sessi
 from swiftplay.storage import LocalLibrary  # noqa: E402
 from swiftplay.themes import THEMES, build_stylesheet  # noqa: E402
 from swiftplay.thumb_cache import ThumbnailCache  # noqa: E402
+from swiftplay.kick_service import (  # noqa: E402
+    KickService,
+    extract_kick_slug,
+)
 from swiftplay.twitch_service import (  # noqa: E402
     TwitchService,
     extract_channel_login,
@@ -211,6 +215,27 @@ def test_storage_config_themes() -> None:
         assert [x.video_id for x in db.list_twitch_favorites()] == ["ibai"]
         db.remove_twitch_favorite("ibai")
         assert db.count_twitch_favorites() == 0
+
+        kick_fav = MediaItem(
+            "westcol",
+            "Directo Kick Prueba",
+            "Westcol",
+            "EN VIVO",
+            0,
+            "",
+            "kick",
+            is_live=True,
+            game_name="Just Chatting",
+            viewer_count=41200,
+        )
+        assert kick_fav.normalized_thumb() == ""
+        db.add_kick_favorite(kick_fav)
+        assert db.is_kick_favorite("westcol")
+        assert "westcol" in db.list_kick_favorite_ids()
+        assert db.count_kick_favorites() == 1
+        assert [x.video_id for x in db.list_kick_favorites()] == ["westcol"]
+        db.remove_kick_favorite("westcol")
+        assert db.count_kick_favorites() == 0
         assert isinstance(db.list_watch_later_ids(), set)
         assert isinstance(db.list_my_music_ids(), set)
 
@@ -645,6 +670,20 @@ def test_live_extraction() -> tuple[ResolvedStream, ResolvedStream]:
     assert tw_hls.primary_url.startswith("http"), "URL HLS de Twitch inválida"
     assert ".m3u8" in tw_hls.primary_url.lower(), f"Se esperaba playlist .m3u8, recibido: {tw_hls.primary_url}"
     print(f"   Twitch en vivo sin sesión OK ({len(tw_streams)} canales, ej: {tw_streams[0].author} -> HLS listo).")
+
+    kick_svc = KickService()
+    try:
+        assert extract_kick_slug("https://kick.com/westcol") == "westcol"
+        kick_streams = kick_svc.get_top_streams(limit=5, language="ES")
+        assert len(kick_streams) >= 1, "Kick no devolvió streams en vivo"
+        assert all(s.kind == "kick" and s.is_live for s in kick_streams)
+        kick_hls = kick_svc.resolve_live_stream(kick_streams[0].video_id, quality="360p")
+        assert kick_hls.primary_url.startswith("http"), "URL HLS de Kick inválida"
+        assert ".m3u8" in kick_hls.primary_url.lower(), f"Se esperaba playlist .m3u8 de Kick, recibido: {kick_hls.primary_url}"
+        print(f"   Kick en vivo sin sesión OK ({len(kick_streams)} canales, ej: {kick_streams[0].author} -> HLS listo).")
+    finally:
+        kick_svc.close()
+
     assert "yt_dlp" not in sys.modules, (
         "yt_dlp no debe importarse en el proceso principal (debe correr en ytdlp_worker)"
     )
@@ -1984,6 +2023,45 @@ def test_gui_and_libmpv_smoke(
                 win._video_item = prev_vid_item
                 win._music_item = prev_mus_item
                 win._switch_page(win.PAGE_DISCORD)
+
+            # Verificar Kick GUI en DIRECTOS (justo debajo de Twitch), favoritos y WatchParty kind="kick"
+            nav_lay = win.nav_twitch.parentWidget().layout()
+            assert nav_lay.indexOf(win.nav_kick) == nav_lay.indexOf(win.nav_twitch) + 1, (
+                "nav_kick debe ubicarse en la barra lateral justo debajo de nav_twitch"
+            )
+            win._switch_page(win.PAGE_KICK)
+            app.processEvents()
+            assert win.stack.currentIndex() == win.PAGE_KICK
+            assert win._search_mode == "kick"
+            kick_demo = MediaItem(
+                "kickdemo",
+                "Stream Demo Kick",
+                "KickStreamer",
+                "EN VIVO",
+                0,
+                "",
+                "kick",
+                is_live=True,
+                game_name="IRL",
+                viewer_count=5400,
+            )
+            win._render_kick_cards([kick_demo])
+            assert len(win.kick_grid._widgets) == 1
+            was_k_fav = win.db.is_kick_favorite("kickdemo")
+            prev_vid_for_kick = win._video_item
+            try:
+                if not was_k_fav:
+                    win._toggle_kick_favorite(kick_demo)
+                assert win.db.is_kick_favorite("kickdemo")
+                win._video_item = kick_demo
+                assert win._resolve_wp_video_kind(win.cfg.watchparty_code) == "kick"
+                win._toggle_kick_favorite(kick_demo)
+                assert not win.db.is_kick_favorite("kickdemo")
+            finally:
+                win._video_item = prev_vid_for_kick
+                if was_k_fav and not win.db.is_kick_favorite("kickdemo"):
+                    win.db.add_kick_favorite(kick_demo)
+                win._render_kick_cards([])
 
             # Verificar WatchParty GUI: card persona expandible -> 3 subcards (YT / Twitch / Music) y anti-eco
             win.watchparty_svc.stop()

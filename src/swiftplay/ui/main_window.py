@@ -96,6 +96,7 @@ from swiftplay.themes import (
     get_notification_color,
     get_theme,
 )
+from swiftplay.kick_service import KickService
 from swiftplay.thumb_cache import ThumbnailCache
 from swiftplay.twitch_service import TwitchService, format_viewers
 from swiftplay.ui.discord_notification import DiscordMessageToast
@@ -259,6 +260,7 @@ class MainWindow(QMainWindow):
     PAGE_WATCHPARTY = 11
     PAGE_MUSIC_ARTIST = 12
     PAGE_WATCHPARTY_CHAT = 13
+    PAGE_KICK = 14
     MAX_FEED_ITEMS = 120
 
     def __init__(
@@ -290,6 +292,7 @@ class MainWindow(QMainWindow):
         self.db = LocalLibrary()
         self.yt = YouTubeService()
         self.twitch = TwitchService()
+        self.kick = KickService()
         self.discord_service = DiscordService(self)
         self.watchparty_svc = WatchPartyService(self)
         self._wp_suppress_until: dict[str, float] = {"video": 0.0, "music": 0.0}
@@ -421,7 +424,7 @@ class MainWindow(QMainWindow):
         self._bottom_bar_hiding = False
 
         # Estado independiente del Reproductor Dual
-        self._search_mode: Literal["video", "music", "twitch"] = "video"
+        self._search_mode: Literal["video", "music", "twitch", "kick"] = "video"
         self._active_deck: Literal["video", "music"] = "video"
         self._last_video_page: int = self.PAGE_VIDEO_SEARCH
         self._last_music_page: int = self.PAGE_MUSIC_SEARCH
@@ -433,6 +436,13 @@ class MainWindow(QMainWindow):
         self._twitch_cards: list[VideoGridCard] = []
         self._twitch_results: list[MediaItem] = []
         self._twitch_loaded = False
+
+        self._kick_tab: Literal["ES", "ALL", "FAV"] = "ES"
+        self._kick_showing_search = False
+        self._kick_gen = 0
+        self._kick_cards: list[VideoGridCard] = []
+        self._kick_results: list[MediaItem] = []
+        self._kick_loaded = False
 
         self._video_item: MediaItem | None = None
         self._video_pos: float = 0.0
@@ -470,6 +480,8 @@ class MainWindow(QMainWindow):
         self._music_search_page_dirty: bool = True
         self._twitch_page_dirty: bool = True
         self._twitch_feed_cache: dict[str, tuple[float, list[MediaItem]]] = {}
+        self._kick_page_dirty: bool = True
+        self._kick_feed_cache: dict[str, tuple[float, list[MediaItem]]] = {}
         self._last_completer_mode: str = ""
 
         self.setWindowTitle(
@@ -746,6 +758,13 @@ class MainWindow(QMainWindow):
             tooltip="Directos de Twitch (invitado, sin chat) [Tab]",
         )
         nav_lay.addWidget(self.nav_twitch)
+
+        self.nav_kick = self._make_nav_btn(
+            "Kick",
+            lambda: self._switch_page(self.PAGE_KICK),
+            tooltip="Directos de Kick (invitado, sin chat)",
+        )
+        nav_lay.addWidget(self.nav_kick)
 
         voice_sec = QLabel("VOZ")
         voice_sec.setObjectName("SectionHeader")
@@ -1610,6 +1629,54 @@ class MainWindow(QMainWindow):
         )
         self.stack.addWidget(self.watchparty_chat_panel)
 
+        # Pág 14: Kick (solo directos, invitado sin chat)
+        self.kick_back_btn: QPushButton | None = None
+        self.kick_refresh_btn: QPushButton | None = None
+        (
+            self.kick_page,
+            self.kick_grid,
+            self.kick_empty_lbl,
+            self.kick_view_title,
+            kick_hdr_btns,
+        ) = self._make_grid_page(
+            "Kick",
+            "Cargando directos de Kick...",
+            header_actions=[
+                ("Directos", self._show_kick_feed_view, False),
+                ("", self._reload_kick_current_view, False),
+            ],
+            return_header=True,
+        )
+        self.kick_back_btn = kick_hdr_btns[0]
+        self.kick_back_btn.setVisible(False)
+        self.kick_refresh_btn = kick_hdr_btns[1]
+        self.kick_refresh_btn.setObjectName("IconBtn")
+        self.kick_refresh_btn.setFixedSize(32, 32)
+        self.kick_refresh_btn.setToolTip("Actualizar")
+
+        self.kick_es_btn = QPushButton("Español")
+        self.kick_es_btn.setObjectName("PillBtn")
+        self.kick_es_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.kick_es_btn.clicked.connect(lambda: self._set_kick_tab("ES"))
+
+        self.kick_all_btn = QPushButton("Global")
+        self.kick_all_btn.setObjectName("PillBtn")
+        self.kick_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.kick_all_btn.clicked.connect(lambda: self._set_kick_tab("ALL"))
+
+        self.kick_fav_btn = QPushButton("Favoritos")
+        self.kick_fav_btn.setObjectName("PillBtn")
+        self.kick_fav_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.kick_fav_btn.clicked.connect(lambda: self._set_kick_tab("FAV"))
+
+        kick_hdr = self.kick_page.layout().itemAt(0).layout()
+        if kick_hdr is not None:
+            kick_hdr.insertWidget(1, self.kick_es_btn)
+            kick_hdr.insertWidget(2, self.kick_all_btn)
+            kick_hdr.insertWidget(3, self.kick_fav_btn)
+        self._refresh_kick_tab_pills()
+        self.stack.addWidget(self.kick_page)
+
         right_col.addWidget(self.stack, 1)
         body_row.addLayout(right_col, 1)
         outer.addLayout(body_row, 1)
@@ -2146,11 +2213,12 @@ class MainWindow(QMainWindow):
             if self._is_fullscreen:
                 self.toggle_fullscreen()
                 return
-            dest = (
-                self.PAGE_TWITCH
-                if (self._video_item is not None and self._video_item.kind == "twitch")
-                else getattr(self, "_video_return_page", self.PAGE_VIDEO_SEARCH)
-            )
+            if self._video_item is not None and self._video_item.kind == "twitch":
+                dest = self.PAGE_TWITCH
+            elif self._video_item is not None and self._video_item.kind == "kick":
+                dest = self.PAGE_KICK
+            else:
+                dest = getattr(self, "_video_return_page", self.PAGE_VIDEO_SEARCH)
             self._switch_page(dest)
             return
         if cur in (
@@ -2159,13 +2227,18 @@ class MainWindow(QMainWindow):
             self.PAGE_HISTORY,
             self.PAGE_CHANNEL,
         ):
-            if self._video_item is not None and self._video_item.kind != "twitch":
+            if self._video_item is not None and self._video_item.kind not in ("twitch", "kick"):
                 self._video_return_page = cur
                 self._switch_page(self.PAGE_VIDEO_PLAYER)
             return
         if cur == self.PAGE_TWITCH:
             if self._video_item is not None and self._video_item.kind == "twitch":
                 self._video_return_page = self.PAGE_TWITCH
+                self._switch_page(self.PAGE_VIDEO_PLAYER)
+            return
+        if cur == self.PAGE_KICK:
+            if self._video_item is not None and self._video_item.kind == "kick":
+                self._video_return_page = self.PAGE_KICK
                 self._switch_page(self.PAGE_VIDEO_PLAYER)
             return
         if cur == self.PAGE_MUSIC_PLAYER:
@@ -2213,7 +2286,7 @@ class MainWindow(QMainWindow):
         if not self._typing_in_input():
             deck = self._get_effective_deck()
             if deck == "video" and self._video_item is not None:
-                if self._video_item.kind == "twitch":
+                if self._video_item.kind in ("twitch", "kick"):
                     return
                 self._seek_deck_relative_from_user("video", delta)
                 if self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER:
@@ -2432,6 +2505,8 @@ class MainWindow(QMainWindow):
         self.nav_mymusic.setIcon(render_icon("heart", p.text, 17))
         self.nav_music_history.setIcon(render_icon("history", p.text, 17))
         self.nav_twitch.setIcon(render_icon("live", p.text, 17))
+        if hasattr(self, "nav_kick"):
+            self.nav_kick.setIcon(render_icon("kick", p.text, 17))
         self._refresh_discord_nav_btn()
         if hasattr(self, "nav_watchparty"):
             self.nav_watchparty.setIcon(render_icon("watchparty", p.text, 17))
@@ -2489,6 +2564,8 @@ class MainWindow(QMainWindow):
             self.music_refresh_btn.setIcon(render_icon("refresh", p.text, 15))
         if self.twitch_refresh_btn is not None:
             self.twitch_refresh_btn.setIcon(render_icon("refresh", p.text, 15))
+        if self.kick_refresh_btn is not None:
+            self.kick_refresh_btn.setIcon(render_icon("refresh", p.text, 15))
         if hasattr(self, "channel_back_btn"):
             self.channel_back_btn.setIcon(render_icon("back", p.text, 15))
         if hasattr(self, "channel_refresh_btn") and self.channel_refresh_btn is not None:
@@ -2540,7 +2617,7 @@ class MainWindow(QMainWindow):
         if not force and (time.monotonic() - self._last_saved_session_ts) < 5.0:
             return
         self._last_saved_session_ts = time.monotonic()
-        is_twitch_cur = self._video_item is not None and self._video_item.kind == "twitch"
+        is_twitch_cur = self._video_item is not None and self._video_item.kind in ("twitch", "kick")
         if is_twitch_cur:
             prev = load_session_state(self._session_state_path)
             v_it = prev.video_item
@@ -2619,7 +2696,7 @@ class MainWindow(QMainWindow):
             self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER
             and self._video_item is not None
         ):
-            if self._video_item.kind == "twitch":
+            if self._video_item.kind in ("twitch", "kick"):
                 self.video_panel.set_status("Pausado (en espera)")
             else:
                 self.video_panel.set_resume_preview(self._video_item, self._video_pos)
@@ -2642,7 +2719,7 @@ class MainWindow(QMainWindow):
             if (
                 self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER
                 and self._video_item is not None
-                and self._video_item.kind != "twitch"
+                and self._video_item.kind not in ("twitch", "kick")
             ):
                 self.video_panel.set_resume_preview(self._video_item, self._video_pos)
         if self.music_player.is_loaded and (
@@ -2694,6 +2771,7 @@ class MainWindow(QMainWindow):
             self.PAGE_HISTORY: "video_history",
             self.PAGE_MUSIC_HISTORY: "music_history",
             self.PAGE_TWITCH: "twitch",
+            self.PAGE_KICK: "kick",
             self.PAGE_DISCORD: "discord",
         }
         return names.get(self.stack.currentIndex(), str(self.stack.currentIndex()))
@@ -3125,9 +3203,9 @@ class MainWindow(QMainWindow):
         """Rota instantáneamente entre YouTube Video, YT Music, Twitch y Discord manteniendo estados."""
         cur = self.stack.currentIndex()
         playing_twitch = (
-            self._video_item is not None and self._video_item.kind == "twitch"
+            self._video_item is not None and self._video_item.kind in ("twitch", "kick")
         )
-        in_twitch = cur == self.PAGE_TWITCH or (
+        in_twitch = cur in (self.PAGE_TWITCH, self.PAGE_KICK) or (
             cur == self.PAGE_VIDEO_PLAYER and playing_twitch
         )
         in_music = cur in (
@@ -3147,7 +3225,7 @@ class MainWindow(QMainWindow):
                 target = self.PAGE_VIDEO_PLAYER
             else:
                 target = self._last_video_page
-                if target in (self.PAGE_TWITCH, self.PAGE_DISCORD) or (
+                if target in (self.PAGE_TWITCH, self.PAGE_KICK, self.PAGE_DISCORD) or (
                     target == self.PAGE_VIDEO_PLAYER and playing_twitch
                 ):
                     target = self.PAGE_VIDEO_SEARCH
@@ -3168,6 +3246,8 @@ class MainWindow(QMainWindow):
             if playing_twitch and self.video_player.has_active_stream:
                 self._active_deck = "video"
                 target = self.PAGE_VIDEO_PLAYER
+            elif self._video_item is not None and self._video_item.kind == "kick":
+                target = self.PAGE_KICK
             else:
                 target = self.PAGE_TWITCH
             self._switch_page(target)
@@ -3178,7 +3258,7 @@ class MainWindow(QMainWindow):
         """Salta directamente entre el deck de Música y el deck de Video/Directo cargado."""
         cur = self.stack.currentIndex()
         playing_twitch = (
-            self._video_item is not None and self._video_item.kind == "twitch"
+            self._video_item is not None and self._video_item.kind in ("twitch", "kick")
         )
         if cur == self.PAGE_DISCORD:
             if self._active_deck == "music" and self._music_item is not None:
@@ -3194,11 +3274,12 @@ class MainWindow(QMainWindow):
             self.PAGE_WATCH_LATER,
             self.PAGE_HISTORY,
             self.PAGE_TWITCH,
+            self.PAGE_KICK,
             self.PAGE_CHANNEL,
         )
         if in_video:
             if not (
-                cur == self.PAGE_TWITCH
+                cur in (self.PAGE_TWITCH, self.PAGE_KICK)
                 or (cur == self.PAGE_VIDEO_PLAYER and playing_twitch)
             ):
                 self._last_video_page = cur
@@ -3214,6 +3295,8 @@ class MainWindow(QMainWindow):
             self._active_deck = "video"
             if self._video_item is not None and self.video_player.has_active_stream:
                 target = self.PAGE_VIDEO_PLAYER
+            elif self._video_item is not None and self._video_item.kind == "kick":
+                target = self.PAGE_KICK
             elif playing_twitch:
                 target = self.PAGE_TWITCH
             else:
@@ -3265,6 +3348,10 @@ class MainWindow(QMainWindow):
             self.twitch_grid.clear_widgets()
             self._twitch_cards.clear()
             self._twitch_page_dirty = True
+        if cur != self.PAGE_KICK and (self.kick_grid._widgets or self._kick_cards):
+            self.kick_grid.clear_widgets()
+            self._kick_cards.clear()
+            self._kick_page_dirty = True
         if cur != self.PAGE_CHANNEL and (self.channel_grid._widgets or self._channel_cards):
             self.channel_grid.clear_widgets()
             self._channel_cards.clear()
@@ -3415,6 +3502,7 @@ class MainWindow(QMainWindow):
         hint_w = max(480, self.stack.width() - 52)
         trigger_music_home = False
         trigger_twitch_load = False
+        trigger_kick_load = False
 
         suppress_updates = page_idx != self.PAGE_VIDEO_PLAYER
         if suppress_updates:
@@ -3457,11 +3545,12 @@ class MainWindow(QMainWindow):
                 self.PAGE_MUSIC_ARTIST: self.nav_ytm,
             }.get(self._music_return_page, self.nav_ytm)
 
-            video_player_nav = (
-                self.nav_twitch
-                if (self._video_item is not None and self._video_item.kind == "twitch")
-                else self.nav_yt
-            )
+            if self._video_item is not None and self._video_item.kind == "twitch":
+                video_player_nav = self.nav_twitch
+            elif self._video_item is not None and self._video_item.kind == "kick":
+                video_player_nav = self.nav_kick
+            else:
+                video_player_nav = self.nav_yt
             nav_map = {
                 self.PAGE_VIDEO_SEARCH: self.nav_yt,
                 self.PAGE_VIDEO_PLAYER: video_player_nav,
@@ -3472,6 +3561,7 @@ class MainWindow(QMainWindow):
                 self.PAGE_MUSIC_PLAYER: music_return_nav,
                 self.PAGE_MUSIC_HISTORY: self.nav_music_history,
                 self.PAGE_TWITCH: self.nav_twitch,
+                self.PAGE_KICK: self.nav_kick,
                 self.PAGE_DISCORD: self.nav_discord,
                 self.PAGE_WATCHPARTY: self.nav_watchparty,
                 self.PAGE_WATCHPARTY_CHAT: self.nav_chats,
@@ -3487,6 +3577,7 @@ class MainWindow(QMainWindow):
                 self.nav_mymusic,
                 self.nav_music_history,
                 self.nav_twitch,
+                self.nav_kick,
                 self.nav_discord,
                 self.nav_watchparty,
                 self.nav_chats,
@@ -3502,6 +3593,11 @@ class MainWindow(QMainWindow):
                 page_idx == self.PAGE_VIDEO_PLAYER
                 and self._video_item is not None
                 and self._video_item.kind == "twitch"
+            )
+            is_kick_player = (
+                page_idx == self.PAGE_VIDEO_PLAYER
+                and self._video_item is not None
+                and self._video_item.kind == "kick"
             )
             if page_idx == self.PAGE_DISCORD:
                 self._search_mode = "video"
@@ -3525,6 +3621,11 @@ class MainWindow(QMainWindow):
                 self._search_mode = "twitch"
                 self.search_input.setPlaceholderText(
                     "Buscar canales en Twitch o pegar enlace... [Ctrl+L]"
+                )
+            elif page_idx == self.PAGE_KICK or is_kick_player:
+                self._search_mode = "kick"
+                self.search_input.setPlaceholderText(
+                    "Buscar canales en Kick o pegar enlace... [Ctrl+L]"
                 )
             elif page_idx in (
                 self.PAGE_VIDEO_SEARCH,
@@ -3602,6 +3703,17 @@ class MainWindow(QMainWindow):
                         self._render_twitch_cards(cached_tw[1], hint_width=hint_w)
                     else:
                         trigger_twitch_load = True
+            elif page_idx == self.PAGE_KICK:
+                if not self._kick_page_dirty:
+                    self._maybe_relayout_grid(self.kick_grid, hint_w)
+                elif self._kick_showing_search and self._kick_results:
+                    self._render_kick_cards(self._kick_results, hint_width=hint_w)
+                else:
+                    cached_kick = self._kick_feed_cache.get(self._kick_tab)
+                    if cached_kick is not None and (time.monotonic() - cached_kick[0]) < 90.0:
+                        self._render_kick_cards(cached_kick[1], hint_width=hint_w)
+                    else:
+                        trigger_kick_load = True
             elif page_idx == self.PAGE_CHANNEL:
                 if self._channel_page_dirty and self._channel_items:
                     self._render_channel_cards(self._channel_items, hint_width=hint_w)
@@ -3626,6 +3738,8 @@ class MainWindow(QMainWindow):
             self._load_music_home()
         elif trigger_twitch_load:
             self._load_twitch_view()
+        elif trigger_kick_load:
+            self._load_kick_view()
 
         if page_idx == self.PAGE_MUSIC_PLAYER and prev_idx != self.PAGE_MUSIC_PLAYER:
             self.music_panel.play_entrance_animation()
@@ -3642,7 +3756,7 @@ class MainWindow(QMainWindow):
 
         self.back_to_video_btn.setText(
             " Directo"
-            if (self._video_item is not None and self._video_item.kind == "twitch")
+            if (self._video_item is not None and self._video_item.kind in ("twitch", "kick"))
             else " Video"
         )
         self.back_to_video_btn.setVisible(
@@ -3717,6 +3831,24 @@ class MainWindow(QMainWindow):
                 lambda: self.twitch.search_channels(query, limit=16),
                 on_done=lambda res: self._on_twitch_search_done(gen, query, res),
                 on_error=lambda err: self._on_search_error(gen, "twitch", err),
+            )
+        elif self._search_mode == "kick":
+            self._kick_showing_search = True
+            self._kick_results = []
+            self._kick_page_dirty = True
+            self.kick_view_title.setText(f"«{query}»")
+            if self.kick_back_btn is not None:
+                self.kick_back_btn.setVisible(True)
+            self._switch_page(self.PAGE_KICK)
+            self.kick_empty_lbl.setText(f"Buscando '{query}' en Kick...")
+            self.kick_empty_lbl.setVisible(True)
+            self.kick_grid.clear_widgets()
+            self._kick_cards.clear()
+            self._set_page_loading(self.kick_page, True)
+            self._run_async(
+                lambda: self.kick.search_channels(query, limit=16),
+                on_done=lambda res: self._on_kick_search_done(gen, query, res),
+                on_error=lambda err: self._on_search_error(gen, "kick", err),
             )
         else:
             self._music_showing_search = True
@@ -4799,6 +4931,10 @@ class MainWindow(QMainWindow):
             self._set_page_loading(self.twitch_page, False)
             self.twitch_empty_lbl.setText(f"Error al buscar en Twitch: {err}")
             self.twitch_empty_lbl.setVisible(True)
+        elif mode == "kick":
+            self._set_page_loading(self.kick_page, False)
+            self.kick_empty_lbl.setText(f"Error al buscar en Kick: {err}")
+            self.kick_empty_lbl.setVisible(True)
         else:
             self._set_page_loading(self.music_search_page, False)
             self.music_empty_lbl.setText(f"Error al buscar: {err}")
@@ -5022,6 +5158,223 @@ class MainWindow(QMainWindow):
         self._refresh_badges()
 
     # ------------------------------------------------------------------
+    # Kick (Solo invitados, directos sin chat)
+    # ------------------------------------------------------------------
+
+    def _refresh_kick_tab_pills(self) -> None:
+        fav_n = self.db.count_kick_favorites()
+        self.kick_fav_btn.setText(f"Favoritos ({fav_n})" if fav_n else "Favoritos")
+        mapping = {
+            "ES": self.kick_es_btn,
+            "ALL": self.kick_all_btn,
+            "FAV": self.kick_fav_btn,
+        }
+        active_pill = mapping.get(self._kick_tab, self.kick_es_btn)
+        for btn in (self.kick_es_btn, self.kick_all_btn, self.kick_fav_btn):
+            btn.setProperty("active", "true" if btn is active_pill else "false")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def _set_kick_tab(self, tab: Literal["ES", "ALL", "FAV"]) -> None:
+        self._kick_tab = tab
+        self._kick_showing_search = False
+        self._kick_results = []
+        self._kick_page_dirty = True
+        self.kick_view_title.setText("Kick")
+        if self.kick_back_btn is not None:
+            self.kick_back_btn.setVisible(False)
+        self._refresh_kick_tab_pills()
+        cached = self._kick_feed_cache.get(tab)
+        if cached is not None and (time.monotonic() - cached[0]) < 90.0:
+            self._render_kick_cards(cached[1])
+            return
+        self._load_kick_view()
+
+    def _show_kick_feed_view(self) -> None:
+        self._kick_showing_search = False
+        self._kick_results = []
+        self._kick_page_dirty = True
+        self.kick_view_title.setText("Kick")
+        if self.kick_back_btn is not None:
+            self.kick_back_btn.setVisible(False)
+        cached = self._kick_feed_cache.get(self._kick_tab)
+        if cached is not None and (time.monotonic() - cached[0]) < 90.0:
+            self._render_kick_cards(cached[1])
+            return
+        self._load_kick_view()
+
+    def _reload_kick_current_view(self) -> None:
+        if self._kick_showing_search and self.search_input.text().strip():
+            self._search_mode = "kick"
+            self._on_search_submitted()
+        else:
+            self._kick_feed_cache.pop(self._kick_tab, None)
+            self._kick_page_dirty = True
+            self._load_kick_view()
+
+    def _load_kick_view(self) -> None:
+        self._kick_showing_search = False
+        self._kick_page_dirty = True
+        self.kick_view_title.setText("Kick")
+        if self.kick_back_btn is not None:
+            self.kick_back_btn.setVisible(False)
+        if self.kick_refresh_btn is not None:
+            self.kick_refresh_btn.setEnabled(False)
+        self.kick_grid.clear_widgets()
+        self._kick_cards.clear()
+
+        tab = self._kick_tab
+        self._kick_gen += 1
+        gen = self._kick_gen
+
+        if tab == "FAV":
+            favs = self.db.list_kick_favorites()
+            if not favs:
+                if self.kick_refresh_btn is not None:
+                    self.kick_refresh_btn.setEnabled(True)
+                self._set_page_loading(self.kick_page, False)
+                self.kick_empty_lbl.setText(
+                    "Aún no tienes canales favoritos de Kick. Usa el menú ⋮ o el corazón en un directo para guardarlo."
+                )
+                self.kick_empty_lbl.setVisible(True)
+                self._kick_feed_cache["FAV"] = (time.monotonic(), [])
+                self._kick_page_dirty = False
+                return
+            self._set_page_loading(self.kick_page, True)
+            self.kick_empty_lbl.setText("Consultando canales favoritos de Kick en vivo...")
+            self.kick_empty_lbl.setVisible(True)
+            slugs = [it.video_id for it in favs]
+            self._run_async(
+                lambda: self.kick.get_channels_status(slugs),
+                on_done=lambda items, t=tab: self._on_kick_items_done(gen, items, t),
+                on_error=lambda err: self._on_kick_error(gen, err),
+            )
+            return
+
+        self._set_page_loading(self.kick_page, True)
+        self.kick_empty_lbl.setText("Cargando directos de Kick...")
+        self.kick_empty_lbl.setVisible(True)
+        self._run_async(
+            lambda: self.kick.get_top_streams(limit=18, language=tab),
+            on_done=lambda items, t=tab: self._on_kick_items_done(gen, items, t),
+            on_error=lambda err: self._on_kick_error(gen, err),
+        )
+
+    def _render_kick_cards(
+        self, items: list[MediaItem], hint_width: int = 0
+    ) -> None:
+        self.kick_grid.clear_widgets()
+        self._kick_cards.clear()
+        self._kick_page_dirty = False
+        if not items:
+            self.kick_empty_lbl.setText("No se encontraron canales en Kick.")
+            self.kick_empty_lbl.setVisible(True)
+            return
+        self.kick_empty_lbl.setVisible(False)
+        fav_ids = self.db.list_kick_favorite_ids()
+        cards: list[QWidget] = []
+        for item in items:
+            card = self._create_kick_card(item, fav_ids=fav_ids)
+            self._kick_cards.append(card)
+            cards.append(card)
+        hint_w = hint_width if hint_width > 0 else max(480, self.stack.width() - 52)
+        self.kick_grid.set_items_widgets(cards, hint_width=hint_w)
+        self.kick_grid.setProperty("_rendered_hint_w", int(hint_w))
+        self._stagger_card_entrances(cards)
+
+    def _on_kick_items_done(
+        self, gen: int, items: list[MediaItem], tab: str | None = None
+    ) -> None:
+        if gen != self._kick_gen:
+            return
+        if self.kick_refresh_btn is not None:
+            self.kick_refresh_btn.setEnabled(True)
+        self._set_page_loading(self.kick_page, False)
+        self._kick_loaded = True
+        cache_tab = tab or self._kick_tab
+        self._kick_feed_cache[cache_tab] = (time.monotonic(), list(items))
+        self._kick_page_dirty = True
+        if self._kick_showing_search or self.stack.currentIndex() != self.PAGE_KICK:
+            return
+        self._render_kick_cards(items)
+        QTimer.singleShot(800, trim_process_memory)
+
+    def _on_kick_error(self, gen: int, err: str) -> None:
+        if gen != self._kick_gen:
+            return
+        if self.kick_refresh_btn is not None:
+            self.kick_refresh_btn.setEnabled(True)
+        self._set_page_loading(self.kick_page, False)
+        if not self._kick_showing_search:
+            self.kick_empty_lbl.setText(f"No se pudo cargar Kick: {err}")
+            self.kick_empty_lbl.setVisible(True)
+
+    def _on_kick_search_done(self, gen: int, query: str, items: list[MediaItem]) -> None:
+        if gen != self._search_gen:
+            return
+        self._set_page_loading(self.kick_page, False)
+        self._kick_results = items
+        self._kick_page_dirty = True
+        if self.stack.currentIndex() != self.PAGE_KICK:
+            return
+        if not items:
+            self.kick_grid.clear_widgets()
+            self._kick_cards.clear()
+            self.kick_empty_lbl.setText(f"No se encontraron canales en Kick para '{query}'.")
+            self.kick_empty_lbl.setVisible(True)
+            self._kick_page_dirty = False
+            return
+        self._render_kick_cards(items)
+
+    def _create_kick_card(
+        self, item: MediaItem, fav_ids: set[str] | None = None
+    ) -> VideoGridCard:
+        slug_key = (item.video_id or "").strip().lower()
+        is_fav = (
+            slug_key in fav_ids
+            if fav_ids is not None
+            else self.db.is_kick_favorite(item.video_id)
+        )
+        card = VideoGridCard(
+            item=item,
+            in_watch_later=is_fav,
+            thumb_cache=self.thumb_cache,
+            palette=self.palette,
+            show_remove=False,
+        )
+        card.play_requested.connect(self.play_kick_stream)
+        card.watch_later_toggled.connect(self._toggle_kick_favorite)
+        return card
+
+    def _toggle_kick_favorite(self, item: MediaItem) -> None:
+        slug = (item.video_id or "").strip().lower()
+        if not slug:
+            return
+        if self.db.is_kick_favorite(slug):
+            self.db.remove_kick_favorite(slug)
+            saved = False
+            self.show_toast("Quitado de Favoritos de Kick")
+        else:
+            self.db.add_kick_favorite(item)
+            saved = True
+            self.show_toast("Guardado en Favoritos de Kick")
+
+        self._kick_feed_cache.pop("FAV", None)
+        for card in self._kick_cards:
+            if card.item.video_id == slug:
+                card.set_watch_later(saved)
+        if self._video_item and self._video_item.kind == "kick" and self._video_item.video_id == slug:
+            self.video_panel.set_watch_later(saved)
+            self.fs_overlay.set_watch_later(saved)
+            self._refresh_bb_fav_icon()
+        if self._kick_tab == "FAV" and not self._kick_showing_search:
+            if self.stack.currentIndex() == self.PAGE_KICK:
+                self._load_kick_view()
+            else:
+                self._kick_page_dirty = True
+        self._refresh_badges()
+
+    # ------------------------------------------------------------------
     # Tarjetas y Listas Locales
     # ------------------------------------------------------------------
 
@@ -5241,12 +5594,19 @@ class MainWindow(QMainWindow):
         self.nav_mymusic.setText(f"  Mi música ({mm_n})" if mm_n else "  Mi música")
         if hasattr(self, "twitch_fav_btn"):
             self._refresh_twitch_tab_pills()
+        if hasattr(self, "kick_fav_btn"):
+            self._refresh_kick_tab_pills()
 
     def _toggle_watch_later_item(self, item: MediaItem) -> None:
-        if item.kind == "twitch":
-            self._toggle_twitch_favorite(item)
+        if item.kind in ("twitch", "kick"):
+            if item.kind == "kick":
+                self._toggle_kick_favorite(item)
+                fav_check = self.db.is_kick_favorite
+            else:
+                self._toggle_twitch_favorite(item)
+                fav_check = self.db.is_twitch_favorite
             if self._video_item is not None and self._video_item.video_id == item.video_id:
-                fav = self.db.is_twitch_favorite(item.video_id)
+                fav = fav_check(item.video_id)
                 self.video_panel.set_watch_later(fav)
                 self.fs_overlay.set_watch_later(fav)
             self._refresh_bb_fav_icon()
@@ -5340,7 +5700,7 @@ class MainWindow(QMainWindow):
     def _save_current_video_progress(self, force: bool = False) -> None:
         if (
             self._video_item is None
-            or self._video_item.kind == "twitch"
+            or self._video_item.kind in ("twitch", "kick")
             or self._video_item.is_live
         ):
             return
@@ -5484,7 +5844,7 @@ class MainWindow(QMainWindow):
         if (
             self._video_item is None
             or not self._video_item.is_live
-            or self._video_item.kind == "twitch"
+            or self._video_item.kind in ("twitch", "kick")
             or self._video_live_start_ts <= 0.0
             or dur <= 0.0
         ):
@@ -5642,12 +6002,20 @@ class MainWindow(QMainWindow):
         self.video_panel.set_status("Error")
         prefix = (
             "No se pudo abrir el directo"
-            if self._video_item is not None and self._video_item.kind == "twitch"
+            if self._video_item is not None and self._video_item.kind in ("twitch", "kick")
             else "No se pudo reproducir el video"
         )
         self.show_toast(f"{prefix}: {err}")
 
     def play_twitch_stream(self, item: MediaItem) -> None:
+        self._play_live_platform_stream(item, "twitch")
+
+    def play_kick_stream(self, item: MediaItem) -> None:
+        self._play_live_platform_stream(item, "kick")
+
+    def _play_live_platform_stream(
+        self, item: MediaItem, platform: Literal["twitch", "kick"]
+    ) -> None:
         self._video_click_timer.stop()
         self._video_idle_unload_timer.stop()
         self.continue_banner.setVisible(False)
@@ -5658,9 +6026,9 @@ class MainWindow(QMainWindow):
         if self._video_item is not None and self.video_player.has_active_stream:
             self.video_player.stop()
 
-        item.kind = "twitch"
+        item.kind = platform
         item.is_live = True
-        self._video_return_page = self.PAGE_TWITCH
+        self._video_return_page = self.PAGE_KICK if platform == "kick" else self.PAGE_TWITCH
         self._active_deck = "video"
         self._video_item = item
         self._video_pos = 0.0
@@ -5671,7 +6039,11 @@ class MainWindow(QMainWindow):
         self.video_player.set_speed(1.0)
         self._switch_page(self.PAGE_VIDEO_PLAYER)
 
-        fav = self.db.is_twitch_favorite(item.video_id)
+        fav = (
+            self.db.is_kick_favorite(item.video_id)
+            if platform == "kick"
+            else self.db.is_twitch_favorite(item.video_id)
+        )
         viewers_txt = format_viewers(item.viewer_count) if item.viewer_count > 0 else ""
         self.video_panel.set_item(item, fav)
         self.video_panel.set_live_mode(True, viewers_text=viewers_txt, is_twitch=True)
@@ -5703,11 +6075,10 @@ class MainWindow(QMainWindow):
             paused_override=False,
             broadcast_sync=not self._wp_applying_remote_play,
         )
-        login = item.video_id
+        slug = item.video_id
+        svc = self.kick if platform == "kick" else self.twitch
         self._run_async(
-            lambda: self.twitch.resolve_live_stream(
-                login, audio_only=audio_only, quality=quality
-            ),
+            lambda: svc.resolve_live_stream(slug, audio_only=audio_only, quality=quality),
             on_done=lambda stream: self._on_twitch_stream_resolved(gen, stream),
             on_error=lambda err: self._on_video_play_error(gen, err),
         )
@@ -5742,6 +6113,9 @@ class MainWindow(QMainWindow):
         if self._video_item.kind == "twitch":
             self.show_toast("Sincronizando directo con el momento real...")
             self.play_twitch_stream(self._video_item)
+        elif self._video_item.kind == "kick":
+            self.show_toast("Sincronizando directo de Kick con el momento real...")
+            self.play_kick_stream(self._video_item)
         elif self._video_item.is_live:
             self.yt.invalidate_stream_cache(self._video_item.video_id)
             self.show_toast("Sincronizando directo de YouTube al momento real...")
@@ -5755,11 +6129,12 @@ class MainWindow(QMainWindow):
             or target >= self.stack.count()
             or target == self.PAGE_VIDEO_PLAYER
         ):
-            target = (
-                self.PAGE_TWITCH
-                if (self._video_item is not None and self._video_item.kind == "twitch")
-                else self.PAGE_VIDEO_SEARCH
-            )
+            if self._video_item is not None and self._video_item.kind == "twitch":
+                target = self.PAGE_TWITCH
+            elif self._video_item is not None and self._video_item.kind == "kick":
+                target = self.PAGE_KICK
+            else:
+                target = self.PAGE_VIDEO_SEARCH
         self._switch_page(target)
 
     def _remember_music_return_page(self) -> None:
@@ -6108,6 +6483,8 @@ class MainWindow(QMainWindow):
             if not self.video_player.has_active_stream:
                 if self._video_item.kind == "twitch":
                     self.play_twitch_stream(self._video_item)
+                elif self._video_item.kind == "kick":
+                    self.play_kick_stream(self._video_item)
                 else:
                     self.play_video(self._video_item, start_pos=self._video_pos)
                 return
@@ -6154,7 +6531,7 @@ class MainWindow(QMainWindow):
 
     def _on_video_ended(self) -> None:
         self._video_paused = True
-        is_twitch = self._video_item is not None and self._video_item.kind == "twitch"
+        is_twitch = self._video_item is not None and self._video_item.kind in ("twitch", "kick")
         if self._video_item is not None and not is_twitch:
             self.db.update_play_progress(
                 self._video_item.video_id, 0.0, self._video_dur
@@ -6198,7 +6575,7 @@ class MainWindow(QMainWindow):
 
     def _on_video_pos_changed(self, pos: float) -> None:
         self._video_pos = pos
-        if self._video_item is not None and self._video_item.kind == "twitch":
+        if self._video_item is not None and self._video_item.kind in ("twitch", "kick"):
             return
         if self._video_item is not None and self._video_item.is_live and pos > self._video_dur:
             self._on_video_dur_changed(pos)
@@ -6215,7 +6592,7 @@ class MainWindow(QMainWindow):
         self.persist_session_state(force=False)
 
     def _on_video_dur_changed(self, dur: float) -> None:
-        if self._video_item is not None and self._video_item.kind == "twitch":
+        if self._video_item is not None and self._video_item.kind in ("twitch", "kick"):
             return
         self._video_dur = max(0.0, dur)
         off = self._compute_live_display_offset(self._video_dur)
@@ -6250,7 +6627,7 @@ class MainWindow(QMainWindow):
             self.continue_banner.setVisible(False)
             self._active_deck = "video"
         else:
-            if self._video_item is not None and self._video_item.kind != "twitch":
+            if self._video_item is not None and self._video_item.kind not in ("twitch", "kick"):
                 self._save_current_video_progress(force=True)
                 self.persist_session_state(force=True)
             if self.video_player.is_loaded:
@@ -6939,17 +7316,21 @@ class MainWindow(QMainWindow):
         hc = str(host_code or "").strip().upper()
         my_code = str(self.cfg.watchparty_code or "").upper()
         if hc == my_code and self._video_item is not None:
-            return "twitch" if self._video_item.kind == "twitch" else "youtube"
+            if self._video_item.kind in ("twitch", "kick"):
+                return self._video_item.kind
+            return "youtube"
         if hasattr(self, "watchparty_svc"):
             for f in self.watchparty_svc.friends_snapshot:
                 if str(f.get("code") or "").upper() == hc:
                     vid = f.get("video") if isinstance(f.get("video"), dict) else None
-                    if vid and vid.get("kind") == "twitch":
-                        return "twitch"
+                    if vid and vid.get("kind") in ("twitch", "kick"):
+                        return str(vid.get("kind"))
                     if vid:
                         return "youtube"
         if self._video_item is not None:
-            return "twitch" if self._video_item.kind == "twitch" else "youtube"
+            if self._video_item.kind in ("twitch", "kick"):
+                return self._video_item.kind
+            return "youtube"
         return "youtube"
 
     def _sync_watchparty_bar(self) -> None:
@@ -7240,6 +7621,8 @@ class MainWindow(QMainWindow):
             if deck == "video":
                 if saved_item.kind == "twitch":
                     self.play_twitch_stream(saved_item)
+                elif saved_item.kind == "kick":
+                    self.play_kick_stream(saved_item)
                 else:
                     saved_speed = clamp_speed(float(saved.get("speed") or self.cfg.video_speed or 1.0))
                     self.cfg.video_speed = saved_speed
@@ -7384,8 +7767,13 @@ class MainWindow(QMainWindow):
         dur = self._video_dur if deck == "video" else self._music_dur
         if dur <= 0.0 and getattr(item, "duration_sec", 0):
             dur = float(item.duration_sec)
-        kind = "music" if deck == "music" else ("twitch" if item.kind == "twitch" else "video")
-        speed = 1.0 if (deck == "music" or kind == "twitch") else float(self.cfg.video_speed or 1.0)
+        kind = (
+            "music"
+            if deck == "music"
+            else (item.kind if item.kind in ("twitch", "kick") else "video")
+        )
+        is_stream_kind = kind in ("twitch", "kick")
+        speed = 1.0 if (deck == "music" or is_stream_kind) else float(self.cfg.video_speed or 1.0)
         payload: dict[str, Any] = {
             "video_id": item.video_id,
             "title": item.title,
@@ -7393,10 +7781,10 @@ class MainWindow(QMainWindow):
             "channel_id": item.channel_id,
             "thumb_url": item.normalized_thumb(),
             "kind": kind,
-            "is_live": bool(item.is_live or kind == "twitch"),
+            "is_live": bool(item.is_live or is_stream_kind),
             "paused": paused,
-            "pos": 0.0 if (kind == "twitch" or item.is_live) else round(pos, 2),
-            "duration_sec": 0 if (kind == "twitch" or item.is_live) else int(max(0.0, dur)),
+            "pos": 0.0 if (is_stream_kind or item.is_live) else round(pos, 2),
+            "duration_sec": 0 if (is_stream_kind or item.is_live) else int(max(0.0, dur)),
             "speed": speed,
             "updated_at": time.time(),
             "game_name": item.game_name,
@@ -7530,7 +7918,7 @@ class MainWindow(QMainWindow):
     def _seek_deck_from_user(self, deck: Literal["video", "music"], pos: float) -> None:
         target = max(0.0, float(pos))
         if deck == "video":
-            if self._video_item is not None and self._video_item.kind == "twitch":
+            if self._video_item is not None and self._video_item.kind in ("twitch", "kick"):
                 return
             self._video_pos = target
             self.video_player.seek(target)
@@ -7541,7 +7929,7 @@ class MainWindow(QMainWindow):
 
     def _seek_deck_relative_from_user(self, deck: Literal["video", "music"], delta: float) -> None:
         if deck == "video":
-            if self._video_item is None or self._video_item.kind == "twitch":
+            if self._video_item is None or self._video_item.kind in ("twitch", "kick"):
                 return
             new_pos = max(0.0, self._video_pos + float(delta))
             if self._video_dur > 0:
@@ -7587,9 +7975,16 @@ class MainWindow(QMainWindow):
         want_speed = max(0.5, min(2.5, float(state.get("speed") or 1.0)))
         vid_id = str(state.get("video_id") or "").strip()
         raw_kind = str(state.get("kind") or ("music" if deck == "music" else "video")).lower()
-        item_kind: Literal["video", "music", "twitch"] = (
-            "music" if deck == "music" else ("twitch" if raw_kind == "twitch" else "video")
+        item_kind: Literal["video", "music", "twitch", "kick"] = (
+            "music"
+            if deck == "music"
+            else (
+                "twitch"
+                if raw_kind == "twitch"
+                else ("kick" if raw_kind == "kick" else "video")
+            )
         )
+        is_remote_stream = item_kind in ("twitch", "kick")
 
         cur_item = self._video_item if deck == "video" else self._music_item
         same_item = (
@@ -7618,7 +8013,7 @@ class MainWindow(QMainWindow):
             duration_sec=int(state.get("duration_sec") or 0),
             thumb_url=str(state.get("thumb_url") or ""),
             kind=item_kind,
-            is_live=bool(state.get("is_live") or item_kind == "twitch"),
+            is_live=bool(state.get("is_live") or is_remote_stream),
             game_name=str(state.get("game_name") or ""),
             viewer_count=int(state.get("viewer_count") or 0),
             channel_id=str(state.get("channel_id") or ""),
@@ -7670,6 +8065,10 @@ class MainWindow(QMainWindow):
                         self._wp_pending_video_sync = None
                         self._wp_pending_video_pause = None
                         self.play_twitch_stream(new_item)
+                    elif item_kind == "kick":
+                        self._wp_pending_video_sync = None
+                        self._wp_pending_video_pause = None
+                        self.play_kick_stream(new_item)
                     else:
                         self._wp_pending_video_sync = pending_payload
                         self._wp_pending_video_pause = want_paused
@@ -7692,7 +8091,7 @@ class MainWindow(QMainWindow):
             return
 
         # Ya tienen el mismo video/directo/canción: sincronizar velocidad, segundo y play/pausa
-        if deck == "video" and item_kind != "twitch":
+        if deck == "video" and not is_remote_stream:
             cur_speed = float(self.cfg.video_speed or 1.0)
             if abs(cur_speed - want_speed) > 0.01:
                 self.cfg.video_speed = want_speed
@@ -7700,7 +8099,7 @@ class MainWindow(QMainWindow):
                 self.video_panel.set_speed_silent(want_speed)
                 self.fs_overlay.set_speed_silent(want_speed)
 
-        is_live_media = item_kind == "twitch" or bool(state.get("is_live"))
+        is_live_media = is_remote_stream or bool(state.get("is_live"))
         cur_paused = self._video_paused if deck == "video" else self._music_paused
         if not is_live_media:
             cur_pos = self._video_pos if deck == "video" else self._music_pos
@@ -7853,14 +8252,14 @@ class MainWindow(QMainWindow):
 
     def _on_video_mouse_moved(self) -> None:
         if self._is_fullscreen:
-            if self._video_item is not None and self._video_item.kind != "twitch":
+            if self._video_item is not None and self._video_item.kind not in ("twitch", "kick"):
                 self.fs_overlay.set_position(self._video_pos)
             scr = self.screen() or QApplication.primaryScreen()
             rect = scr.geometry() if scr else self.geometry()
             self.fs_overlay.reveal(rect)
 
     def _on_video_speed_changed(self, speed: float) -> None:
-        if self._video_item is not None and self._video_item.kind == "twitch":
+        if self._video_item is not None and self._video_item.kind in ("twitch", "kick"):
             return
         self.cfg.video_speed = speed
         save_config(self.cfg)
@@ -7877,6 +8276,8 @@ class MainWindow(QMainWindow):
         if self._video_item and not self.cfg.video_audio_only:
             if self._video_item.kind == "twitch":
                 self.play_twitch_stream(self._video_item)
+            elif self._video_item.kind == "kick":
+                self.play_kick_stream(self._video_item)
             else:
                 self.play_video(self._video_item, start_pos=self._video_pos)
 
@@ -7888,6 +8289,8 @@ class MainWindow(QMainWindow):
         if self._video_item:
             if self._video_item.kind == "twitch":
                 self.play_twitch_stream(self._video_item)
+            elif self._video_item.kind == "kick":
+                self.play_kick_stream(self._video_item)
             else:
                 self.play_video(self._video_item, start_pos=self._video_pos)
 
@@ -7916,6 +8319,7 @@ class MainWindow(QMainWindow):
             self.PAGE_WATCH_LATER,
             self.PAGE_HISTORY,
             self.PAGE_TWITCH,
+            self.PAGE_KICK,
         ):
             if self._video_item is not None:
                 return "video"
@@ -7955,8 +8359,12 @@ class MainWindow(QMainWindow):
             if self.video_player.has_active_stream:
                 self._schedule_video_surface_refresh(55)
             else:
-                if self._video_item.kind == "twitch":
-                    fav = self.db.is_twitch_favorite(self._video_item.video_id)
+                if self._video_item.kind in ("twitch", "kick"):
+                    fav = (
+                        self.db.is_kick_favorite(self._video_item.video_id)
+                        if self._video_item.kind == "kick"
+                        else self.db.is_twitch_favorite(self._video_item.video_id)
+                    )
                     vtxt = (
                         format_viewers(self._video_item.viewer_count)
                         if self._video_item.viewer_count > 0
@@ -7982,13 +8390,13 @@ class MainWindow(QMainWindow):
     def _on_bb_prev(self) -> None:
         if self._get_bottom_bar_deck() == "music":
             self.play_previous()
-        elif self._video_item is not None and self._video_item.kind != "twitch":
+        elif self._video_item is not None and self._video_item.kind not in ("twitch", "kick"):
             self._seek_deck_relative_from_user("video", -10.0)
 
     def _on_bb_next(self) -> None:
         if self._get_bottom_bar_deck() == "music":
             self.play_next()
-        elif self._video_item is not None and self._video_item.kind != "twitch":
+        elif self._video_item is not None and self._video_item.kind not in ("twitch", "kick"):
             self._seek_deck_relative_from_user("video", 10.0)
 
     def _on_bb_seek_moved(self, val: int) -> None:
@@ -8037,7 +8445,7 @@ class MainWindow(QMainWindow):
     def _download_bb_current(self) -> None:
         deck = self._get_bottom_bar_deck()
         if deck == "video" and self._video_item is not None:
-            if self._video_item.kind == "twitch" or self._video_item.is_live:
+            if self._video_item.kind in ("twitch", "kick") or self._video_item.is_live:
                 return
             self._download_item(self._video_item, "video")
         elif deck == "music" and self._music_item is not None:
@@ -8069,7 +8477,7 @@ class MainWindow(QMainWindow):
             return
         deck = self._get_close_media_target()
         if deck == "video" and self._video_item is not None:
-            is_live = self._video_item.kind == "twitch" or self._video_item.is_live
+            is_live = self._video_item.kind in ("twitch", "kick") or self._video_item.is_live
             self.close_media_btn.setText(" Cerrar directo" if is_live else " Cerrar video")
             self.close_media_btn.setToolTip(
                 "Cerrar el directo actual y liberar memoria"
@@ -8092,7 +8500,7 @@ class MainWindow(QMainWindow):
             self._video_click_timer.stop()
             self._video_idle_unload_timer.stop()
             self._save_current_video_progress(force=True)
-            was_twitch = self._video_item is not None and self._video_item.kind == "twitch"
+            was_kind = self._video_item.kind if self._video_item is not None else "video"
             self._video_play_gen += 1
             self._video_resolving_id = None
             self._wp_pending_video_sync = None
@@ -8115,11 +8523,12 @@ class MainWindow(QMainWindow):
                 self._active_deck = "music"
             self.persist_session_state(force=True)
             if self.stack.currentIndex() == self.PAGE_VIDEO_PLAYER:
-                dest = (
-                    self.PAGE_TWITCH
-                    if was_twitch
-                    else getattr(self, "_video_return_page", self.PAGE_VIDEO_SEARCH)
-                )
+                if was_kind == "twitch":
+                    dest = self.PAGE_TWITCH
+                elif was_kind == "kick":
+                    dest = self.PAGE_KICK
+                else:
+                    dest = getattr(self, "_video_return_page", self.PAGE_VIDEO_SEARCH)
                 self._switch_page(dest)
         elif deck == "music":
             self._music_idle_unload_timer.stop()
@@ -8177,9 +8586,9 @@ class MainWindow(QMainWindow):
         pos = self._video_pos if deck == "video" else self._music_pos
         dur = self._video_dur if deck == "video" else self._music_dur
         vol = self.cfg.video_volume if deck == "video" else self.cfg.music_volume
-        is_twitch = deck == "video" and it is not None and it.kind == "twitch"
+        is_twitch = deck == "video" and it is not None and it.kind in ("twitch", "kick")
         is_live = (
-            deck == "video" and it is not None and (it.kind == "twitch" or it.is_live)
+            deck == "video" and it is not None and (it.kind in ("twitch", "kick") or it.is_live)
         )
 
         self.bb_deck_tag.setText(
@@ -8192,10 +8601,11 @@ class MainWindow(QMainWindow):
         if it is not None:
             self.bb_title.setText(it.title)
             if is_twitch:
+                plat_fallback = "Kick" if it.kind == "kick" else "Twitch"
                 sub = (
                     f"{it.author}  ·  {it.game_name}"
                     if it.game_name
-                    else (it.author or "Twitch")
+                    else (it.author or plat_fallback)
                 )
             elif is_live:
                 sub = f"{it.author or 'YouTube'}  ·  En vivo"
@@ -8251,7 +8661,7 @@ class MainWindow(QMainWindow):
         if both_loaded:
             vid_label = (
                 "Directo"
-                if (self._video_item is not None and self._video_item.kind == "twitch")
+                if (self._video_item is not None and self._video_item.kind in ("twitch", "kick"))
                 else "Video"
             )
             self.bb_switch_btn.setText("Música" if deck == "video" else vid_label)
@@ -8261,7 +8671,7 @@ class MainWindow(QMainWindow):
         deck = self._get_minibar_deck()
         it = self._video_item if deck == "video" else self._music_item
         paused = self._video_paused if deck == "video" else self._music_paused
-        if deck == "video" and it is not None and it.kind == "twitch":
+        if deck == "video" and it is not None and it.kind in ("twitch", "kick"):
             dur = 0.0
             pos = 0.0
         else:
@@ -8302,6 +8712,9 @@ class MainWindow(QMainWindow):
         if deck == "video":
             if it.kind == "twitch":
                 saved = self.db.is_twitch_favorite(it.video_id)
+                icon_name = "heart_filled" if saved else "heart"
+            elif it.kind == "kick":
+                saved = self.db.is_kick_favorite(it.video_id)
                 icon_name = "heart_filled" if saved else "heart"
             else:
                 saved = self.db.is_in_watch_later(it.video_id)
@@ -8869,6 +9282,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.twitch.close()
+        except Exception:
+            pass
+        try:
+            self.kick.close()
         except Exception:
             pass
         try:

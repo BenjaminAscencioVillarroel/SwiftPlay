@@ -1147,7 +1147,7 @@ class VideoGridCard(QFrame):
         self._card_hovered = True
         self._start_card_hover_anim(1.0)
         self.more_btn.setIcon(render_icon("more", self._palette.text, 16))
-        if self.item.kind != "twitch":
+        if self.item.kind not in ("twitch", "kick"):
             self.hover_entered.emit(self.item)
         super().enterEvent(event)
 
@@ -1155,7 +1155,7 @@ class VideoGridCard(QFrame):
         self._card_hovered = False
         self._start_card_hover_anim(0.0)
         self.more_btn.setIcon(render_icon("more", self._palette.text2, 16))
-        if self.item.kind != "twitch":
+        if self.item.kind not in ("twitch", "kick"):
             self.hover_left.emit(self.item)
         super().leaveEvent(event)
 
